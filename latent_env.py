@@ -47,10 +47,16 @@ class LatentEnv(gym.Env):
             z_start = self.model.encode({'pixels': start_pixels})['emb']
             self.z_ultimate_goal = self.model.encode({'pixels': goal_pixels})['emb']
             
-        self.z_history = z_start
-        self.act_history = torch.zeros(
-            (self.num_envs, 1, self.model.action_encoder.output_dim), device=self.device
-        )
+        if z_start.dim() == 2:
+            z_start = z_start.unsqueeze(1) # Shape: [Batch, 1, Dim]
+            
+        # We duplicate the starting state 3 times to simulate standing still
+        self.z_history = z_start.repeat(1, 3, 1)
+        
+        latent_dim = z_start.shape[-1]
+        
+        # Pad the ENCODED action history with 3 steps of zero-actions
+        self.act_history = torch.zeros((self.num_envs, 3, latent_dim), device=self.device)
         
         return self._get_obs(), {}
 
@@ -59,54 +65,59 @@ class LatentEnv(gym.Env):
         Teleports the environments to the provided latent states and flushes history.
         Expects z_curr shape: [num_envs, 192]
         """
-        # Ensure correct shape [num_envs, 1, 192] for the history buffer
-        if z_curr.dim() == 2:
-            self.z_history = z_curr.unsqueeze(1).clone()
-        else:
-            self.z_history = z_curr.clone()
+        if not isinstance(z_curr, torch.Tensor):
+            z_curr = torch.tensor(z_curr, dtype=torch.float32, device=self.device)
             
-        # Flush the action history back to zeros
-        self.act_history = torch.zeros((self.num_envs, 1, self.model.action_encoder.output_dim), device=self.device)
+        # 1. Enforce correct shape [num_envs, 1, 192] BEFORE repeating
+        if z_curr.dim() == 2:
+            z_curr = z_curr.unsqueeze(1) 
+
+        # 2. Duplicate the starting state 3 times to simulate standing still
+        # Shape safely becomes [num_envs, 3, 192]
+        self.z_history = z_curr.repeat(1, 3, 1).to(self.device)
+        
+        # 3. Pad the action history with 3 steps of zero-actions
+        latent_dim = z_curr.shape[-1]
+        self.act_history = torch.zeros(
+            (self.num_envs, 3, latent_dim), 
+            device=self.device
+        )
         
         # Reset the step counter for the T_max loop
         self.current_steps.zero_()
 
     def step(self, actions):
-        self.current_steps += 1
+        # Hardcode the paper's architecture requirement for OGBench-Cube
+        HS = 3 
         
-        action_tensor = actions.unsqueeze(1)
-        
-        with torch.no_grad():
-            act_emb = self.model.action_encoder(action_tensor)
+        if actions.dim() == 2:
+            actions = actions.unsqueeze(1)
             
-            # Update Action History
-            if self.act_history.shape[1] < self.history_size:
-                self.act_history = torch.cat([self.act_history, act_emb], dim=1)
-            else:
-                self.act_history = torch.cat([self.act_history[:, 1:], act_emb], dim=1)
-                
-            # Predict Next State
-            z_next = self.model.predict(self.z_history, self.act_history)[:, -1:] 
+        # 1. Encode the current action chunk
+        act_emb = self.model.action_encoder(actions)
+        if act_emb.dim() == 2: 
+            act_emb = act_emb.unsqueeze(1) # [Batch, 1, Dim]
             
-            # Update State History
-            if self.z_history.shape[1] < self.history_size:
-                self.z_history = torch.cat([self.z_history, z_next], dim=1)
-            else:
-                self.z_history = torch.cat([self.z_history[:, 1:], z_next], dim=1)
-
-        current_z = self.z_history[:, -1]
-        target_z = self.z_ultimate_goal[:, -1]
+        # 2. Append the new action to the history buffer
+        self.act_history = torch.cat([self.act_history, act_emb], dim=1)
         
-        distances = torch.norm(current_z - target_z, p=2, dim=-1)
-        rewards = -distances
+        # 3. THE SLIDING WINDOW (Enforce length = 3)
+        z_trunc = self.z_history[:, -HS:]
+        act_trunc = self.act_history[:, -HS:]
         
-        terminated = distances < 0.5 
-        truncated = self.current_steps >= self.max_steps
+        # 4. Predict the next state
+        z_next = self.model.predict(z_trunc, act_trunc)[:, -1:]
         
-        info = {"l2_distance_to_final_goal": distances}
+        # 5. Append the predicted state to the history for the NEXT loop
+        self.z_history = torch.cat([self.z_history, z_next], dim=1)
         
-        return current_z, rewards, terminated, truncated, info
+        # 6. Compute reward (assuming z_ultimate_goal is set)
+        distances = torch.norm(z_next.squeeze(1) - self.z_ultimate_goal, p=2, dim=-1)
+        rewards = -(distances > 0.5).float()
+        dones = distances < 0.5
+        
+        return z_next.squeeze(1), rewards, dones, False, {}
 
     def _get_obs(self):
-        # Return purely as a tensor
+        # Return purely as a tensor for the Actor
         return self.z_history[:, -1]
