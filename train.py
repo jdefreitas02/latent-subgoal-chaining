@@ -88,188 +88,63 @@ class TwinCritic(nn.Module):
         q2 = self.q2_l3(q2)
         return q1, q2
 
-def compute_reward(z_curr, z_target, threshold=0.5):
-    """Computes sparse reward for live env and HER relabeling."""
-    distances = torch.norm(z_curr - z_target, p=2, dim=-1)
-    rewards = -(distances > threshold).float()
-    successes = distances < threshold
-    return rewards, successes
-
-# ---------------------------------------------------------
-# PHASE 1: SUBGOAL EXTRACTION
-# ---------------------------------------------------------
-def extract_subgoal_sequences(dataset, model, subgoal_spacing=1, num_episodes=100, device="cuda"):
-    """
-    Extracts frames from the dataset at fixed temporal intervals 
-    and encodes them into sequences of latent subgoals.
-    
-    Args:
-        subgoal_spacing: Number of frames between subgoals (1 = every frame, 5 = every 5th frame).
-    """
-    print(f"Extracting subgoals with a spacing of {subgoal_spacing} frames...")
-    sequences = []
-    
-    num_episodes_to_extract = min(num_episodes, len(dataset.lengths))
-    
-    with torch.no_grad():
-        for ep_idx in range(num_episodes_to_extract):
-            ep_len = dataset.lengths[ep_idx]
-            
-            # Determine the frame indices we want to extract
-            frame_indices = list(range(0, ep_len, subgoal_spacing))
-            
-            # Ensure the very last frame is always included as the ultimate goal
-            if frame_indices[-1] != ep_len - 1:
-                frame_indices.append(ep_len - 1)
-                
-            starts = np.array(frame_indices)
-            ends = starts + 1
-            
-            # Request these specific frames from the HDF5 dataset
-            ep_indices_array = np.full(len(starts), ep_idx)
-            chunks = dataset.load_chunk(ep_indices_array, starts, ends)
-            
-            # Stack pixels: shape (num_frames, 1, C, H, W)
-            pixels = torch.stack([chunk['pixels'] for chunk in chunks]).to(device)
-            
-            # Encode the frames into latent space
-            encoded = model.encode({'pixels': pixels})['emb'] # Shape: (num_frames, 1, 192)
-            
-            # Remove the time dimension to get (num_frames, 192)
-            seq = encoded.squeeze(1) 
-            sequences.append(seq)
-            
-    return sequences
-
-
-class DynamicTaskBuffer:
-    """
-    An active pool of (z_start, z_target) tasks.
-    Agents sample from this, and return their results after T_max steps.
-    """
-    def __init__(self, sequences, max_size=100000, device="cuda"):
-        self.sequences = sequences
-        self.max_size = max_size
+class StandardReplayBuffer:
+    def __init__(self, capacity=1000000, device="cuda"):
+        self.capacity = capacity
         self.device = device
-        self.tasks = []
-        
-        # Phase 2 Initialization: Add all adjacent (z_i, z_{i+1}) pairs to the buffer
-        for seq_idx, seq in enumerate(self.sequences):
-            for i in range(len(seq) - 1):
-                # Store: (z_start, z_target, seq_idx, target_idx)
-                # We keep track of the indices so we know what the *next* subgoal is on success
-                self.tasks.append((seq[i], seq[i+1], seq_idx, i+1))
-                
-    def sample_tasks(self, batch_size):
-        """Randomly samples a batch of tasks for the vectorized environments."""
-        sampled = random.choices(self.tasks, k=batch_size)
-        
-        z_starts = torch.stack([t[0] for t in sampled]).to(self.device)
-        z_targets = torch.stack([t[1] for t in sampled]).to(self.device)
-        seq_indices = [t[2] for t in sampled]
-        target_indices = [t[3] for t in sampled]
-        
-        return z_starts, z_targets, seq_indices, target_indices
-
-    def add_task(self, z_start, z_target, seq_idx, target_idx):
-        """Adds a task to the pool, popping the oldest if capacity is reached."""
-        if len(self.tasks) >= self.max_size:
-            self.tasks.pop(0) 
-        self.tasks.append((z_start, z_target, seq_idx, target_idx))
-
-    def process_episode_results(self, z_final, successes, seq_indices, target_indices):
-        """
-        Evaluates how the agents did and adds 
-        the appropriate new tasks back into the pool.
-        """
-        for i in range(len(successes)):
-            seq_idx = seq_indices[i]
-            target_idx = target_indices[i]
-            current_z = z_final[i].detach() # The state where the agent ended up
-            
-            if successes[i]:
-                # Agent succeeded, advance to the next subgoal in the sequence.
-                next_target_idx = target_idx + 1
-                if next_target_idx < len(self.sequences[seq_idx]):
-                    next_target = self.sequences[seq_idx][next_target_idx]
-                    self.add_task(current_z, next_target, seq_idx, next_target_idx)
-            else:
-                # Agent failed, keep the target and try again from where it got stuck.
-                target_z = self.sequences[seq_idx][target_idx]
-                self.add_task(current_z, target_z, seq_idx, target_idx)
-
-class EpisodicHERBuffer:
-    """Stores episodes and applies HER 80% of the time during sampling."""
-    def __init__(self, capacity_episodes=10000, future_p=0.8, device="cuda"):
-        self.episodes = []
-        self.capacity = capacity_episodes
-        self.future_p = future_p
-        self.device = device
+        self.buffer = []
         self.position = 0
 
-    def store_episodes(self, batched_episodes):
-        for ep in batched_episodes:
-            if len(ep) > 0: 
-                if len(self.episodes) < self.capacity:
-                    self.episodes.append(ep)
-                else:
-                    self.episodes[self.position] = ep
-                    self.position = (self.position + 1) % self.capacity
-     
-    def sample_batch(self, batch_size=256):
-        z_batch, a_batch, z_next_batch, g_batch, r_batch, done_batch = [], [], [], [], [], []
-        
-        for _ in range(batch_size):
-            ep = random.choice(self.episodes)
-            t = random.randint(0, len(ep) - 1)
-            z_curr, a, z_next, original_g = ep[t]
-            
-            if random.random() < self.future_p and t < len(ep) - 1:
-                future_t = random.randint(t + 1, len(ep) - 1)
-                g_tilde = ep[future_t][2] 
-                r, success = compute_reward(z_next, g_tilde)
-                g_target = g_tilde
+    def store_transitions(self, z_curr, actions, z_next, z_target, rewards, dones):
+        batch_size = z_curr.shape[0]
+        for i in range(batch_size):
+            # Move to CPU to prevent GPU Out-Of-Memory over large datasets
+            transition = (
+                z_curr[i].detach().cpu(),
+                actions[i].detach().cpu(),
+                z_next[i].detach().cpu(),
+                z_target[i].detach().cpu(),
+                rewards[i].detach().cpu(),
+                dones[i].detach().cpu()
+            )
+            if len(self.buffer) < self.capacity:
+                self.buffer.append(transition)
             else:
-                r, success = compute_reward(z_next, original_g)
-                g_target = original_g
-                
-            z_batch.append(z_curr)
-            a_batch.append(a)
-            z_next_batch.append(z_next)
-            g_batch.append(g_target)
-            r_batch.append(r)
-            
-            # success is already a boolean tensor from compute_reward, just cast to float
-            done_batch.append(success.to(dtype=torch.float32))
-            
+                self.buffer[self.position] = transition
+            self.position = (self.position + 1) % self.capacity
+
+    def sample_batch(self, batch_size=256):
+        batch = random.sample(self.buffer, batch_size)
+        z_batch, a_batch, z_next_batch, g_batch, r_batch, done_batch = map(torch.stack, zip(*batch))
+        
         return (
-            torch.stack(z_batch), torch.stack(a_batch), 
-            torch.stack(z_next_batch), torch.stack(g_batch), 
-            torch.stack(r_batch), torch.stack(done_batch)
+            z_batch.to(self.device), 
+            a_batch.to(self.device), 
+            z_next_batch.to(self.device), 
+            g_batch.to(self.device), 
+            r_batch.to(self.device), 
+            done_batch.to(self.device)
         )
 
 def train_loop(env, actor, critic, critic_target, 
                actor_optimizer, critic_optimizer, alpha_optimizer, 
-               log_alpha, target_entropy, task_buffer, replay_buffer, 
-               num_iterations=1000, T_max=10, gamma=0.99, tau=0.005, 
+               log_alpha, target_entropy, replay_buffer, 
+               num_iterations=1000, T_max=50, gamma=0.99, tau=0.005, 
                save_dir="./checkpoints"):
     
     os.makedirs(save_dir, exist_ok=True)
-    print(f"Starting Task-Sampled Training Loop. Saving checkpoints to {save_dir}")
+    print(f"Starting Standard Baseline Training Loop. Saving checkpoints to {save_dir}")
     
     for iteration in range(num_iterations):
         
-        z_curr, z_target, seq_idxs, target_idxs = task_buffer.sample_tasks(env.num_envs)
-        env.reset()
-        # set the environment to start at current latent
-        env.set_states(z_curr) 
-        
-        M_ep = [[] for _ in range(env.num_envs)]
+        # 1. Start from the beginning of the video, target is the very end of the video
+        z_curr, _ = env.reset()
+        z_target = env.z_ultimate_goal.clone()
         
         # Track which environments are still trying to reach their goal
         active_mask = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
-        success_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         
+        # 2. Rollout for T_max steps (horizon is long to allow reaching the distant goal)
         for step in range(T_max):
             if not active_mask.any():
                 break # break if all envs have succeeded
@@ -278,33 +153,31 @@ def train_loop(env, actor, critic, critic_target,
                 actions, _, _ = actor.sample(z_curr, z_target)
             
             # Step the environment (World Model)
-            z_next, _, _, _, _ = env.step(actions)
+            z_next, rewards, dones, _, _ = env.step(actions)
             
-            # Check for success
-            _, successes = compute_reward(z_next, z_target)
+            # Filter down to only environments that are still active
+            active_z_curr = z_curr[active_mask]
+            active_actions = actions[active_mask]
+            active_z_next = z_next[active_mask]
+            active_z_target = z_target[active_mask]
+            active_rewards = rewards[active_mask]
+            active_dones = dones[active_mask]
             
-            # Update masks (Only count successes for envs that were still active)
-            just_succeeded = successes & active_mask
-            success_mask |= just_succeeded
+            # Store standard transitions directly into the replay buffer
+            replay_buffer.store_transitions(
+                active_z_curr, active_actions, active_z_next, 
+                active_z_target, active_rewards, active_dones
+            )
             
-            # Store transitions ONLY for active environments
-            for i in range(env.num_envs):
-                if active_mask[i]:
-                    transition = (z_curr[i], actions[i], z_next[i], z_target[i])
-                    M_ep[i].append(transition)
-            
-            # Turn off environments that just succeeded
+            # Update masks
+            just_succeeded = dones & active_mask
             active_mask &= ~just_succeeded
             
             # Update z_curr (If inactive, keep the old z_curr so it doesn't wander)
             z_curr = torch.where(active_mask.unsqueeze(-1), z_next, z_curr)
 
-        # --- 3. Post-Episode Buffer Updates ---
-        replay_buffer.store_episodes(M_ep)
-        task_buffer.process_episode_results(z_curr, success_mask.cpu().numpy(), seq_idxs, target_idxs)
-        #print(len(replay_buffer.episodes))
-        # SAC training
-        if len(replay_buffer.episodes) >= 10: 
+        # --- 3. SAC Training Phase ---
+        if len(replay_buffer.buffer) >= 256: # Ensure enough data for a batch
             
             # Variables for logging
             avg_actor_loss = 0.0
@@ -362,12 +235,12 @@ def train_loop(env, actor, critic, critic_target,
                     target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
             
             if iteration % 10 == 0:
-                print(f"Iter {iteration:04d} | Buf: {len(replay_buffer.episodes):04d} eps | "
+                print(f"Iter {iteration:04d} | Buf: {len(replay_buffer.buffer):06d} trans | "
                       f"Act Loss: {avg_actor_loss/40:.4f} | Crit Loss: {avg_critic_loss/40:.4f}")
                 
         if (iteration > 0 and iteration % 100 == 0) or iteration == num_iterations - 1:
-            torch.save(actor.state_dict(), os.path.join(save_dir, "actor_policy.pth"))
-            torch.save(critic.state_dict(), os.path.join(save_dir, "critic_network.pth"))
+            torch.save(actor.state_dict(), os.path.join(save_dir, "actor_policy_baseline.pth"))
+            torch.save(critic.state_dict(), os.path.join(save_dir, "critic_network_baseline.pth"))
             print(f"--> Checkpoint saved at Iteration {iteration}")
 
 if __name__ == "__main__":
@@ -380,7 +253,6 @@ if __name__ == "__main__":
         print("--- RUNNING IN LOCAL DEBUG MODE ---")
         num_envs_to_use = 2
         num_iters_to_run = 25
-        num_episodes_extract = 2
         
         class DummyJEPA(nn.Module):
             def __init__(self):
@@ -402,10 +274,8 @@ if __name__ == "__main__":
     else:
         print("--- RUNNING IN PRODUCTION MODE ---")
         num_envs_to_use = 50
-        num_iters_to_run = 100
-        num_episodes_extract = 100
+        num_iters_to_run = 10000
         
-
         ephemeral = os.environ.get("EPHEMERAL")
         if ephemeral is None:
             raise ValueError("EPHEMERAL environment variable is not set")
@@ -438,21 +308,10 @@ if __name__ == "__main__":
             
         print("Dataset and JEPA Model successfully loaded")
 
-    # =====================================================================
-
     env = LatentEnv(jepa_model=jepa_model, dataset=dataset, num_envs=num_envs_to_use, device=device) 
-
-    spacing_parameter = 5 
-    subgoal_sequences = extract_subgoal_sequences(
-        dataset=dataset, 
-        model=jepa_model, 
-        subgoal_spacing=spacing_parameter, 
-        num_episodes=num_episodes_extract, 
-        device=device
-    )
     
-    task_buffer = DynamicTaskBuffer(subgoal_sequences, device=device)
-    replay_buffer = EpisodicHERBuffer(device=device)
+    # Initialize Standard Replay Buffer (No HER)
+    replay_buffer = StandardReplayBuffer(device=device)
 
     actor = GoalConditionedActor(action_dim=25).to(device)
     critic = TwinCritic(action_dim=25).to(device)
@@ -476,11 +335,10 @@ if __name__ == "__main__":
         alpha_optimizer=alpha_optimizer,
         log_alpha=log_alpha,
         target_entropy=target_entropy,
-        task_buffer=task_buffer, 
         replay_buffer=replay_buffer,
         num_iterations=num_iters_to_run,
-        T_max=10,
+        T_max=50, # Set to 50 to allow the agent to traverse the full episode length without subgoals
         gamma=0.99,
         tau=0.005,
-        save_dir="./checkpoints" 
+        save_dir="./checkpoints_baseline" 
     )
