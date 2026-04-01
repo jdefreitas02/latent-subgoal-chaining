@@ -6,6 +6,7 @@ import sys
 import numpy as np
 import random
 import os
+import time
 import stable_worldmodel as swm
 from hydra import initialize, compose
         
@@ -135,10 +136,18 @@ def train_loop(env, actor, critic, critic_target,
     os.makedirs(save_dir, exist_ok=True)
     print(f"Starting Standard Baseline Training Loop. Saving checkpoints to {save_dir}")
     
+    start_time = time.time()
+    
     for iteration in range(num_iterations):
         
         # 1. Start from the beginning of the video, target is the very end of the video
         z_curr, _ = env.reset()
+        
+        # FIX: The World Model keeps a sequence dimension (e.g., [Batch, 1, 192])
+        # We must strip it so it matches z_curr (e.g., [Batch, 192])
+        if env.z_ultimate_goal.dim() == 3:
+            env.z_ultimate_goal = env.z_ultimate_goal.squeeze(1)
+            
         z_target = env.z_ultimate_goal.clone()
         
         # Track which environments are still trying to reach their goal
@@ -187,7 +196,7 @@ def train_loop(env, actor, critic, critic_target,
                 z_b, a_b, z_next_b, g_b, r_b, d_b = replay_buffer.sample_batch(batch_size=256)
                 
                 r_b = r_b.unsqueeze(-1)
-                d_b = d_b.unsqueeze(-1)
+                d_b = d_b.float().unsqueeze(-1)
                 alpha = log_alpha.exp().item()
 
                 #  Update Critic
@@ -235,8 +244,11 @@ def train_loop(env, actor, critic, critic_target,
                     target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
             
             if iteration % 10 == 0:
+                elapsed_time = time.time() - start_time
                 print(f"Iter {iteration:04d} | Buf: {len(replay_buffer.buffer):06d} trans | "
-                      f"Act Loss: {avg_actor_loss/40:.4f} | Crit Loss: {avg_critic_loss/40:.4f}")
+                      f"Act Loss: {avg_actor_loss/40:.4f} | Crit Loss: {avg_critic_loss/40:.4f} | "
+                      f"Time: {elapsed_time:.2f}s")
+                start_time = time.time()
                 
         if (iteration > 0 and iteration % 100 == 0) or iteration == num_iterations - 1:
             torch.save(actor.state_dict(), os.path.join(save_dir, "actor_policy_baseline.pth"))
@@ -257,7 +269,7 @@ if __name__ == "__main__":
         class DummyJEPA(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.action_encoder = nn.Linear(5, 192)
+                self.action_encoder = nn.Linear(25, 192)
             def encode(self, info): 
                 return {'emb': torch.randn(info['pixels'].shape[0], 1, 192, device=info['pixels'].device)}
             def predict(self, emb, act_emb): 
@@ -337,7 +349,7 @@ if __name__ == "__main__":
         target_entropy=target_entropy,
         replay_buffer=replay_buffer,
         num_iterations=num_iters_to_run,
-        T_max=50, # Set to 50 to allow the agent to traverse the full episode length without subgoals
+        T_max=200, 
         gamma=0.99,
         tau=0.005,
         save_dir="./checkpoints_baseline" 
