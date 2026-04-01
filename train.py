@@ -7,6 +7,7 @@ import numpy as np
 import random
 import os
 import time
+import csv
 import stable_worldmodel as swm
 from hydra import initialize, compose
         
@@ -90,41 +91,76 @@ class TwinCritic(nn.Module):
         return q1, q2
 
 class StandardReplayBuffer:
-    def __init__(self, capacity=1000000, device="cuda"):
+    """A highly optimized tensor-based flat replay buffer natively stored on GPU."""
+    def __init__(self, latent_dim=192, action_dim=25, capacity=1000000, device="cuda"):
         self.capacity = capacity
         self.device = device
-        self.buffer = []
+        
+        # Pre-allocate directly on the GPU. At 1M transitions, this is only ~1.5GB of VRAM!
+        self.z_curr = torch.zeros((capacity, latent_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros((capacity, action_dim), dtype=torch.float32, device=device)
+        self.z_next = torch.zeros((capacity, latent_dim), dtype=torch.float32, device=device)
+        self.z_target = torch.zeros((capacity, latent_dim), dtype=torch.float32, device=device)
+        self.rewards = torch.zeros((capacity,), dtype=torch.float32, device=device)
+        self.dones = torch.zeros((capacity,), dtype=torch.float32, device=device)
+        
         self.position = 0
+        self.size = 0
 
     def store_transitions(self, z_curr, actions, z_next, z_target, rewards, dones):
         batch_size = z_curr.shape[0]
-        for i in range(batch_size):
-            # Move to CPU to prevent GPU Out-Of-Memory over large datasets
-            transition = (
-                z_curr[i].detach().cpu(),
-                actions[i].detach().cpu(),
-                z_next[i].detach().cpu(),
-                z_target[i].detach().cpu(),
-                rewards[i].detach().cpu(),
-                dones[i].detach().cpu()
-            )
-            if len(self.buffer) < self.capacity:
-                self.buffer.append(transition)
-            else:
-                self.buffer[self.position] = transition
-            self.position = (self.position + 1) % self.capacity
+        end_idx = self.position + batch_size
+
+        # Keep everything on device. No .cpu() syncs!
+        z_curr_dev = z_curr.detach()
+        actions_dev = actions.detach()
+        z_next_dev = z_next.detach()
+        z_target_dev = z_target.detach()
+        rewards_dev = rewards.detach()
+        dones_dev = dones.detach()
+
+        # Handle writing to the tensor (including wrap-around if buffer is full)
+        if end_idx <= self.capacity:
+            self.z_curr[self.position:end_idx] = z_curr_dev
+            self.actions[self.position:end_idx] = actions_dev
+            self.z_next[self.position:end_idx] = z_next_dev
+            self.z_target[self.position:end_idx] = z_target_dev
+            self.rewards[self.position:end_idx] = rewards_dev
+            self.dones[self.position:end_idx] = dones_dev
+        else:
+            overflow = end_idx - self.capacity
+            valid = batch_size - overflow
+            
+            # Fill to the end of the buffer
+            self.z_curr[self.position:self.capacity] = z_curr_dev[:valid]
+            self.actions[self.position:self.capacity] = actions_dev[:valid]
+            self.z_next[self.position:self.capacity] = z_next_dev[:valid]
+            self.z_target[self.position:self.capacity] = z_target_dev[:valid]
+            self.rewards[self.position:self.capacity] = rewards_dev[:valid]
+            self.dones[self.position:self.capacity] = dones_dev[:valid]
+            
+            # Wrap around and fill the beginning
+            self.z_curr[0:overflow] = z_curr_dev[valid:]
+            self.actions[0:overflow] = actions_dev[valid:]
+            self.z_next[0:overflow] = z_next_dev[valid:]
+            self.z_target[0:overflow] = z_target_dev[valid:]
+            self.rewards[0:overflow] = rewards_dev[valid:]
+            self.dones[0:overflow] = dones_dev[valid:]
+
+        self.position = end_idx % self.capacity
+        self.size = min(self.size + batch_size, self.capacity)
 
     def sample_batch(self, batch_size=256):
-        batch = random.sample(self.buffer, batch_size)
-        z_batch, a_batch, z_next_batch, g_batch, r_batch, done_batch = map(torch.stack, zip(*batch))
+        # Sampling is now instantaneous because everything is already on the GPU
+        idxs = torch.randint(0, self.size, (batch_size,), device=self.device)
         
         return (
-            z_batch.to(self.device), 
-            a_batch.to(self.device), 
-            z_next_batch.to(self.device), 
-            g_batch.to(self.device), 
-            r_batch.to(self.device), 
-            done_batch.to(self.device)
+            self.z_curr[idxs], 
+            self.actions[idxs], 
+            self.z_next[idxs], 
+            self.z_target[idxs], 
+            self.rewards[idxs], 
+            self.dones[idxs]
         )
 
 def train_loop(env, actor, critic, critic_target, 
@@ -136,62 +172,74 @@ def train_loop(env, actor, critic, critic_target,
     os.makedirs(save_dir, exist_ok=True)
     print(f"Starting Standard Baseline Training Loop. Saving checkpoints to {save_dir}")
     
+    # Initialize the CSV Logger for paper statistics
+    csv_file = os.path.join(save_dir, "training_metrics.csv")
+    with open(csv_file, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Iteration", "Buffer_Size", "Actor_Loss", "Critic_Loss", "Reset_Time", "Action_Time", "EnvStep_Time", "BufStore_Time", "Train_Time", "Total_Time"])
+    
     start_time = time.time()
+    reset_time_accum = 0.0
+    act_time_accum = 0.0
+    env_step_accum = 0.0
+    buf_store_accum = 0.0
+    train_time_accum = 0.0
     
     for iteration in range(num_iterations):
         
-        # 1. Start from the beginning of the video, target is the very end of the video
+        # --- TIMER: ENV RESET (Disk I/O and Initial Encoder Pass) ---
+        t_reset = time.time()
         z_curr, _ = env.reset()
-        
-        # FIX: The World Model keeps a sequence dimension (e.g., [Batch, 1, 192])
-        # We must strip it so it matches z_curr (e.g., [Batch, 192])
+        reset_time_accum += (time.time() - t_reset)
+
         if env.z_ultimate_goal.dim() == 3:
             env.z_ultimate_goal = env.z_ultimate_goal.squeeze(1)
             
         z_target = env.z_ultimate_goal.clone()
-        
-        # Track which environments are still trying to reach their goal
         active_mask = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
         
-        # 2. Rollout for T_max steps (horizon is long to allow reaching the distant goal)
-        for step in range(T_max):
-            if not active_mask.any():
-                break # break if all envs have succeeded
+        # 1. Rollout for T_max steps (ENTIRE LOOP WRAPPED IN NO_GRAD to prevent Autograd leaks)
+        with torch.no_grad():
+            for step in range(T_max):
+                if not active_mask.any():
+                    break 
                 
-            with torch.no_grad():
+                # --- TIMER: ACTOR SAMPLE ---
+                t_act = time.time()
                 actions, _, _ = actor.sample(z_curr, z_target)
-            
-            # Step the environment (World Model)
-            z_next, rewards, dones, _, _ = env.step(actions)
-            
-            # Filter down to only environments that are still active
-            active_z_curr = z_curr[active_mask]
-            active_actions = actions[active_mask]
-            active_z_next = z_next[active_mask]
-            active_z_target = z_target[active_mask]
-            active_rewards = rewards[active_mask]
-            active_dones = dones[active_mask]
-            
-            # Store standard transitions directly into the replay buffer
-            replay_buffer.store_transitions(
-                active_z_curr, active_actions, active_z_next, 
-                active_z_target, active_rewards, active_dones
-            )
-            
-            # Update masks
-            just_succeeded = dones & active_mask
-            active_mask &= ~just_succeeded
-            
-            # Update z_curr (If inactive, keep the old z_curr so it doesn't wander)
-            z_curr = torch.where(active_mask.unsqueeze(-1), z_next, z_curr)
+                act_time_accum += (time.time() - t_act)
+                
+                # --- TIMER: ENV STEP (Model Inference) ---
+                t0 = time.time()
+                z_next, rewards, dones, _, _ = env.step(actions)
+                env_step_accum += (time.time() - t0)
+                
+                active_z_curr = z_curr[active_mask]
+                active_actions = actions[active_mask]
+                active_z_next = z_next[active_mask]
+                active_z_target = z_target[active_mask]
+                active_rewards = rewards[active_mask]
+                active_dones = dones[active_mask]
+                
+                # --- TIMER: BUFFER STORE ---
+                t1 = time.time()
+                replay_buffer.store_transitions(
+                    active_z_curr, active_actions, active_z_next, 
+                    active_z_target, active_rewards, active_dones
+                )
+                buf_store_accum += (time.time() - t1)
+                
+                just_succeeded = dones & active_mask
+                active_mask &= ~just_succeeded
+                z_curr = torch.where(active_mask.unsqueeze(-1), z_next, z_curr)
 
-        # --- 3. SAC Training Phase ---
-        if len(replay_buffer.buffer) >= 256: # Ensure enough data for a batch
-            
-            # Variables for logging
-            avg_actor_loss = 0.0
-            avg_critic_loss = 0.0
-            
+        # --- 2. SAC Training Phase ---
+        iter_train_start = time.time()
+        
+        avg_actor_loss = 0.0
+        avg_critic_loss = 0.0
+        
+        if replay_buffer.size >= 256: 
             for _ in range(40): 
                 z_b, a_b, z_next_b, g_b, r_b, d_b = replay_buffer.sample_batch(batch_size=256)
                 
@@ -199,7 +247,6 @@ def train_loop(env, actor, critic, critic_target,
                 d_b = d_b.float().unsqueeze(-1)
                 alpha = log_alpha.exp().item()
 
-                #  Update Critic
                 with torch.no_grad():
                     next_actions, next_log_pi, _ = actor.sample(z_next_b, g_b)
                     target_q1, target_q2 = critic_target(z_next_b, g_b, next_actions)
@@ -215,7 +262,6 @@ def train_loop(env, actor, critic, critic_target,
                 
                 avg_critic_loss += critic_loss.item()
 
-                # Update Actor
                 new_actions, log_pi, _ = actor.sample(z_b, g_b)
                 for p in critic.parameters():
                     p.requires_grad = False
@@ -233,22 +279,38 @@ def train_loop(env, actor, critic, critic_target,
                 for p in critic.parameters():
                     p.requires_grad = True
 
-                # Update Alpha
                 alpha_loss = -(log_alpha * (log_pi + target_entropy).detach()).mean()
                 alpha_optimizer.zero_grad()
                 alpha_loss.backward()
                 alpha_optimizer.step()
 
-                # Soft Update Target Networks
                 for target_param, param in zip(critic_target.parameters(), critic.parameters()):
                     target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+        
+        train_time_accum += (time.time() - iter_train_start)
             
-            if iteration % 10 == 0:
-                elapsed_time = time.time() - start_time
-                print(f"Iter {iteration:04d} | Buf: {len(replay_buffer.buffer):06d} trans | "
-                      f"Act Loss: {avg_actor_loss/40:.4f} | Crit Loss: {avg_critic_loss/40:.4f} | "
-                      f"Time: {elapsed_time:.2f}s")
-                start_time = time.time()
+        if iteration % 10 == 0:
+            elapsed_time = time.time() - start_time
+            
+            actor_val = avg_actor_loss/40 if replay_buffer.size >= 256 else 0.0
+            critic_val = avg_critic_loss/40 if replay_buffer.size >= 256 else 0.0
+            
+            print(f"Iter {iteration:04d} | Buf: {replay_buffer.size:06d} | "
+                  f"Act Loss: {actor_val:.4f} | Crit Loss: {critic_val:.4f} | "
+                  f"Reset: {reset_time_accum:.2f}s | Act: {act_time_accum:.2f}s | "
+                  f"EnvStep: {env_step_accum:.2f}s | BufStore: {buf_store_accum:.2f}s | "
+                  f"Train: {train_time_accum:.2f}s | Total: {elapsed_time:.2f}s")
+            
+            with open(csv_file, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([iteration, replay_buffer.size, actor_val, critic_val, reset_time_accum, act_time_accum, env_step_accum, buf_store_accum, train_time_accum, elapsed_time])
+            
+            start_time = time.time()
+            reset_time_accum = 0.0
+            act_time_accum = 0.0
+            env_step_accum = 0.0
+            buf_store_accum = 0.0
+            train_time_accum = 0.0
                 
         if (iteration > 0 and iteration % 100 == 0) or iteration == num_iterations - 1:
             torch.save(actor.state_dict(), os.path.join(save_dir, "actor_policy_baseline.pth"))
@@ -285,7 +347,7 @@ if __name__ == "__main__":
         dataset = DummyDataset()
     else:
         print("--- RUNNING IN PRODUCTION MODE ---")
-        num_envs_to_use = 50
+        num_envs_to_use = 40
         num_iters_to_run = 10000
         
         ephemeral = os.environ.get("EPHEMERAL")
@@ -322,8 +384,7 @@ if __name__ == "__main__":
 
     env = LatentEnv(jepa_model=jepa_model, dataset=dataset, num_envs=num_envs_to_use, device=device) 
     
-    # Initialize Standard Replay Buffer (No HER)
-    replay_buffer = StandardReplayBuffer(device=device)
+    replay_buffer = StandardReplayBuffer(latent_dim=192, action_dim=25, capacity=1000000, device=device)
 
     actor = GoalConditionedActor(action_dim=25).to(device)
     critic = TwinCritic(action_dim=25).to(device)
