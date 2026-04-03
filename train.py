@@ -47,7 +47,6 @@ class GoalConditionedActor(nn.Module):
         torch.nn.init.uniform_(self.mean_linear.weight, -1e-3, 1e-3)
         torch.nn.init.constant_(self.mean_linear.bias, 0)
         torch.nn.init.uniform_(self.log_std_linear.weight, -1e-3, 1e-3)
-        # Start with a smaller std (e^-1.0 ~ 0.36) so it explores safely within the expert distribution
         torch.nn.init.constant_(self.log_std_linear.bias, -1.0)
 
     def forward(self, state, goal):
@@ -68,11 +67,9 @@ class GoalConditionedActor(nn.Module):
         x_t = normal.rsample()  
         y_t = torch.tanh(x_t)
         
-        # Multiply by the new scale so the agent can reach the expert's top speed
         action = y_t * self.action_scale 
         
         log_prob = normal.log_prob(x_t)
-        # Correct the calculus for the log probability density to account for the wider scale
         log_prob -= torch.log(self.action_scale * (1.0 - y_t.pow(2)) + epsilon)
         log_prob = log_prob.sum(dim=-1, keepdim=True)
         
@@ -110,109 +107,121 @@ class TwinCritic(nn.Module):
         q2 = self.q2_l3(q2)
         return q1, q2
 
-class StandardReplayBuffer:
-    """A highly optimized tensor-based flat replay buffer natively stored on GPU."""
-    def __init__(self, latent_dim=192, action_dim=25, capacity=1000000, device="cuda"):
-        self.capacity = capacity
+class VectorizedEpisodicHERBuffer:
+    """100% GPU-native, highly optimized 3D Tensor Buffer with dynamic HER sampling."""
+    def __init__(self, latent_dim=192, action_dim=25, capacity_episodes=20000, max_t=50, future_p=0.8, device="cuda"):
+        self.capacity = capacity_episodes
+        self.max_t = max_t
+        self.future_p = future_p
         self.device = device
         
-        # Pre-allocate directly on the GPU. At 1M transitions, this is only ~1.5GB of VRAM!
-        self.z_curr = torch.zeros((capacity, latent_dim), dtype=torch.float32, device=device)
-        self.actions = torch.zeros((capacity, action_dim), dtype=torch.float32, device=device)
-        self.z_next = torch.zeros((capacity, latent_dim), dtype=torch.float32, device=device)
-        self.z_target = torch.zeros((capacity, latent_dim), dtype=torch.float32, device=device)
-        self.rewards = torch.zeros((capacity,), dtype=torch.float32, device=device)
-        self.dones = torch.zeros((capacity,), dtype=torch.float32, device=device)
+        # Pre-allocate all memory instantly
+        self.z_curr = torch.zeros((capacity_episodes, max_t, latent_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros((capacity_episodes, max_t, action_dim), dtype=torch.float32, device=device)
+        self.z_next = torch.zeros((capacity_episodes, max_t, latent_dim), dtype=torch.float32, device=device)
+        self.original_g = torch.zeros((capacity_episodes, max_t, latent_dim), dtype=torch.float32, device=device)
+        self.ep_lens = torch.zeros((capacity_episodes,), dtype=torch.long, device=device)
         
         self.position = 0
         self.size = 0
 
-    def store_transitions(self, z_curr, actions, z_next, z_target, rewards, dones):
-        batch_size = z_curr.shape[0]
-        end_idx = self.position + batch_size
-
-        # Keep everything on device. No .cpu() syncs!
-        z_curr_dev = z_curr.detach()
-        actions_dev = actions.detach()
-        z_next_dev = z_next.detach()
-        z_target_dev = z_target.detach()
-        rewards_dev = rewards.detach()
-        dones_dev = dones.detach()
-
-        # Handle writing to the tensor (including wrap-around if buffer is full)
+    def store_episodes(self, z_curr_seq, actions_seq, z_next_seq, target_seq, lengths):
+        num_new = z_curr_seq.shape[0]
+        seq_len = z_curr_seq.shape[1]
+        end_idx = self.position + num_new
+        
+        # Vectorized wrap-around injection
         if end_idx <= self.capacity:
-            self.z_curr[self.position:end_idx] = z_curr_dev
-            self.actions[self.position:end_idx] = actions_dev
-            self.z_next[self.position:end_idx] = z_next_dev
-            self.z_target[self.position:end_idx] = z_target_dev
-            self.rewards[self.position:end_idx] = rewards_dev
-            self.dones[self.position:end_idx] = dones_dev
+            self.z_curr[self.position:end_idx, :seq_len] = z_curr_seq
+            self.actions[self.position:end_idx, :seq_len] = actions_seq
+            self.z_next[self.position:end_idx, :seq_len] = z_next_seq
+            self.original_g[self.position:end_idx, :seq_len] = target_seq
+            self.ep_lens[self.position:end_idx] = lengths
         else:
             overflow = end_idx - self.capacity
-            valid = batch_size - overflow
+            valid = num_new - overflow
             
-            # Fill to the end of the buffer
-            self.z_curr[self.position:self.capacity] = z_curr_dev[:valid]
-            self.actions[self.position:self.capacity] = actions_dev[:valid]
-            self.z_next[self.position:self.capacity] = z_next_dev[:valid]
-            self.z_target[self.position:self.capacity] = z_target_dev[:valid]
-            self.rewards[self.position:self.capacity] = rewards_dev[:valid]
-            self.dones[self.position:self.capacity] = dones_dev[:valid]
+            self.z_curr[self.position:self.capacity, :seq_len] = z_curr_seq[:valid]
+            self.actions[self.position:self.capacity, :seq_len] = actions_seq[:valid]
+            self.z_next[self.position:self.capacity, :seq_len] = z_next_seq[:valid]
+            self.original_g[self.position:self.capacity, :seq_len] = target_seq[:valid]
+            self.ep_lens[self.position:self.capacity] = lengths[:valid]
             
-            # Wrap around and fill the beginning
-            self.z_curr[0:overflow] = z_curr_dev[valid:]
-            self.actions[0:overflow] = actions_dev[valid:]
-            self.z_next[0:overflow] = z_next_dev[valid:]
-            self.z_target[0:overflow] = z_target_dev[valid:]
-            self.rewards[0:overflow] = rewards_dev[valid:]
-            self.dones[0:overflow] = dones_dev[valid:]
-
+            self.z_curr[0:overflow, :seq_len] = z_curr_seq[valid:]
+            self.actions[0:overflow, :seq_len] = actions_seq[valid:]
+            self.z_next[0:overflow, :seq_len] = z_next_seq[valid:]
+            self.original_g[0:overflow, :seq_len] = target_seq[valid:]
+            self.ep_lens[0:overflow] = lengths[valid:]
+            
         self.position = end_idx % self.capacity
-        self.size = min(self.size + batch_size, self.capacity)
-
+        self.size = min(self.size + num_new, self.capacity)
+     
     def sample_batch(self, batch_size=256):
-        # Sampling is now instantaneous because everything is already on the GPU
-        idxs = torch.randint(0, self.size, (batch_size,), device=self.device)
+        # 1. Instantly sample random episodes and a random valid timestep per episode
+        ep_idxs = torch.randint(0, self.size, (batch_size,), device=self.device)
+        sampled_lens = self.ep_lens[ep_idxs]
         
-        return (
-            self.z_curr[idxs], 
-            self.actions[idxs], 
-            self.z_next[idxs], 
-            self.z_target[idxs], 
-            self.rewards[idxs], 
-            self.dones[idxs]
-        )
+        safe_lens = torch.clamp(sampled_lens, min=1)
+        t_idxs = (torch.rand(batch_size, device=self.device) * safe_lens).long()
+        t_idxs = torch.clamp(t_idxs, max=safe_lens - 1) 
+        
+        # 2. Gather base transitions
+        z_curr_b = self.z_curr[ep_idxs, t_idxs]
+        a_b = self.actions[ep_idxs, t_idxs]
+        z_next_b = self.z_next[ep_idxs, t_idxs]
+        orig_g_b = self.original_g[ep_idxs, t_idxs]
+        
+        # --- TRUE VECTORIZED HER FIX ---
+        # We must ONLY apply HER if there is a valid future step available
+        valid_future = (t_idxs < sampled_lens - 1)
+        her_mask = (torch.rand(batch_size, device=self.device) < self.future_p) & valid_future
+        
+        # Calculate how many steps are strictly AFTER t_idxs
+        range_len = sampled_lens - 1 - t_idxs
+        safe_range = torch.clamp(range_len, min=1)
+        
+        # Force offsets to be at least +1 so we never sample the immediate state!
+        offsets = (torch.rand(batch_size, device=self.device) * safe_range).long() + 1
+        future_t = torch.clamp(t_idxs + offsets, max=sampled_lens - 1)
+        
+        future_g_b = self.z_curr[ep_idxs, future_t]
+        
+        # Swap goals based on mask
+        g_target_b = torch.where(her_mask.unsqueeze(-1), future_g_b, orig_g_b)
+        
+        # 4. Dynamically compute the Sparse Rewards based on the active goal
+        action_penalty = torch.norm(a_b, p=2, dim=-1) * 0.01
+        dist = torch.norm(z_next_b - g_target_b, p=2, dim=-1)
+        success = dist < 2.0
+        
+        r_b = torch.where(success, torch.zeros_like(dist), -torch.ones_like(dist)) - action_penalty
+        done_b = success.to(torch.float32)
+        
+        return z_curr_b, a_b, z_next_b, g_target_b, r_b, done_b
 
 def sample_curriculum_tasks(all_latents, batch_size, gap_schedule, current_stage, device):
-    """Dynamically samples (start, goal) pairs, keeping a mix of old tasks to prevent forgetting."""
+    """Dynamically samples (start, goal) pairs based on the Curriculum."""
     num_eps = len(all_latents)
     
-    # Stage 0 only sees the first 50 videos. Stage 1 sees 100, etc. 
-    # This artificially keeps the local dynamics constant until the agent masters them!
     pool_size = min(num_eps, 50 * (current_stage + 1))
     ep_idxs = torch.randint(0, pool_size, (batch_size,))
     
     z_starts = []
     z_targets = []
-    gaps_used = [] # Track which gap was assigned to each environment
+    gaps_used = []
     
     for ep_idx in ep_idxs:
         ep = all_latents[ep_idx]
         ep_len = ep.shape[0]
         
-        # 80% chance to train on the current hardest gap, 20% chance to practice an old, easy gap
         if current_stage > 0 and random.random() < 0.2:
             gap = random.choice(gap_schedule[:current_stage])
         else:
             gap = gap_schedule[current_stage]
             
-        # The World Model groups 5 actions together (5 frames * 5-DOF = 25D chunk).
         actual_frame_gap = gap * 5
-        
-        # Ensure the episode is long enough for the requested physical gap
         actual_frame_gap = min(actual_frame_gap, ep_len - 1)
         
-        # Pick a random start frame, leaving enough room for the gap
         start_t = torch.randint(0, ep_len - actual_frame_gap, (1,)).item()
         target_t = start_t + actual_frame_gap
         
@@ -229,18 +238,21 @@ def train_loop(env, actor, critic, critic_target,
                save_dir="./checkpoints"):
     
     os.makedirs(save_dir, exist_ok=True)
-    print(f"Starting Curriculum Training Loop. Saving checkpoints to {save_dir}")
+    print(f"Starting Vectorized Episodic HER Loop. Saving to {save_dir}")
     
-    # Initialize the CSV Logger for paper statistics
     csv_file = os.path.join(save_dir, "training_metrics.csv")
     with open(csv_file, mode='w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["Iteration", "Stage", "Gap", "Success_Rate", "Buffer_Size", "Actor_Loss", "Critic_Loss", "EnvStep_Time", "BufStore_Time", "Train_Time", "Total_Time"])
+        writer.writerow(["Iteration", "Stage", "Gap", "Success_Rate", "Episodes_in_Buf", "Actor_Loss", "Critic_Loss", "EnvStep_Time", "BufStore_Time", "Train_Time", "Total_Time"])
     
-    gap_schedule  = [1, 2, 4, 8, 16, 24, 32, 40] 
-    tmax_schedule = [1, 2, 4, 8, 16, 24, 32, 40] 
+    # --- FIX: BALANCED T_MAX MARGIN OF ERROR ---
+    # 1 WM step = 5 physical frames.
+    # We now give a tight but forgiving margin: 2-3 extra WM steps (10-15 extra physical frames) 
+    # to allow corrective maneuvers without letting the agent wander forever.
+    gap_schedule  = [2, 4,  8, 16, 24, 32, 40] 
+    tmax_schedule = [4, 6, 10, 20, 30, 40, 50] 
     stage = 0
-    recent_successes = deque(maxlen=2000) # Tracks success rate over recent attempts
+    recent_successes = deque(maxlen=2000)
     
     start_time = time.time()
     env_step_accum = 0.0
@@ -252,22 +264,25 @@ def train_loop(env, actor, critic, critic_target,
         current_target_gap = gap_schedule[stage]
         T_max = tmax_schedule[stage]
         
-        # --- CURRICULUM TASK GENERATION ---
         z_curr, z_target, gaps_used = sample_curriculum_tasks(all_latents, env.num_envs, gap_schedule, stage, env.device)
         
-        # Teleport environment to the new starting states and set the curriculum goal
         env.set_states(z_curr)
         env.z_ultimate_goal = z_target
         
         active_mask = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
         success_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         
-        # --- TELEMETRY TRACKERS ---
         rollout_act_mags = []
         avg_start_dist = 0.0
         avg_end_dist = 0.0
         
-        # 1. Rollout for T_max steps (ENTIRE LOOP WRAPPED IN NO_GRAD to prevent Autograd leaks)
+        # Pre-allocate temporary trajectory memory for blazing fast collection
+        rollout_z_curr = torch.zeros((env.num_envs, T_max, 192), dtype=torch.float32, device=env.device)
+        rollout_actions = torch.zeros((env.num_envs, T_max, 25), dtype=torch.float32, device=env.device)
+        rollout_z_next = torch.zeros((env.num_envs, T_max, 192), dtype=torch.float32, device=env.device)
+        rollout_z_target = torch.zeros((env.num_envs, T_max, 192), dtype=torch.float32, device=env.device)
+        rollout_lengths = torch.zeros((env.num_envs,), dtype=torch.long, device=env.device)
+        
         with torch.no_grad():
             for step in range(T_max):
                 if not active_mask.any():
@@ -279,36 +294,18 @@ def train_loop(env, actor, critic, critic_target,
                 actions, _, _ = actor.sample(z_curr, z_target)
                 rollout_act_mags.append(torch.norm(actions, p=2, dim=-1).mean().item())
                 
-                # --- TIMER: ENV STEP (Model Inference) ---
                 t0 = time.time()
-                z_next, rewards, dones, _, _ = env.step(actions)
+                z_next, _, dones, _, _ = env.step(actions)
                 env_step_accum += (time.time() - t0)
                 
-                if step == T_max - 1:
-                    avg_end_dist = torch.norm(z_curr - z_target, p=2, dim=-1).mean().item()
-                
-                active_z_curr = z_curr[active_mask]
-                active_actions = actions[active_mask]
-                active_z_next = z_next[active_mask]
-                active_z_target = z_target[active_mask]
-                active_dones = dones[active_mask]
-                
-                # --- ACTION REGULARIZATION ---
-                # Add a penalty for taking massive actions!
-                # This teaches the Critic to pull the agent out of the OOD "shadow realm"
-                action_penalty = torch.norm(active_actions, p=2, dim=-1) * 0.01
-                active_rewards = rewards[active_mask] - action_penalty
-                
-                # --- TIMER: BUFFER STORE ---
                 t1 = time.time()
                 
-                # 1. Store the standard transition (Agent tried to reach z_target)
-                replay_buffer.store_transitions(
-                    active_z_curr, active_actions, active_z_next, 
-                    active_z_target, active_rewards, active_dones
-                )
-                
-                # HER has been completely removed to prevent World Model hallucination exploitation!
+                # Instantly record data ONLY for environments that are still running
+                rollout_z_curr[active_mask, step] = z_curr[active_mask]
+                rollout_actions[active_mask, step] = actions[active_mask]
+                rollout_z_next[active_mask, step] = z_next[active_mask]
+                rollout_z_target[active_mask, step] = z_target[active_mask]
+                rollout_lengths[active_mask] += 1
                 
                 buf_store_accum += (time.time() - t1)
                 
@@ -317,9 +314,17 @@ def train_loop(env, actor, critic, critic_target,
                 
                 active_mask &= ~just_succeeded
                 z_curr = torch.where(active_mask.unsqueeze(-1), z_next, z_curr)
+            
+            # Record true ending distance after the loop captures all successes/failures accurately!
+            avg_end_dist = torch.norm(z_curr - z_target, p=2, dim=-1).mean().item()
 
-        # --- CURRICULUM ADVANCEMENT LOGIC ---
-        # ONLY track success rate for the current hardest tasks (ignore the 20% easy practice tasks)
+        # Inject the entire rollout batch into the buffer instantly
+        t2 = time.time()
+        replay_buffer.store_episodes(
+            rollout_z_curr, rollout_actions, rollout_z_next, rollout_z_target, rollout_lengths
+        )
+        buf_store_accum += (time.time() - t2)
+
         hard_task_mask = (gaps_used == current_target_gap)
         if hard_task_mask.any():
             hard_successes = success_mask[hard_task_mask]
@@ -327,20 +332,20 @@ def train_loop(env, actor, critic, critic_target,
             
         current_sr = np.mean(recent_successes) if len(recent_successes) > 0 else 0.0
         
-        # Require the buffer to be full (2000 attempts) and SR > 85% to advance
         if len(recent_successes) == recent_successes.maxlen and current_sr > 0.85:
             if stage < len(gap_schedule) - 1:
                 stage += 1
-                recent_successes.clear() # Reset tracking for the new harder stage
+                recent_successes.clear()
                 print(f"\n*** CURRICULUM ADVANCE: Stage {stage} | New Gap: {gap_schedule[stage]} | New T_max: {tmax_schedule[stage]} ***\n")
 
-        # --- 2. SAC Training Phase ---
+        # --- SAC Training Phase ---
         iter_train_start = time.time()
         
         avg_actor_loss = 0.0
         avg_critic_loss = 0.0
         
-        if replay_buffer.size >= 256: 
+        # Buffer readiness condition 
+        if replay_buffer.size >= 50: 
             for _ in range(40): 
                 z_b, a_b, z_next_b, g_b, r_b, d_b = replay_buffer.sample_batch(batch_size=256)
                 
@@ -348,7 +353,7 @@ def train_loop(env, actor, critic, critic_target,
                 d_b = d_b.unsqueeze(-1)
                 alpha = log_alpha.exp().item()
 
-                #  Update Critic
+                # Update Critic
                 with torch.no_grad():
                     next_actions, next_log_pi, _ = actor.sample(z_next_b, g_b)
                     target_q1, target_q2 = critic_target(z_next_b, g_b, next_actions)
@@ -397,12 +402,12 @@ def train_loop(env, actor, critic, critic_target,
         train_time_accum += (time.time() - iter_train_start)
 
         if iteration % 10 == 0:
-            actor_val = avg_actor_loss / 40.0 if replay_buffer.size >= 256 else 0.0
-            critic_val = avg_critic_loss / 40.0 if replay_buffer.size >= 256 else 0.0
+            actor_val = avg_actor_loss / 40.0 if replay_buffer.size >= 50 else 0.0
+            critic_val = avg_critic_loss / 40.0 if replay_buffer.size >= 50 else 0.0
             elapsed_time = time.time() - start_time
             avg_act_mag = np.mean(rollout_act_mags) if rollout_act_mags else 0.0
                 
-            print(f"Iter {iteration:04d} | SR: {current_sr*100:.1f}% | "
+            print(f"Iter {iteration:04d} | SR: {current_sr*100:.1f}% | Buf Eps: {replay_buffer.size} | "
                   f"Act Loss: {actor_val:.1f} | Crit Loss: {critic_val:.1f} | "
                   f"ActMag: {avg_act_mag:.2f} | StartD: {avg_start_dist:.2f} | EndD: {avg_end_dist:.2f}")
             
@@ -460,18 +465,18 @@ if __name__ == "__main__":
             
         data_path = f"{ephemeral}/stable_wm_data/ogbench/cube_single_expert.h5"
         ckpt_path = f"{ephemeral}/stable_wm_data/cube/lejepa_weights.ckpt"
-        
+
         print(f"Loading Dataset from: {data_path}")
         print(f"Loading Checkpoint from: {ckpt_path}")
 
         parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-        
+
         if parent_dir not in sys.path:
             sys.path.insert(0, parent_dir)
 
-        with initialize(version_base=None, config_path="../config"): 
+        with initialize(version_base=None, config_path="../config"):
             cfg = compose(config_name="eval/cube", overrides=["+policy=cube/lejepa"])
-        
+
         dataset = swm.data.HDF5Dataset(
             f"{ephemeral}/stable_wm_data/ogbench/cube_single_expert"
         )
@@ -494,7 +499,8 @@ if __name__ == "__main__":
 
     env = LatentEnv(jepa_model=jepa_model, dataset=dataset, num_envs=num_envs_to_use, device=device) 
     
-    replay_buffer = StandardReplayBuffer(latent_dim=192, action_dim=25, capacity=1000000, device=device)
+    # Pass max_t=50 to support our max T_max of 40 comfortably!
+    replay_buffer = VectorizedEpisodicHERBuffer(latent_dim=192, action_dim=25, capacity_episodes=20000, max_t=50, future_p=0.8, device=device)
 
     actor = GoalConditionedActor(action_dim=25).to(device)
     critic = TwinCritic(action_dim=25).to(device)
@@ -506,7 +512,6 @@ if __name__ == "__main__":
 
     target_entropy = -float(actor.mean_linear.out_features) 
     
-    # By starting alpha at ~0.13 instead of 1.0, the agent actually cares about the Q-Values immediately!
     log_alpha = torch.tensor([-2.0], requires_grad=True, device=device)
     alpha_optimizer = torch.optim.Adam([log_alpha], lr=3e-4)
 

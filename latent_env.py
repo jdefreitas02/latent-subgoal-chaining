@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 import torch
+import torchvision.transforms.v2 as tv_transforms
 import os
 import time
 
@@ -20,7 +21,7 @@ class LatentEnv(gym.Env):
         self.history_size = history_size
         
         self.latent_dim = 192
-        self.action_dim = 5
+        self.action_dim = 25
         
         self.z_history = None
         self.act_history = None
@@ -136,26 +137,32 @@ class LatentEnv(gym.Env):
         batch_size = 10 
         
         all_latents = []
+        img_transform = tv_transforms.Compose([
+            tv_transforms.ToDtype(torch.float32, scale=True),
+            tv_transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
         total_frames_processed = 0
         t0 = time.time()
-        
+
         with torch.no_grad():
             for i in range(0, num_episodes, batch_size):
                 end_idx = min(i + batch_size, num_episodes)
                 ep_indices = np.arange(i, end_idx)
                 ep_lens = self.dataset.lengths[ep_indices]
-                
+
                 # Request the ENTIRE episode (from frame 0 to ep_len)
                 starts = np.zeros(len(ep_indices), dtype=int)
                 ends = ep_lens
-                
+
                 chunks = self.dataset.load_chunk(ep_indices, starts, ends)
-                
+
                 for chunk in chunks:
-                    pixels = chunk['pixels'].to(self.device)
+                    raw_pixels = chunk['pixels'].to(self.device)  # [T, C, H, W] uint8
+                    pixels = img_transform(raw_pixels)            # [T, C, H, W] float32, ImageNet-normalised
                     # Add dummy batch dimension for the Vision Transformer
                     pixels_5d = pixels.unsqueeze(0)
-                    
+
                     # Encode and strip the dummy batch dimension
                     z_ep = self.model.encode({'pixels': pixels_5d})['emb'].squeeze(0)
                     
