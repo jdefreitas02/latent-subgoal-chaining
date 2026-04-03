@@ -99,7 +99,7 @@ class LatentEnv(gym.Env):
         self.current_steps.zero_()
 
     def step(self, actions):
-        HS = 3 
+        HS = 1 
         
         if actions.dim() == 2:
             actions = actions.unsqueeze(1)
@@ -117,8 +117,9 @@ class LatentEnv(gym.Env):
         self.z_history = torch.cat([self.z_history, z_next], dim=1)
         
         distances = torch.norm(z_next.squeeze(1) - self.z_ultimate_goal, p=2, dim=-1)
-        rewards = -(distances > 0.5).float()
-        dones = distances < 0.5
+        
+        rewards = -distances
+        dones = distances < 2.0
         
         return z_next.squeeze(1), rewards, dones, False, {}
 
