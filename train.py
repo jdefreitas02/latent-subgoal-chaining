@@ -8,6 +8,7 @@ import random
 import os
 import time
 import csv
+from collections import deque
 import stable_worldmodel as swm
 from hydra import initialize, compose
         
@@ -27,21 +28,32 @@ def weights_init_(m):
 
 class GoalConditionedActor(nn.Module):
     """The Policy Network: pi(action | z_curr, z_goal)"""
-    def __init__(self, latent_dim=192, action_dim=5, hidden_dim=256):
+    def __init__(self, latent_dim=192, action_dim=25, hidden_dim=256, action_scale=3.0):
         super(GoalConditionedActor, self).__init__()
+        
+        self.action_scale = action_scale
         
         input_dim = latent_dim * 2
         self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
         self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
         
         self.mean_linear = nn.Linear(hidden_dim, action_dim)
         self.log_std_linear = nn.Linear(hidden_dim, action_dim)
         self.apply(weights_init_)
+        
+        # Force the Actor to start with very small actions to prevent blowing up the World Model
+        torch.nn.init.uniform_(self.mean_linear.weight, -1e-3, 1e-3)
+        torch.nn.init.constant_(self.mean_linear.bias, 0)
+        torch.nn.init.uniform_(self.log_std_linear.weight, -1e-3, 1e-3)
+        # Start with a smaller std (e^-1.0 ~ 0.36) so it explores safely within the expert distribution
+        torch.nn.init.constant_(self.log_std_linear.bias, -1.0)
 
     def forward(self, state, goal):
         x = torch.cat([state, goal], dim=-1)
-        x = F.relu(self.linear1(x))
-        x = F.relu(self.linear2(x))
+        x = F.relu(self.ln1(self.linear1(x)))
+        x = F.relu(self.ln2(self.linear2(x)))
         
         mean = self.mean_linear(x)
         log_std = self.log_std_linear(x)
@@ -55,38 +67,46 @@ class GoalConditionedActor(nn.Module):
         
         x_t = normal.rsample()  
         y_t = torch.tanh(x_t)
-        action = y_t * 1.0 # Action scale
+        
+        # Multiply by the new scale so the agent can reach the expert's top speed
+        action = y_t * self.action_scale 
         
         log_prob = normal.log_prob(x_t)
-        log_prob -= torch.log(1.0 - y_t.pow(2) + epsilon)
+        # Correct the calculus for the log probability density to account for the wider scale
+        log_prob -= torch.log(self.action_scale * (1.0 - y_t.pow(2)) + epsilon)
         log_prob = log_prob.sum(dim=-1, keepdim=True)
-        return action, log_prob, mean
+        
+        return action, log_prob, torch.tanh(mean) * self.action_scale
 
 class TwinCritic(nn.Module):
     """The Value Network: Q(z_curr, z_goal, action)"""
-    def __init__(self, latent_dim=192, action_dim=5, hidden_dim=256):
+    def __init__(self, latent_dim=192, action_dim=25, hidden_dim=256):
         super(TwinCritic, self).__init__()
         
         input_dim = (latent_dim * 2) + action_dim
         
         self.q1_l1 = nn.Linear(input_dim, hidden_dim)
+        self.q1_ln1 = nn.LayerNorm(hidden_dim)
         self.q1_l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.q1_ln2 = nn.LayerNorm(hidden_dim)
         self.q1_l3 = nn.Linear(hidden_dim, 1)
         
         self.q2_l1 = nn.Linear(input_dim, hidden_dim)
+        self.q2_ln1 = nn.LayerNorm(hidden_dim)
         self.q2_l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.q2_ln2 = nn.LayerNorm(hidden_dim)
         self.q2_l3 = nn.Linear(hidden_dim, 1)
         self.apply(weights_init_)
 
     def forward(self, state, goal, action):
         x = torch.cat([state, goal, action], dim=-1)
         
-        q1 = F.relu(self.q1_l1(x))
-        q1 = F.relu(self.q1_l2(q1))
+        q1 = F.relu(self.q1_ln1(self.q1_l1(x)))
+        q1 = F.relu(self.q1_ln2(self.q1_l2(q1)))
         q1 = self.q1_l3(q1)
         
-        q2 = F.relu(self.q2_l1(x))
-        q2 = F.relu(self.q2_l2(q2))
+        q2 = F.relu(self.q2_ln1(self.q2_l1(x)))
+        q2 = F.relu(self.q2_ln2(self.q2_l2(q2)))
         q2 = self.q2_l3(q2)
         return q1, q2
 
@@ -163,75 +183,156 @@ class StandardReplayBuffer:
             self.dones[idxs]
         )
 
+def sample_curriculum_tasks(all_latents, batch_size, gap_schedule, current_stage, device):
+    """Dynamically samples (start, goal) pairs, keeping a mix of old tasks to prevent forgetting."""
+    num_eps = len(all_latents)
+    
+    # Stage 0 only sees the first 50 videos. Stage 1 sees 100, etc. 
+    # This artificially keeps the local dynamics constant until the agent masters them!
+    pool_size = min(num_eps, 50 * (current_stage + 1))
+    ep_idxs = torch.randint(0, pool_size, (batch_size,))
+    
+    z_starts = []
+    z_targets = []
+    gaps_used = [] # Track which gap was assigned to each environment
+    
+    for ep_idx in ep_idxs:
+        ep = all_latents[ep_idx]
+        ep_len = ep.shape[0]
+        
+        # 80% chance to train on the current hardest gap, 20% chance to practice an old, easy gap
+        if current_stage > 0 and random.random() < 0.2:
+            gap = random.choice(gap_schedule[:current_stage])
+        else:
+            gap = gap_schedule[current_stage]
+            
+        # The World Model groups 5 actions together (5 frames * 5-DOF = 25D chunk).
+        actual_frame_gap = gap * 5
+        
+        # Ensure the episode is long enough for the requested physical gap
+        actual_frame_gap = min(actual_frame_gap, ep_len - 1)
+        
+        # Pick a random start frame, leaving enough room for the gap
+        start_t = torch.randint(0, ep_len - actual_frame_gap, (1,)).item()
+        target_t = start_t + actual_frame_gap
+        
+        z_starts.append(ep[start_t])
+        z_targets.append(ep[target_t])
+        gaps_used.append(gap)
+        
+    return torch.stack(z_starts).to(device), torch.stack(z_targets).to(device), torch.tensor(gaps_used, device=device)
+
 def train_loop(env, actor, critic, critic_target, 
                actor_optimizer, critic_optimizer, alpha_optimizer, 
-               log_alpha, target_entropy, replay_buffer, 
-               num_iterations=1000, T_max=50, gamma=0.99, tau=0.005, 
+               log_alpha, target_entropy, replay_buffer, all_latents,
+               num_iterations=1000, gamma=0.99, tau=0.005, 
                save_dir="./checkpoints"):
     
     os.makedirs(save_dir, exist_ok=True)
-    print(f"Starting Standard Baseline Training Loop. Saving checkpoints to {save_dir}")
+    print(f"Starting Curriculum Training Loop. Saving checkpoints to {save_dir}")
     
     # Initialize the CSV Logger for paper statistics
     csv_file = os.path.join(save_dir, "training_metrics.csv")
     with open(csv_file, mode='w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["Iteration", "Buffer_Size", "Actor_Loss", "Critic_Loss", "Reset_Time", "Action_Time", "EnvStep_Time", "BufStore_Time", "Train_Time", "Total_Time"])
+        writer.writerow(["Iteration", "Stage", "Gap", "Success_Rate", "Buffer_Size", "Actor_Loss", "Critic_Loss", "EnvStep_Time", "BufStore_Time", "Train_Time", "Total_Time"])
+    
+    gap_schedule  = [1, 2, 4, 8, 16, 24, 32, 40] 
+    tmax_schedule = [1, 2, 4, 8, 16, 24, 32, 40] 
+    stage = 0
+    recent_successes = deque(maxlen=2000) # Tracks success rate over recent attempts
     
     start_time = time.time()
-    reset_time_accum = 0.0
-    act_time_accum = 0.0
     env_step_accum = 0.0
     buf_store_accum = 0.0
     train_time_accum = 0.0
     
     for iteration in range(num_iterations):
         
-        # --- TIMER: ENV RESET (Disk I/O and Initial Encoder Pass) ---
-        t_reset = time.time()
-        z_curr, _ = env.reset()
-        reset_time_accum += (time.time() - t_reset)
-
-        if env.z_ultimate_goal.dim() == 3:
-            env.z_ultimate_goal = env.z_ultimate_goal.squeeze(1)
-            
-        z_target = env.z_ultimate_goal.clone()
+        current_target_gap = gap_schedule[stage]
+        T_max = tmax_schedule[stage]
+        
+        # --- CURRICULUM TASK GENERATION ---
+        z_curr, z_target, gaps_used = sample_curriculum_tasks(all_latents, env.num_envs, gap_schedule, stage, env.device)
+        
+        # Teleport environment to the new starting states and set the curriculum goal
+        env.set_states(z_curr)
+        env.z_ultimate_goal = z_target
+        
         active_mask = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        success_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        
+        # --- TELEMETRY TRACKERS ---
+        rollout_act_mags = []
+        avg_start_dist = 0.0
+        avg_end_dist = 0.0
         
         # 1. Rollout for T_max steps (ENTIRE LOOP WRAPPED IN NO_GRAD to prevent Autograd leaks)
         with torch.no_grad():
             for step in range(T_max):
                 if not active_mask.any():
                     break 
+                    
+                if step == 0:
+                    avg_start_dist = torch.norm(z_curr - z_target, p=2, dim=-1).mean().item()
                 
-                # --- TIMER: ACTOR SAMPLE ---
-                t_act = time.time()
                 actions, _, _ = actor.sample(z_curr, z_target)
-                act_time_accum += (time.time() - t_act)
+                rollout_act_mags.append(torch.norm(actions, p=2, dim=-1).mean().item())
                 
                 # --- TIMER: ENV STEP (Model Inference) ---
                 t0 = time.time()
                 z_next, rewards, dones, _, _ = env.step(actions)
                 env_step_accum += (time.time() - t0)
                 
+                if step == T_max - 1:
+                    avg_end_dist = torch.norm(z_curr - z_target, p=2, dim=-1).mean().item()
+                
                 active_z_curr = z_curr[active_mask]
                 active_actions = actions[active_mask]
                 active_z_next = z_next[active_mask]
                 active_z_target = z_target[active_mask]
-                active_rewards = rewards[active_mask]
                 active_dones = dones[active_mask]
+                
+                # --- ACTION REGULARIZATION ---
+                # Add a penalty for taking massive actions!
+                # This teaches the Critic to pull the agent out of the OOD "shadow realm"
+                action_penalty = torch.norm(active_actions, p=2, dim=-1) * 0.01
+                active_rewards = rewards[active_mask] - action_penalty
                 
                 # --- TIMER: BUFFER STORE ---
                 t1 = time.time()
+                
+                # 1. Store the standard transition (Agent tried to reach z_target)
                 replay_buffer.store_transitions(
                     active_z_curr, active_actions, active_z_next, 
                     active_z_target, active_rewards, active_dones
                 )
+                
+                # HER has been completely removed to prevent World Model hallucination exploitation!
+                
                 buf_store_accum += (time.time() - t1)
                 
                 just_succeeded = dones & active_mask
+                success_mask |= just_succeeded
+                
                 active_mask &= ~just_succeeded
                 z_curr = torch.where(active_mask.unsqueeze(-1), z_next, z_curr)
+
+        # --- CURRICULUM ADVANCEMENT LOGIC ---
+        # ONLY track success rate for the current hardest tasks (ignore the 20% easy practice tasks)
+        hard_task_mask = (gaps_used == current_target_gap)
+        if hard_task_mask.any():
+            hard_successes = success_mask[hard_task_mask]
+            recent_successes.extend(hard_successes.cpu().tolist())
+            
+        current_sr = np.mean(recent_successes) if len(recent_successes) > 0 else 0.0
+        
+        # Require the buffer to be full (2000 attempts) and SR > 85% to advance
+        if len(recent_successes) == recent_successes.maxlen and current_sr > 0.85:
+            if stage < len(gap_schedule) - 1:
+                stage += 1
+                recent_successes.clear() # Reset tracking for the new harder stage
+                print(f"\n*** CURRICULUM ADVANCE: Stage {stage} | New Gap: {gap_schedule[stage]} | New T_max: {tmax_schedule[stage]} ***\n")
 
         # --- 2. SAC Training Phase ---
         iter_train_start = time.time()
@@ -244,9 +345,10 @@ def train_loop(env, actor, critic, critic_target,
                 z_b, a_b, z_next_b, g_b, r_b, d_b = replay_buffer.sample_batch(batch_size=256)
                 
                 r_b = r_b.unsqueeze(-1)
-                d_b = d_b.float().unsqueeze(-1)
+                d_b = d_b.unsqueeze(-1)
                 alpha = log_alpha.exp().item()
 
+                #  Update Critic
                 with torch.no_grad():
                     next_actions, next_log_pi, _ = actor.sample(z_next_b, g_b)
                     target_q1, target_q2 = critic_target(z_next_b, g_b, next_actions)
@@ -258,10 +360,12 @@ def train_loop(env, actor, critic, critic_target,
 
                 critic_optimizer.zero_grad()
                 critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
                 critic_optimizer.step()
                 
                 avg_critic_loss += critic_loss.item()
 
+                # Update Actor
                 new_actions, log_pi, _ = actor.sample(z_b, g_b)
                 for p in critic.parameters():
                     p.requires_grad = False
@@ -272,6 +376,7 @@ def train_loop(env, actor, critic, critic_target,
 
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
                 actor_optimizer.step()
                 
                 avg_actor_loss += actor_loss.item()
@@ -279,35 +384,33 @@ def train_loop(env, actor, critic, critic_target,
                 for p in critic.parameters():
                     p.requires_grad = True
 
+                # Update Alpha
                 alpha_loss = -(log_alpha * (log_pi + target_entropy).detach()).mean()
                 alpha_optimizer.zero_grad()
                 alpha_loss.backward()
                 alpha_optimizer.step()
 
+                # Soft Update Target Networks
                 for target_param, param in zip(critic_target.parameters(), critic.parameters()):
                     target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
-        
+            
         train_time_accum += (time.time() - iter_train_start)
-            
+
         if iteration % 10 == 0:
+            actor_val = avg_actor_loss / 40.0 if replay_buffer.size >= 256 else 0.0
+            critic_val = avg_critic_loss / 40.0 if replay_buffer.size >= 256 else 0.0
             elapsed_time = time.time() - start_time
-            
-            actor_val = avg_actor_loss/40 if replay_buffer.size >= 256 else 0.0
-            critic_val = avg_critic_loss/40 if replay_buffer.size >= 256 else 0.0
-            
-            print(f"Iter {iteration:04d} | Buf: {replay_buffer.size:06d} | "
-                  f"Act Loss: {actor_val:.4f} | Crit Loss: {critic_val:.4f} | "
-                  f"Reset: {reset_time_accum:.2f}s | Act: {act_time_accum:.2f}s | "
-                  f"EnvStep: {env_step_accum:.2f}s | BufStore: {buf_store_accum:.2f}s | "
-                  f"Train: {train_time_accum:.2f}s | Total: {elapsed_time:.2f}s")
+            avg_act_mag = np.mean(rollout_act_mags) if rollout_act_mags else 0.0
+                
+            print(f"Iter {iteration:04d} | SR: {current_sr*100:.1f}% | "
+                  f"Act Loss: {actor_val:.1f} | Crit Loss: {critic_val:.1f} | "
+                  f"ActMag: {avg_act_mag:.2f} | StartD: {avg_start_dist:.2f} | EndD: {avg_end_dist:.2f}")
             
             with open(csv_file, mode='a', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow([iteration, replay_buffer.size, actor_val, critic_val, reset_time_accum, act_time_accum, env_step_accum, buf_store_accum, train_time_accum, elapsed_time])
+                writer.writerow([iteration, stage, current_target_gap, current_sr, replay_buffer.size, actor_val, critic_val, env_step_accum, buf_store_accum, train_time_accum, elapsed_time])
             
             start_time = time.time()
-            reset_time_accum = 0.0
-            act_time_accum = 0.0
             env_step_accum = 0.0
             buf_store_accum = 0.0
             train_time_accum = 0.0
@@ -345,9 +448,10 @@ if __name__ == "__main__":
         
         jepa_model = DummyJEPA().to(device)
         dataset = DummyDataset()
+        all_latents = [torch.randn(201, 192) for _ in range(10)]
     else:
         print("--- RUNNING IN PRODUCTION MODE ---")
-        num_envs_to_use = 40
+        num_envs_to_use = 50
         num_iters_to_run = 10000
         
         ephemeral = os.environ.get("EPHEMERAL")
@@ -381,6 +485,12 @@ if __name__ == "__main__":
             param.requires_grad = False
             
         print("Dataset and JEPA Model successfully loaded")
+        
+        # Load the massive latents cache for Curriculum task sampling
+        cache_path = os.path.join(ephemeral, "stable_wm_data", "cube_all_latents_cache.pt")
+        print(f"Loading latents cache from {cache_path}...")
+        cache = torch.load(cache_path)
+        all_latents = cache['all_latents']
 
     env = LatentEnv(jepa_model=jepa_model, dataset=dataset, num_envs=num_envs_to_use, device=device) 
     
@@ -395,7 +505,9 @@ if __name__ == "__main__":
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=3e-4)
 
     target_entropy = -float(actor.mean_linear.out_features) 
-    log_alpha = torch.zeros(1, requires_grad=True, device=device)
+    
+    # By starting alpha at ~0.13 instead of 1.0, the agent actually cares about the Q-Values immediately!
+    log_alpha = torch.tensor([-2.0], requires_grad=True, device=device)
     alpha_optimizer = torch.optim.Adam([log_alpha], lr=3e-4)
 
     train_loop(
@@ -409,9 +521,9 @@ if __name__ == "__main__":
         log_alpha=log_alpha,
         target_entropy=target_entropy,
         replay_buffer=replay_buffer,
+        all_latents=all_latents,
         num_iterations=num_iters_to_run,
-        T_max=200, 
         gamma=0.99,
         tau=0.005,
-        save_dir="./checkpoints_baseline" 
+        save_dir="./checkpoints_curriculum_2" 
     )
