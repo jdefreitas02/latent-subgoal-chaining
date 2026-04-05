@@ -6,27 +6,25 @@ import os
 import time
 
 class LatentEnv(gym.Env):
-    def __init__(self, jepa_model, dataset, num_envs=50, device="cuda", max_steps=50, history_size=3):
+    def __init__(self, jepa_model, dataset, num_envs=50, device="cuda"):
         super().__init__()
-        
+
         self.model = jepa_model.to(device)
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
-            
+
         self.dataset = dataset
         self.num_envs = num_envs
         self.device = device
-        self.max_steps = max_steps
-        self.history_size = history_size
-        
+
         self.latent_dim = 192
         self.action_dim = 25
-        
-        self.z_history = None
-        self.act_history = None
+
+        # Single-frame state buffers — the world model is Markovian (HS=1)
+        self.z_state = None      # [num_envs, 1, latent_dim]
+        self.act_emb = None      # [num_envs, 1, latent_dim]
         self.z_ultimate_goal = None
-        self.current_steps = torch.zeros(self.num_envs, device=self.device)
         
         # --- CACHE LOADING / GENERATION ---
         ephemeral = os.environ.get("EPHEMERAL")
@@ -55,77 +53,59 @@ class LatentEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.current_steps.zero_()
-        
-        # 1. Grab the next batch of completely unique episodes
+
+        # Grab the next batch of completely unique episodes
         if self.ep_ptr + self.num_envs > self.num_total_episodes:
-            # We reached the end of the dataset. Reshuffle and start over
+            # Reached the end of the dataset — reshuffle and start over
             self.ep_order = np.random.permutation(self.num_total_episodes)
             self.ep_ptr = 0
-            
+
         ep_indices = self.ep_order[self.ep_ptr : self.ep_ptr + self.num_envs]
         self.ep_ptr += self.num_envs
-        
-        # 2. INSTANTANEOUS LOAD FROM GPU RAM (Zero Disk I/O, Zero Encoding)
-        z_start = self.all_starts[ep_indices]
+
+        # INSTANTANEOUS LOAD FROM GPU RAM (Zero Disk I/O, Zero Encoding)
+        z_start = self.all_starts[ep_indices]           # [B, latent_dim]
         self.z_ultimate_goal = self.all_goals[ep_indices].clone()
-            
-        if z_start.dim() == 2:
-            z_start = z_start.unsqueeze(1) # Shape: [Batch, 1, Dim]
-            
-        # We duplicate the starting state 3 times to simulate standing still
-        self.z_history = z_start.repeat(1, 3, 1)
-        
-        latent_dim = z_start.shape[-1]
-        
-        # Pad the ENCODED action history with 3 steps of zero-actions
-        self.act_history = torch.zeros((self.num_envs, 3, latent_dim), device=self.device)
-        
+
+        self.z_state  = z_start.unsqueeze(1)            # [B, 1, latent_dim]
+        self.act_emb  = torch.zeros_like(self.z_state)  # [B, 1, latent_dim]
+
         return self._get_obs(), {}
 
     def set_states(self, z_curr):
         """
         Teleports the environments to the provided latent states and flushes history.
-        Expects z_curr shape: [num_envs, 192]
+        Expects z_curr shape: [num_envs, latent_dim]
         """
         if not isinstance(z_curr, torch.Tensor):
             z_curr = torch.tensor(z_curr, dtype=torch.float32, device=self.device)
-            
-        if z_curr.dim() == 2:
-            z_curr = z_curr.unsqueeze(1) 
 
-        self.z_history = z_curr.repeat(1, 3, 1).to(self.device)
-        latent_dim = z_curr.shape[-1]
-        self.act_history = torch.zeros((self.num_envs, 3, latent_dim), device=self.device)
-        self.current_steps.zero_()
+        self.z_state = z_curr.unsqueeze(1).to(self.device)  # [B, 1, latent_dim]
+        self.act_emb = torch.zeros_like(self.z_state)
 
     def step(self, actions):
-        HS = 1 
-        
         if actions.dim() == 2:
             actions = actions.unsqueeze(1)
-            
+
         act_emb = self.model.action_encoder(actions)
-        if act_emb.dim() == 2: 
-            act_emb = act_emb.unsqueeze(1) 
-            
-        self.act_history = torch.cat([self.act_history, act_emb], dim=1)
-        
-        z_trunc = self.z_history[:, -HS:]
-        act_trunc = self.act_history[:, -HS:]
-        
-        z_next = self.model.predict(z_trunc, act_trunc)[:, -1:]
-        self.z_history = torch.cat([self.z_history, z_next], dim=1)
-        
+        if act_emb.dim() == 2:
+            act_emb = act_emb.unsqueeze(1)
+
+        # World model is Markovian: predict next state from current state + action only
+        z_next = self.model.predict(self.z_state, act_emb)[:, -1:]
+
+        # Overwrite single-frame buffers (no unbounded history growth)
+        self.z_state = z_next
+        self.act_emb = act_emb
+
         distances = torch.norm(z_next.squeeze(1) - self.z_ultimate_goal, p=2, dim=-1)
-        
         rewards = -distances
         dones = distances < 2.0
-        
+
         return z_next.squeeze(1), rewards, dones, False, {}
 
     def _get_obs(self):
-        return self.z_history[:, -1]
+        return self.z_state.squeeze(1)
 
     def _precompute(self, save_path):
         """
