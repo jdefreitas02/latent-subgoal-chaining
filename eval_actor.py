@@ -1,6 +1,7 @@
 import os
 os.environ["MUJOCO_GL"] = "glfw"
 
+import re
 import sys
 
 # jepa.py lives in the parent directory. torch.load() unpickles the checkpoint
@@ -24,6 +25,50 @@ from sklearn import preprocessing
 
 import stable_pretraining as spt
 import stable_worldmodel as swm
+
+# Import high-level policy architectures from their training module
+from train_high_level import MLPHighLevel, DiffusionHighLevel
+
+
+# ==========================================================
+# 0. OGBench WM LOADER (for state_dict .ckpt checkpoints)
+# ==========================================================
+def load_ogbench_jepa(ckpt_path, device="cuda"):
+    """Load an OGBench-style pytorch-lightning state_dict checkpoint into a bare JEPA model.
+
+    The checkpoint stores weights under 'state_dict' with a 'model.' prefix added by
+    the spt.Module wrapper. Architecture: ViT-Tiny, patch_size=8, img_size=64.
+    This mirrors the loading logic in analyse_ogbench_wm.py.
+    """
+    from jepa import JEPA
+    from module import ARPredictor, Embedder, MLP
+
+    encoder = spt.backbone.utils.vit_hf(
+        "tiny", patch_size=8, image_size=64, pretrained=False, use_mask_token=False
+    )
+    predictor = ARPredictor(
+        num_frames=3, input_dim=192, hidden_dim=192, output_dim=192,
+        depth=6, heads=16, mlp_dim=2048, dim_head=64, dropout=0.1, emb_dropout=0.0,
+    )
+    action_encoder = Embedder(input_dim=25, emb_dim=192)
+    projector = MLP(input_dim=192, output_dim=192, hidden_dim=2048,
+                    norm_fn=torch.nn.BatchNorm1d)
+    pred_proj  = MLP(input_dim=192, output_dim=192, hidden_dim=2048,
+                    norm_fn=torch.nn.BatchNorm1d)
+    model = JEPA(encoder=encoder, predictor=predictor,
+                 action_encoder=action_encoder, projector=projector, pred_proj=pred_proj)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    raw_sd = {k[len("model."):]: v for k, v in ckpt["state_dict"].items()
+              if k.startswith("model.")}
+    model.load_state_dict(raw_sd, strict=True)
+    print(f"  Loaded OGBench JEPA from {ckpt_path} "
+          f"(epoch {ckpt.get('epoch', '?')}, step {ckpt.get('global_step', '?')})")
+    model = model.to(device).eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    return model
+
 
 # ==========================================================
 # 1. ARCHITECTURE DEFINITIONS (must match train.py exactly)
@@ -115,10 +160,13 @@ class LatentActorPolicy(swm.policy.BasePolicy):
         self.transform = {"pixels": t, "goal": t}
 
         print("Loading JEPA Vision Encoder...")
-        self.jepa_model = swm.policy.AutoCostModel(cfg.policy).to(device)
-        self.jepa_model.eval()
-        self.jepa_model.requires_grad_(False)
-        self.jepa_model.interpolate_pos_encoding = True
+        if cfg.policy.endswith(".ckpt"):
+            self.jepa_model = load_ogbench_jepa(cfg.policy, device)
+        else:
+            self.jepa_model = swm.policy.AutoCostModel(cfg.policy).to(device)
+            self.jepa_model.eval()
+            self.jepa_model.requires_grad_(False)
+            self.jepa_model.interpolate_pos_encoding = True
 
         print(f"Loading Trained Actor from: {actor_ckpt_path}")
         self.actor = GoalConditionedActor(latent_dim=192, action_dim=25).to(device)
@@ -172,7 +220,124 @@ class LatentActorPolicy(swm.policy.BasePolicy):
 
 
 # ==========================================================
-# 3. EVALUATION LOOP
+# 3. HIERARCHICAL POLICY (high-level subgoal + low-level actor)
+# ==========================================================
+def _load_high_level(model_type, gap, ckpt_dir, device):
+    """
+    Loads MLP or Diffusion high-level policy for a given gap.
+    ckpt_dir is the root checkpoints_high_level/ directory.
+    Returns the loaded model in eval mode.
+    """
+    ckpt_path = Path(ckpt_dir) / f"{model_type}_gap{gap}" / "best_model.pth"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"High-level checkpoint not found at '{ckpt_path}'.\n"
+            f"Run train_high_level.py --model_type {model_type} --gap {gap} first."
+        )
+    if model_type == "mlp":
+        model = MLPHighLevel().to(device)
+    elif model_type == "diffusion":
+        model = DiffusionHighLevel().to(device)
+    else:
+        raise ValueError(f"Unknown high-level model type: '{model_type}'")
+
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.eval()
+    model.requires_grad_(False)
+    print(f"Loaded {model_type} high-level policy (gap={gap}) from {ckpt_path}")
+    return model
+
+
+class HierarchicalLatentActorPolicy(swm.policy.BasePolicy):
+    """
+    Two-level hierarchical policy.
+
+    High level  — proposes a latent subgoal z_subgoal every `gap` WM steps
+                  by calling the trained MLP or Diffusion model on (z_curr, z_final_goal).
+                  Uses only the learned model at runtime — no expert data.
+
+    Low level   — the frozen gap-trained SAC actor runs toward z_subgoal for up
+                  to `gap` WM steps, then the high level replans.
+
+    One WM step = one action block = one refill of _action_buffer (5 physical steps).
+    """
+    def __init__(self, cfg, actor_ckpt_path, action_scaler,
+                 high_level_model, gap, device="cuda"):
+        super().__init__()
+        self.device        = device
+        self.action_scaler = action_scaler
+        self.gap           = gap
+        self.high_level    = high_level_model
+
+        t = img_transform(cfg.eval.img_size)
+        self.transform = {"pixels": t, "goal": t}
+
+        print("Loading JEPA Vision Encoder...")
+        if cfg.policy.endswith(".ckpt"):
+            self.jepa_model = load_ogbench_jepa(cfg.policy, device)
+        else:
+            self.jepa_model = swm.policy.AutoCostModel(cfg.policy).to(device)
+            self.jepa_model.eval()
+            self.jepa_model.requires_grad_(False)
+            self.jepa_model.interpolate_pos_encoding = True
+
+        print(f"Loading Trained Actor from: {actor_ckpt_path}")
+        self.actor = GoalConditionedActor(latent_dim=192, action_dim=25).to(device)
+        self.actor.load_state_dict(torch.load(actor_ckpt_path, map_location=device))
+        self.actor.eval()
+
+        self._action_buffer      = []
+        self._wm_steps_to_subgoal = 0   # WM steps taken since last high-level call
+        self._z_subgoal           = None
+
+    def reset(self):
+        self._action_buffer       = []
+        self._wm_steps_to_subgoal = 0
+        self._z_subgoal           = None
+
+    def get_action(self, info_dict):
+        if not self._action_buffer:
+            info_dict = self._prepare_info(info_dict)
+
+            pixels = info_dict["pixels"].to(self.device)  # [N, T, C, H, W]
+            goal   = info_dict["goal"].to(self.device)    # [N, T, C, H, W]
+
+            with torch.no_grad():
+                z_curr      = self.jepa_model.encode({"pixels": pixels})["emb"][:, -1]  # [N, 192]
+                z_final_goal = self.jepa_model.encode({"pixels": goal})["emb"][:, -1]   # [N, 192]
+
+                # Replan if: first step, budget exhausted, or subgoal already reached.
+                # The third condition is critical — without it the low-level wastes
+                # its remaining budget holding at an already-achieved intermediate state.
+                subgoal_reached = (
+                    self._z_subgoal is not None and
+                    torch.norm(z_curr - self._z_subgoal, p=2, dim=-1).max().item() < 2.0
+                )
+                if (self._z_subgoal is None
+                        or self._wm_steps_to_subgoal >= self.gap
+                        or subgoal_reached):
+                    self._z_subgoal           = self.high_level.predict(z_curr, z_final_goal)
+                    self._wm_steps_to_subgoal = 0
+
+                # Low-level actor targets the subgoal, not the final goal
+                _, _, actions = self.actor.sample(z_curr, self._z_subgoal)  # [N, 25]
+
+            self._wm_steps_to_subgoal += 1
+
+            actions_np = actions.cpu().numpy()
+            N = actions_np.shape[0]
+            actions_physical = self.action_scaler.inverse_transform(
+                actions_np.reshape(N * 5, 5)
+            ).reshape(N, 5, 5)
+
+            for t in range(5):
+                self._action_buffer.append(actions_physical[:, t, :])
+
+        return self._action_buffer.pop(0)
+
+
+# ==========================================================
+# 4. EVALUATION LOOP
 # ==========================================================
 def get_episodes_length(dataset, episodes):
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
@@ -205,14 +370,19 @@ def run(cfg: DictConfig):
             f"Pass ++checkpoint_dir=<dir> to specify the experiment folder."
         )
 
-    # Derive a human-readable experiment name for results directory
+    # Derive a human-readable experiment name for results directory.
+    # Incorporate the high-level model type so flat/mlp/diffusion runs
+    # don't overwrite each other when using the same low-level checkpoint.
     exp_name = os.path.basename(checkpoint_dir).replace("checkpoints_", "", 1)
+    high_level_model_type = cfg.get("high_level_model_type", "none")
+    if high_level_model_type != "none":
+        exp_name = f"{exp_name}_hl_{high_level_model_type}"
     results_path = Path(hydra.utils.to_absolute_path(f"eval_results_{exp_name}"))
     results_path.mkdir(parents=True, exist_ok=True)
 
     # Create world environment
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
-    world = swm.World(**cfg.world, image_shape=(224, 224))
+    world = swm.World(**cfg.world, image_shape=(cfg.world.width, cfg.world.height))
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
@@ -225,7 +395,34 @@ def run(cfg: DictConfig):
     action_scaler = preprocessing.StandardScaler()
     action_scaler.fit(action_data)
 
-    policy = LatentActorPolicy(cfg, actor_ckpt_path, action_scaler=action_scaler)
+    # --- Detect fixed-gap from checkpoint directory name ---
+    # e.g. "checkpoints_her_fixed_gap_24_sparse" → gap=24
+    gap_match = re.search(r'fixed_gap_(\d+)', checkpoint_dir)
+    fixed_gap = int(gap_match.group(1)) if gap_match else None
+
+    # --- Choose flat or hierarchical policy ---
+    high_level_model_type = cfg.get("high_level_model_type", "none")
+    high_level_ckpt_dir   = cfg.get("high_level_ckpt_dir",
+                                    hydra.utils.to_absolute_path("checkpoints_high_level"))
+
+    if fixed_gap is not None and high_level_model_type != "none":
+        print(f"\nFixed-gap={fixed_gap} checkpoint detected.")
+        print(f"Building hierarchical policy with {high_level_model_type} high-level...")
+        high_level_model = _load_high_level(
+            model_type=high_level_model_type,
+            gap=fixed_gap,
+            ckpt_dir=high_level_ckpt_dir,
+            device="cuda",
+        )
+        policy = HierarchicalLatentActorPolicy(
+            cfg, actor_ckpt_path, action_scaler=action_scaler,
+            high_level_model=high_level_model, gap=fixed_gap,
+        )
+    else:
+        if fixed_gap is not None:
+            print(f"\nFixed-gap={fixed_gap} checkpoint detected but high_level_model_type='none'.")
+            print("Running flat policy (no high-level). Pass ++high_level_model_type=mlp to enable.")
+        policy = LatentActorPolicy(cfg, actor_ckpt_path, action_scaler=action_scaler)
 
     # Sample evaluation starting points
     episode_len = get_episodes_length(dataset, ep_indices)

@@ -15,6 +15,7 @@ from hydra import initialize, compose
 
 # Import your vectorized environment
 from latent_env import LatentEnv
+from bc_policy import BCPolicy
 
 # Standard SAC Hyperparameters for the Actor
 LOG_SIG_MAX = 2
@@ -179,7 +180,7 @@ class VectorizedEpisodicHERBuffer:
         self.position = end_idx % self.capacity
         self.size = min(self.size + num_new, self.capacity)
 
-    def sample_batch(self, batch_size=256):
+    def sample_batch(self, batch_size=256, reward_mode='sparse'):
         # 1. Instantly sample random episodes and a random valid timestep per episode
         ep_idxs = torch.randint(0, self.size, (batch_size,), device=self.device)
         sampled_lens = self.ep_lens[ep_idxs]
@@ -208,16 +209,26 @@ class VectorizedEpisodicHERBuffer:
 
         future_g_b = self.z_curr[ep_idxs, future_t]
 
-        # Swap goals based on mask
+        # Swap goals based on mask (HER relabelling applies regardless of reward mode)
         g_target_b = torch.where(her_mask.unsqueeze(-1), future_g_b, orig_g_b)
 
-        # 4. Dynamically compute sparse rewards based on the active goal
+        # 4. Compute reward based on mode
         action_penalty = torch.norm(a_b, p=2, dim=-1) * 0.01
-        dist = torch.norm(z_next_b - g_target_b, p=2, dim=-1)
-        success = dist < 2.0
-
-        r_b = torch.where(success, torch.zeros_like(dist), -torch.ones_like(dist)) - action_penalty
+        dist_next = torch.norm(z_next_b - g_target_b, p=2, dim=-1)
+        success = dist_next < 2.0
         done_b = success.to(torch.float32)
+
+        if reward_mode == 'dense':
+            # Potential-based shaping: reward = improvement in distance toward goal,
+            # normalised by average 1-step latent distance (1.6) so scale ~= 1.0 per step.
+            # Clipped to [-2, 2] to prevent noisy transitions from producing large rewards
+            # that cause critic divergence through bootstrapping.
+            dist_curr = torch.norm(z_curr_b - g_target_b, p=2, dim=-1)
+            improvement = (dist_curr - dist_next) / 1.6
+            improvement = torch.clamp(improvement, -2.0, 2.0)
+            r_b = improvement - action_penalty
+        else:  # sparse
+            r_b = torch.where(success, torch.zeros_like(dist_next), -torch.ones_like(dist_next)) - action_penalty
 
         return z_curr_b, a_b, z_next_b, g_target_b, r_b, done_b
 
@@ -302,11 +313,13 @@ def train_loop(env, actor, critic, critic_target,
                log_alpha, target_entropy, replay_buffer, all_latents,
                num_iterations=1000, gamma=0.99, tau=0.005,
                save_dir="./checkpoints",
-               mode='curriculum', fixed_gap=None, tmax_pure_distance=40):
+               mode='curriculum', fixed_gap=None, tmax_pure_distance=40,
+               reward_mode='sparse', bc_model=None, bc_alpha=0.0):
 
     os.makedirs(save_dir, exist_ok=True)
     mode_str = mode if mode != 'fixed' else f"fixed (gap={fixed_gap})"
-    print(f"Starting HER Training | Mode: {mode_str} | Saving to: {save_dir}")
+    bc_str = f"BC alpha={bc_alpha}" if bc_model is not None else "no BC"
+    print(f"Starting HER Training | Mode: {mode_str} | Reward: {reward_mode} | {bc_str} | Saving to: {save_dir}")
 
     csv_file = os.path.join(save_dir, "training_metrics.csv")
     with open(csv_file, mode='w', newline='') as f:
@@ -436,9 +449,14 @@ def train_loop(env, actor, critic, critic_target,
         avg_actor_loss = 0.0
         avg_critic_loss = 0.0
 
+        # Dense reward provides a richer signal per sample so fewer updates per
+        # iteration are needed; more importantly, fewer updates prevent the critic
+        # from diverging through aggressive bootstrapping of shaped rewards.
+        grad_updates = 20 if reward_mode == 'dense' else 40
+
         if replay_buffer.num_transitions >= 256:
-            for _ in range(40):
-                z_b, a_b, z_next_b, g_b, r_b, d_b = replay_buffer.sample_batch(batch_size=256)
+            for _ in range(grad_updates):
+                z_b, a_b, z_next_b, g_b, r_b, d_b = replay_buffer.sample_batch(batch_size=256, reward_mode=reward_mode)
 
                 r_b = r_b.unsqueeze(-1)
                 d_b = d_b.unsqueeze(-1)
@@ -470,6 +488,14 @@ def train_loop(env, actor, critic, critic_target,
                 q_min_new = torch.min(q1_new, q2_new)
                 actor_loss = (alpha * log_pi - q_min_new).mean()
 
+                # Behavioural cloning regularisation: pull actor toward the
+                # BC policy's deterministic action for the same (state, goal).
+                if bc_model is not None:
+                    with torch.no_grad():
+                        bc_actions = bc_model(z_b, g_b)
+                    bc_loss = F.mse_loss(new_actions, bc_actions)
+                    actor_loss = actor_loss + bc_alpha * bc_loss
+
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
@@ -493,8 +519,8 @@ def train_loop(env, actor, critic, critic_target,
         train_time_accum += (time.time() - iter_train_start)
 
         if iteration % 10 == 0:
-            actor_val  = avg_actor_loss / 40.0 if replay_buffer.num_transitions >= 256 else 0.0
-            critic_val = avg_critic_loss / 40.0 if replay_buffer.num_transitions >= 256 else 0.0
+            actor_val  = avg_actor_loss / grad_updates if replay_buffer.num_transitions >= 256 else 0.0
+            critic_val = avg_critic_loss / grad_updates if replay_buffer.num_transitions >= 256 else 0.0
             elapsed_time = time.time() - start_time
             avg_act_mag = np.mean(rollout_act_mags) if rollout_act_mags else 0.0
 
@@ -519,6 +545,51 @@ def train_loop(env, actor, critic, critic_target,
             torch.save(actor.state_dict(),  os.path.join(save_dir, "actor_policy.pth"))
             torch.save(critic.state_dict(), os.path.join(save_dir, "critic_network.pth"))
             print(f"--> Checkpoint saved at Iteration {iteration}")
+
+def _load_jepa_from_ckpt(ckpt_path, device):
+    """Load an OGBench-style pytorch-lightning state_dict checkpoint into a bare JEPA model.
+
+    The checkpoint stores weights under 'state_dict' with a 'model.' prefix added by
+    the spt.Module wrapper. This mirrors the loading logic in analyse_ogbench_wm.py.
+    Architecture is fixed to the OGBench config: ViT-Tiny, patch_size=8, img_size=64.
+    """
+    import stable_pretraining as spt
+    from jepa import JEPA
+    from module import ARPredictor, Embedder, MLP
+
+    encoder = spt.backbone.utils.vit_hf(
+        "tiny", patch_size=8, image_size=64, pretrained=False, use_mask_token=False
+    )
+    predictor = ARPredictor(
+        num_frames=3, input_dim=192, hidden_dim=192, output_dim=192,
+        depth=6, heads=16, mlp_dim=2048, dim_head=64, dropout=0.1, emb_dropout=0.0,
+    )
+    action_encoder = Embedder(input_dim=25, emb_dim=192)
+    projector = MLP(input_dim=192, output_dim=192, hidden_dim=2048,
+                    norm_fn=torch.nn.BatchNorm1d)
+    pred_proj  = MLP(input_dim=192, output_dim=192, hidden_dim=2048,
+                    norm_fn=torch.nn.BatchNorm1d)
+    model = JEPA(encoder=encoder, predictor=predictor,
+                 action_encoder=action_encoder, projector=projector, pred_proj=pred_proj)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "state_dict" in ckpt:
+        # Lightning-style checkpoint: weights live under 'state_dict' with a 'model.' prefix
+        raw_sd = {k[len("model."):]: v for k, v in ckpt["state_dict"].items()
+                  if k.startswith("model.")}
+        epoch = ckpt.get('epoch', '?')
+        step  = ckpt.get('global_step', '?')
+    else:
+        # Raw state dict saved directly (keys are bare module paths, no prefix)
+        raw_sd = dict(ckpt)
+        epoch, step = '?', '?'
+    model.load_state_dict(raw_sd, strict=True)
+    print(f"  Loaded OGBench JEPA from {ckpt_path} (epoch {epoch}, step {step})")
+    model = model.to(device).eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    return model
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Latent World Model SAC + HER Training")
@@ -545,18 +616,57 @@ if __name__ == "__main__":
         '--num_iters', type=int, default=None,
         help="Override the number of training iterations.",
     )
+    parser.add_argument(
+        '--reward_mode', type=str, default='sparse', choices=['sparse', 'dense'],
+        help=(
+            "Reward mode:\n"
+            "  sparse — -1 every step until success (original behaviour).\n"
+            "  dense  — potential-based shaping: reward = clamp((dist_curr - dist_next)/1.6, -2, 2).\n"
+            "            No terminal bonus; 20 gradient updates/iter instead of 40.\n"
+            "            HER relabelling still applies in both modes."
+        ),
+    )
+    parser.add_argument(
+        '--bc_alpha', type=float, default=0.0,
+        help="BC regularisation coefficient added to the actor loss (0 = disabled).",
+    )
+    parser.add_argument(
+        '--bc_model_path', type=str, default=None,
+        help="Path to a BCPolicy checkpoint (.pth) produced by train_bc.py. "
+             "Required when --bc_alpha > 0.",
+    )
+    parser.add_argument(
+        '--ckpt_path', type=str, default=None,
+        help="Path to JEPA checkpoint (.ckpt). "
+             "Default: {EPHEMERAL}/stable_wm_data/cube/lejepa_weights.ckpt",
+    )
+    parser.add_argument(
+        '--cache_path', type=str, default=None,
+        help="Path to precomputed latents cache (.pt). "
+             "Default: {EPHEMERAL}/stable_wm_data/cube_all_latents_cache.pt",
+    )
+    parser.add_argument(
+        '--dataset_path', type=str, default=None,
+        help="Path to HDF5 dataset (without .h5 extension). "
+             "Default: {EPHEMERAL}/stable_wm_data/ogbench/cube_single_expert",
+    )
     args = parser.parse_args()
+
+    if args.bc_alpha > 0 and args.bc_model_path is None:
+        parser.error("--bc_model_path is required when --bc_alpha > 0")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- DERIVE CHECKPOINT DIRECTORY FROM MODE ---
+    # --- DERIVE CHECKPOINT DIRECTORY FROM MODE, REWARD, AND BC ---
+    reward_tag = f"_{args.reward_mode}"
+    bc_tag     = f"_bc{args.bc_alpha}" if args.bc_alpha > 0 else ""
     if args.mode == 'pure_distance':
-        save_dir = "./checkpoints_her_pure_distance"
+        save_dir = f"./checkpoints_her_pure_distance{reward_tag}{bc_tag}"
     elif args.mode == 'fixed':
-        save_dir = f"./checkpoints_her_fixed_gap_{args.gap}"
+        save_dir = f"./checkpoints_her_fixed_gap_{args.gap}{reward_tag}{bc_tag}"
     else:
-        save_dir = "./checkpoints_her_curriculum"
+        save_dir = f"./checkpoints_her_curriculum{reward_tag}{bc_tag}"
 
     DEBUG_MODE = False
 
@@ -585,52 +695,67 @@ if __name__ == "__main__":
         all_latents = [torch.randn(201, 192) for _ in range(10)]
     else:
         print("--- RUNNING IN PRODUCTION MODE ---")
-        num_envs_to_use = 50
-        num_iters_to_run = 25000
+        num_envs_to_use = 256
+        num_iters_to_run = 50000
 
         ephemeral = os.environ.get("EPHEMERAL")
         if ephemeral is None:
             raise ValueError("EPHEMERAL environment variable is not set")
 
-        data_path = f"{ephemeral}/stable_wm_data/ogbench/cube_single_expert.h5"
-        ckpt_path = f"{ephemeral}/stable_wm_data/cube/lejepa_weights.ckpt"
+        data_path  = args.dataset_path or f"{ephemeral}/stable_wm_data/ogbench/cube_single_expert"
+        ckpt_path  = args.ckpt_path    or f"{ephemeral}/stable_wm_data/cube/lejepa_weights.ckpt"
+        cache_path = args.cache_path   or os.path.join(ephemeral, "stable_wm_data", "cube_all_latents_cache.pt")
 
         print(f"Loading Dataset from:    {data_path}")
         print(f"Loading Checkpoint from: {ckpt_path}")
+        print(f"Loading Cache from:      {cache_path}")
 
         parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
         if parent_dir not in sys.path:
             sys.path.insert(0, parent_dir)
 
-        with initialize(version_base=None, config_path="../config"):
-            cfg = compose(config_name="eval/cube", overrides=["+policy=cube/lejepa"])
+        dataset = swm.data.HDF5Dataset(data_path)
 
-        dataset = swm.data.HDF5Dataset(
-            f"{ephemeral}/stable_wm_data/ogbench/cube_single_expert"
-        )
-
-        jepa_model = swm.policy.AutoCostModel(cfg.policy)
-
-        # Move to GPU and Freeze
-        jepa_model = jepa_model.to(device)
-        jepa_model.eval()
-        for param in jepa_model.parameters():
-            param.requires_grad = False
+        if ckpt_path.endswith(".ckpt"):
+            jepa_model = _load_jepa_from_ckpt(ckpt_path, device)
+        else:
+            with initialize(version_base=None, config_path="../config"):
+                cfg = compose(config_name="eval/cube", overrides=["+policy=cube/lejepa"])
+            jepa_model = swm.policy.AutoCostModel(cfg.policy)
+            jepa_model = jepa_model.to(device)
+            jepa_model.eval()
+            for param in jepa_model.parameters():
+                param.requires_grad = False
 
         print("Dataset and JEPA Model successfully loaded")
 
-        # Load the massive latents cache for task sampling
-        cache_path = os.path.join(ephemeral, "stable_wm_data", "cube_all_latents_cache.pt")
+        # Load the latents cache for task sampling
         print(f"Loading latents cache from {cache_path}...")
-        cache = torch.load(cache_path)
+        cache = torch.load(cache_path, map_location="cpu")
         all_latents = cache['all_latents']
 
     # Allow --num_iters to override the default
     if args.num_iters is not None:
         num_iters_to_run = args.num_iters
 
-    env = LatentEnv(jepa_model=jepa_model, dataset=dataset, num_envs=num_envs_to_use, device=device)
+    # --- Load BC model (frozen) if requested ---
+    bc_model = None
+    if args.bc_alpha > 0:
+        ckpt = torch.load(args.bc_model_path, map_location=device, weights_only=False)
+        bc_model = BCPolicy(
+            latent_dim=ckpt.get('latent_dim', 192),
+            action_dim=ckpt.get('action_dim', 25),
+            action_scale=ckpt.get('action_scale', 3.0),
+        ).to(device)
+        bc_model.load_state_dict(ckpt['model_state_dict'])
+        bc_model.eval()
+        for p in bc_model.parameters():
+            p.requires_grad = False
+        print(f"BC model loaded from {args.bc_model_path} (bc_alpha={args.bc_alpha})")
+
+    env = LatentEnv(jepa_model=jepa_model, dataset=dataset, num_envs=num_envs_to_use,
+                    device=device, cache_path=cache_path if not DEBUG_MODE else None)
 
     # max_t=50 comfortably fits the largest T_max of 40 across all modes
     replay_buffer = VectorizedEpisodicHERBuffer(
@@ -670,4 +795,7 @@ if __name__ == "__main__":
         mode=args.mode,
         fixed_gap=args.gap if args.mode == 'fixed' else None,
         tmax_pure_distance=args.tmax,
+        reward_mode=args.reward_mode,
+        bc_model=bc_model,
+        bc_alpha=args.bc_alpha,
     )
