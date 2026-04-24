@@ -222,6 +222,8 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--val_split', type=float, default=0.1,
                         help="Fraction of triplets held out for validation.")
+    parser.add_argument('--cache_path', type=str, default=None,
+                        help="Path to latents cache .pt. Default: {EPHEMERAL}/stable_wm_data/cube_all_latents_cache.pt")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
