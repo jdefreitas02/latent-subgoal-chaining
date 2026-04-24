@@ -6,7 +6,7 @@ import os
 import time
 
 class LatentEnv(gym.Env):
-    def __init__(self, jepa_model, dataset, num_envs=50, device="cuda", cache_path=None):
+    def __init__(self, jepa_model, dataset, num_envs=50, device="cuda", cache_path=None, done_threshold=2.0):
         super().__init__()
 
         self.model = jepa_model.to(device)
@@ -20,6 +20,7 @@ class LatentEnv(gym.Env):
 
         self.latent_dim = 192
         self.action_dim = 25
+        self.done_threshold = done_threshold
 
         # Single-frame state buffers — the world model is Markovian (HS=1)
         self.z_state = None      # [num_envs, 1, latent_dim]
@@ -27,12 +28,8 @@ class LatentEnv(gym.Env):
         self.z_ultimate_goal = None
 
         # --- CACHE LOADING / GENERATION ---
-        ephemeral = os.environ.get("EPHEMERAL")
-        if ephemeral is None:
-            raise ValueError("EPHEMERAL environment variable is not set")
-
         if cache_path is None:
-            cache_path = os.path.join(ephemeral, "stable_wm_data", "cube_all_latents_cache.pt")
+            cache_path = os.path.join(os.path.expanduser("~"), "stable_wm_data", "ogbench", "ogbench_latents_cache.pt")
         
         if not os.path.exists(cache_path):
             print(f"Cache not found at {cache_path}. Generating it now...")
@@ -101,7 +98,7 @@ class LatentEnv(gym.Env):
 
         distances = torch.norm(z_next.squeeze(1) - self.z_ultimate_goal, p=2, dim=-1)
         rewards = -distances
-        dones = distances < 2.887  # 1.5× OGBench WM 1-step mean (1.9249)
+        dones = distances < self.done_threshold
 
         return z_next.squeeze(1), rewards, dones, False, {}
 

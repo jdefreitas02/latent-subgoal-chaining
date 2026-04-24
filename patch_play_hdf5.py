@@ -9,7 +9,8 @@ import os
 import numpy as np
 import h5py
 
-path = f"{os.environ['EPHEMERAL']}/stable_wm_data/ogbench/cube_single_play_v0.h5"
+stablewm_home = os.environ.get("STABLEWM_HOME", os.path.join(os.path.expanduser("~"), "stable_wm_data"))
+path = os.path.join(stablewm_home, "ogbench", "cube_single_play_v0.h5")
 print(f"Patching: {path}")
 
 with h5py.File(path, "a") as f:

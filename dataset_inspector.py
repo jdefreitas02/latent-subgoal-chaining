@@ -7,12 +7,10 @@ def inspect_dataset():
     print("--- OGBench Dataset Inspector ---")
     
     # Grab the ephemeral path just like in your train.py
-    ephemeral = os.environ.get("EPHEMERAL")
-    if ephemeral is None:
-        raise ValueError("EPHEMERAL environment variable is not set")
-        
+    stablewm_home = os.environ.get("STABLEWM_HOME", os.path.join(os.path.expanduser("~"), "stable_wm_data"))
+
     # Standard path for the dataset
-    data_path = f"{ephemeral}/stable_wm_data/ogbench/cube_single_expert"
+    data_path = os.path.join(stablewm_home, "ogbench", "cube_single_expert")
     
     print(f"Loading dataset from: {data_path}.h5 ...\n")
     

@@ -20,9 +20,9 @@ HDF5 layout required by HDF5Dataset:
 Usage:
     python convert_ogbench_npz.py [--input PATH] [--output PATH]
 
-Defaults (use $EPHEMERAL env var):
-    input:  $EPHEMERAL/stable_wm_data/ogbench/cube-single-play-v0.npz
-    output: $EPHEMERAL/stable_wm_data/ogbench/cube_single_play_v0.h5
+Defaults (use $STABLEWM_HOME env var, falls back to $HOME/stable_wm_data):
+    input:  $STABLEWM_HOME/ogbench/visual-cube-single-play-v0.npz
+    output: $STABLEWM_HOME/ogbench/cube_single_play_v0.h5
 """
 
 import argparse
@@ -117,11 +117,9 @@ def convert(input_path: str, output_path: str, chunk_episodes: int = 50) -> None
 
 
 def main():
-    ephemeral = os.environ.get("EPHEMERAL", "")
-    default_input  = os.path.join(ephemeral, "stable_wm_data", "ogbench",
-                                  "cube-single-play-v0.npz")
-    default_output = os.path.join(ephemeral, "stable_wm_data", "ogbench",
-                                  "cube_single_play_v0.h5")
+    stablewm_home  = os.environ.get("STABLEWM_HOME", os.path.join(os.path.expanduser("~"), "stable_wm_data"))
+    default_input  = os.path.join(stablewm_home, "ogbench", "visual-cube-single-play-v0.npz")
+    default_output = os.path.join(stablewm_home, "ogbench", "cube_single_play_v0.h5")
 
     parser = argparse.ArgumentParser(description="Convert OGBench NPZ to HDF5 for LeWM training")
     parser.add_argument("--input",  default=default_input,  help="Path to input NPZ file")

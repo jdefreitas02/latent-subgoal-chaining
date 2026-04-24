@@ -227,11 +227,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device} | Model: {args.model_type} | Gap: {args.gap}")
 
-    ephemeral = os.environ.get("EPHEMERAL")
-    if ephemeral is None:
-        raise ValueError("EPHEMERAL environment variable is not set")
+    stablewm_home = os.environ.get("STABLEWM_HOME", os.path.join(os.path.expanduser("~"), "stable_wm_data"))
 
-    cache_path = os.path.join(ephemeral, "stable_wm_data", "cube_all_latents_cache.pt")
+    cache_path = os.path.join(stablewm_home, "cube_all_latents_cache.pt")
     print(f"Loading latents from {cache_path}...")
     cache      = torch.load(cache_path, map_location='cpu')
     all_latents = cache['all_latents']

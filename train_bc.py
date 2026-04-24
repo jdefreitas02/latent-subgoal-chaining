@@ -129,12 +129,10 @@ def train_bc(args):
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    ephemeral = os.environ.get("EPHEMERAL")
-    if ephemeral is None:
-        raise ValueError("EPHEMERAL environment variable is not set")
+    stablewm_home = os.environ.get("STABLEWM_HOME", os.path.join(os.path.expanduser("~"), "stable_wm_data"))
 
-    dataset_path = args.dataset_path or f"{ephemeral}/stable_wm_data/ogbench/cube_single_expert"
-    cache_path   = args.cache_path   or os.path.join(ephemeral, "stable_wm_data", "cube_all_latents_cache.pt")
+    dataset_path = args.dataset_path or os.path.join(stablewm_home, "ogbench", "cube_single_expert")
+    cache_path   = args.cache_path   or os.path.join(stablewm_home, "cube_all_latents_cache.pt")
 
     print(f"Loading dataset from:     {dataset_path}")
     print(f"Loading latents cache from {cache_path}...")
@@ -226,9 +224,9 @@ if __name__ == "__main__":
                         help="Random HER goals sampled per WM-step transition")
     parser.add_argument('--cache_path',   type=str, default=None,
                         help="Path to latents cache .pt file. "
-                             "Default: {EPHEMERAL}/stable_wm_data/cube_all_latents_cache.pt")
+                             "Default: $HOME/stable_wm_data/cube_all_latents_cache.pt")
     parser.add_argument('--dataset_path', type=str, default=None,
                         help="Path to HDF5 dataset (without .h5 extension). "
-                             "Default: {EPHEMERAL}/stable_wm_data/ogbench/cube_single_expert")
+                             "Default: $HOME/stable_wm_data/ogbench/cube_single_expert")
     args = parser.parse_args()
     train_bc(args)

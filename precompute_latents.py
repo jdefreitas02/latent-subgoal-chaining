@@ -11,8 +11,8 @@ def precompute():
     print("--- Starting Full Dataset Latent Pre-computation ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    ephemeral = os.environ.get("EPHEMERAL")
-    data_path = f"{ephemeral}/stable_wm_data/ogbench/cube_single_expert"
+    stablewm_home = os.environ.get("STABLEWM_HOME", os.path.join(os.path.expanduser("~"), "stable_wm_data"))
+    data_path = os.path.join(stablewm_home, "ogbench", "cube_single_expert")
     
     parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if parent_dir not in sys.path: sys.path.insert(0, parent_dir)

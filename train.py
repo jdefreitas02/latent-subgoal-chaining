@@ -638,17 +638,17 @@ if __name__ == "__main__":
     parser.add_argument(
         '--ckpt_path', type=str, default=None,
         help="Path to JEPA checkpoint (.ckpt). "
-             "Default: {EPHEMERAL}/stable_wm_data/cube/lejepa_weights.ckpt",
+             "Default: $HOME/stable_wm_data/cube/lejepa_weights.ckpt",
     )
     parser.add_argument(
         '--cache_path', type=str, default=None,
         help="Path to precomputed latents cache (.pt). "
-             "Default: {EPHEMERAL}/stable_wm_data/cube_all_latents_cache.pt",
+             "Default: $HOME/stable_wm_data/cube_all_latents_cache.pt",
     )
     parser.add_argument(
         '--dataset_path', type=str, default=None,
         help="Path to HDF5 dataset (without .h5 extension). "
-             "Default: {EPHEMERAL}/stable_wm_data/ogbench/cube_single_expert",
+             "Default: $HOME/stable_wm_data/ogbench/cube_single_expert",
     )
     args = parser.parse_args()
 
@@ -698,13 +698,11 @@ if __name__ == "__main__":
         num_envs_to_use = 256
         num_iters_to_run = 50000
 
-        ephemeral = os.environ.get("EPHEMERAL")
-        if ephemeral is None:
-            raise ValueError("EPHEMERAL environment variable is not set")
+        stablewm_home = os.environ.get("STABLEWM_HOME", os.path.join(os.path.expanduser("~"), "stable_wm_data"))
 
-        data_path  = args.dataset_path or f"{ephemeral}/stable_wm_data/ogbench/cube_single_expert"
-        ckpt_path  = args.ckpt_path    or f"{ephemeral}/stable_wm_data/cube/lejepa_weights.ckpt"
-        cache_path = args.cache_path   or os.path.join(ephemeral, "stable_wm_data", "cube_all_latents_cache.pt")
+        data_path  = args.dataset_path or f"{stablewm_home}/ogbench/cube_single_expert"
+        ckpt_path  = args.ckpt_path    or f"{stablewm_home}/cube/lejepa_weights.ckpt"
+        cache_path = args.cache_path   or os.path.join(stablewm_home, "cube_all_latents_cache.pt")
 
         print(f"Loading Dataset from:    {data_path}")
         print(f"Loading Checkpoint from: {ckpt_path}")

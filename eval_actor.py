@@ -1,5 +1,5 @@
 import os
-os.environ["MUJOCO_GL"] = "glfw"
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 import re
 import sys
