@@ -222,16 +222,19 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--val_split', type=float, default=0.1,
                         help="Fraction of triplets held out for validation.")
+    parser.add_argument('--cache_path', type=str, default=None,
+                        help="Path to latents cache .pt. Default: {EPHEMERAL}/stable_wm_data/cube_all_latents_cache.pt")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device} | Model: {args.model_type} | Gap: {args.gap}")
 
     ephemeral = os.environ.get("EPHEMERAL")
-    if ephemeral is None:
-        raise ValueError("EPHEMERAL environment variable is not set")
+    if ephemeral is None and args.cache_path is None:
+        raise ValueError("Either --cache_path or the EPHEMERAL environment variable must be set")
 
-    cache_path = os.path.join(ephemeral, "stable_wm_data", "cube_all_latents_cache.pt")
+    cache_path = args.cache_path or os.path.join(
+        ephemeral, "stable_wm_data", "cube_all_latents_cache.pt")
     print(f"Loading latents from {cache_path}...")
     cache      = torch.load(cache_path, map_location='cpu')
     all_latents = cache['all_latents']

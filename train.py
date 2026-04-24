@@ -669,6 +669,7 @@ if __name__ == "__main__":
         save_dir = f"./checkpoints_her_curriculum{reward_tag}{bc_tag}"
 
     DEBUG_MODE = False
+    done_threshold = 2.0  # overridden in production based on model type
 
     if DEBUG_MODE:
         print("--- RUNNING IN LOCAL DEBUG MODE ---")
@@ -717,9 +718,12 @@ if __name__ == "__main__":
 
         dataset = swm.data.HDF5Dataset(data_path)
 
-        if ckpt_path.endswith(".ckpt"):
+        if args.ckpt_path is not None:
+            # Explicit path provided: load directly (used for the custom 64x64 JEPA model)
             jepa_model = _load_jepa_from_ckpt(ckpt_path, device)
+            done_threshold = 2.887
         else:
+            # Default: use the swm AutoCostModel (224x224 model resolved via STABLEWM_HOME)
             with initialize(version_base=None, config_path="../config"):
                 cfg = compose(config_name="eval/cube", overrides=["+policy=cube/lejepa"])
             jepa_model = swm.policy.AutoCostModel(cfg.policy)
@@ -727,6 +731,7 @@ if __name__ == "__main__":
             jepa_model.eval()
             for param in jepa_model.parameters():
                 param.requires_grad = False
+            done_threshold = 2.0
 
         print("Dataset and JEPA Model successfully loaded")
 
@@ -755,7 +760,8 @@ if __name__ == "__main__":
         print(f"BC model loaded from {args.bc_model_path} (bc_alpha={args.bc_alpha})")
 
     env = LatentEnv(jepa_model=jepa_model, dataset=dataset, num_envs=num_envs_to_use,
-                    device=device, cache_path=cache_path if not DEBUG_MODE else None)
+                    device=device, cache_path=cache_path if not DEBUG_MODE else None,
+                    done_threshold=done_threshold)
 
     # max_t=50 comfortably fits the largest T_max of 40 across all modes
     replay_buffer = VectorizedEpisodicHERBuffer(
