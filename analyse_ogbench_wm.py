@@ -287,16 +287,147 @@ def test_wm_prediction(model, dataset, device, n_test=200):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Long-horizon autoregressive drift (mirrors LatentEnv.step exactly)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_wm_long_rollout_drift(model, dataset, device, n_test=100,
+                                gaps=(1, 3, 5, 10, 20, 30)):
+    """
+    Autoregressively roll the predictor from z_enc[0] using the ground-truth
+    action sequence, exactly as latent_env.LatentEnv.step does:
+        z_state = z_enc[0]                           (single-frame history)
+        for k in range(max_gap):
+            z_state = model.predict(z_state, action_encoder(a_k))[:, -1:]
+    Compare against encode(real_frame[k]) at each of the requested gaps.
+
+    This is the definitive Tier 1.1 measurement: if drift at gap=30 is
+    comfortably below the training done_threshold (=2.0), the "exposure
+    bias" hypothesis is wrong. If drift at gap=30 greatly exceeds 2.0, it
+    confirms the diagnosis that the SAC critic was trained in a fictional
+    predictor-drift space.
+
+    Each dataset action row is a single 5-DoF control step; the world model
+    was trained on 25-dim blocks of 5 consecutive raw actions (frameskip=5).
+    One "WM step" = 5 dataset frames.
+    """
+    print("\n" + "="*60)
+    print("  LONG-HORIZON AUTOREGRESSIVE DRIFT")
+    print("="*60)
+    print(f"  (mirrors LatentEnv.step: 1-frame history, 25-dim action blocks)")
+
+    transform = get_transform()
+    max_gap = max(gaps)
+    # drift_by_gap[k] = list of L2 distances between predict^k(z_enc[0], a...)
+    # and z_enc[k*FRAMESKIP] across all test windows
+    drift_by_gap      = {k: [] for k in gaps}
+    baseline_by_gap   = {k: [] for k in gaps}  # ‖z_enc[0] - z_enc[k*FRAMESKIP]‖
+    natural_step      = []  # ‖z_enc[t+1 WM-step] − z_enc[t]‖
+
+    rng = np.random.default_rng(0)
+    ep_pool = rng.choice(len(dataset.lengths),
+                         size=min(n_test, len(dataset.lengths)), replace=False)
+
+    needed_frames = max_gap * FRAMESKIP + 1   # frames 0 … max_gap·FRAMESKIP
+
+    with torch.no_grad():
+        for ep_i in ep_pool:
+            ep_len = dataset.lengths[ep_i]
+            if ep_len < needed_frames:
+                continue
+
+            # Load & encode the entire (trimmed) episode once
+            chunk = dataset.load_chunk(
+                np.array([ep_i]), np.array([0]), np.array([ep_len])
+            )[0]
+            raw_pix = chunk["pixels"].to(device)
+            actions = chunk["action"].to(device).float()   # [ep_len, 5]
+            pix     = transform(raw_pix)
+            z_all   = model.encode({"pixels": pix.unsqueeze(0)})["emb"].squeeze(0)  # [ep_len, 192]
+
+            # Natural 1-WM-step scale (one per episode)
+            if ep_len > FRAMESKIP:
+                deltas = torch.norm(
+                    z_all[FRAMESKIP::FRAMESKIP] - z_all[:-FRAMESKIP:FRAMESKIP],
+                    dim=-1
+                )
+                natural_step.extend(deltas.tolist())
+
+            # Only a few windows per episode to keep the cost bounded
+            valid_starts = ep_len - needed_frames
+            n_windows = min(3, max(1, valid_starts // 10))
+            starts = rng.choice(max(1, valid_starts), size=n_windows, replace=False)
+
+            for t0 in starts:
+                t0 = int(t0)
+                # 1-frame history seeded with the real encoder latent
+                z_state = z_all[t0].unsqueeze(0).unsqueeze(0)    # [1, 1, 192]
+                z0      = z_all[t0]
+
+                # Walk the predictor forward for max_gap WM steps,
+                # recording divergence at each requested checkpoint.
+                for k in range(1, max_gap + 1):
+                    a_lo = t0 + (k - 1) * FRAMESKIP
+                    a_hi = t0 + k       * FRAMESKIP
+                    act_block = actions[a_lo:a_hi].reshape(1, 1, EFF_ACT_DIM)
+                    act_emb   = model.action_encoder(act_block)
+                    z_state   = model.predict(z_state, act_emb)[:, -1:, :]
+
+                    if k in drift_by_gap:
+                        z_true = z_all[t0 + k * FRAMESKIP]
+                        drift_by_gap[k].append(
+                            torch.norm(z_state.squeeze() - z_true, dim=-1).item()
+                        )
+                        baseline_by_gap[k].append(
+                            torch.norm(z0 - z_true, dim=-1).item()
+                        )
+
+    # Report
+    nat = np.array(natural_step)
+    print(f"\n  Natural 1-WM-step ‖z_enc[t+1] − z_enc[t]‖  "
+          f"(the scale pred_loss is measured against):")
+    print(f"    mean={nat.mean():.4f}  median={np.median(nat):.4f}  "
+          f"p90={np.percentile(nat, 90):.4f}")
+
+    done_thr = 2.0
+    print(f"\n  Training done_threshold = {done_thr}  (sparse reward boundary)")
+    print(f"\n  {'gap (WM steps)':<16s}{'pred drift mean':<20s}"
+          f"{'median':<12s}{'p90':<12s}{'baseline Δ₀ mean':<20s}{'drift / done_thr':<18s}")
+    print(f"  {'─'*98}")
+
+    breach_gap = None
+    for k in gaps:
+        if not drift_by_gap[k]:
+            continue
+        d = np.array(drift_by_gap[k])
+        b = np.array(baseline_by_gap[k])
+        ratio = d.mean() / done_thr
+        print(f"  {k:<16d}{d.mean():<20.4f}{np.median(d):<12.4f}"
+              f"{np.percentile(d, 90):<12.4f}{b.mean():<20.4f}{ratio:<18.2f}")
+        if breach_gap is None and d.mean() > done_thr:
+            breach_gap = k
+
+    print()
+    if breach_gap is None:
+        print(f"  ✗ Drift stays under done_threshold={done_thr} at all tested gaps.")
+        print(f"    Exposure-bias hypothesis is NOT supported — look elsewhere.")
+    else:
+        largest_gap = max(k for k in gaps if drift_by_gap[k])
+        mean_drift  = np.mean(drift_by_gap[largest_gap])
+        print(f"  ✓ Mean drift first exceeds done_threshold={done_thr} "
+              f"at gap={breach_gap} WM steps.")
+        print(f"    At gap={largest_gap} the SAC critic was training inside a ")
+        print(f"    predictor-drift cloud ~{mean_drift:.2f} L2 away on average from")
+        print(f"    any real encoder latent — confirming exposure-bias diagnosis.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ephemeral = os.environ.get("EPHEMERAL")
-    if ephemeral is None:
-        raise ValueError("EPHEMERAL env var not set")
+    stablewm_home = os.environ.get("STABLEWM_HOME", os.path.join(os.path.expanduser("~"), "stable_wm_data"))
 
-    data_path  = os.path.join(ephemeral, "stable_wm_data", "ogbench", "cube_single_play_v0")
-    cache_path = os.path.join(ephemeral, "stable_wm_data", "ogbench_latents_cache.pt")
+    data_path  = os.path.join(stablewm_home, "ogbench", "cube_single_play_v0")
+    cache_path = os.path.join(stablewm_home, "ogbench_latents_cache.pt")
 
     print("="*60)
     print("  OGBench LeWM Analysis")
@@ -335,6 +466,7 @@ def main():
     print("\n[4/4] Running analysis …")
     analyse_latent_space(all_latents)
     test_wm_prediction(model, dataset, device)
+    test_wm_long_rollout_drift(model, dataset, device)
 
     print("\n" + "="*60)
     print("  Done.")
