@@ -36,6 +36,23 @@ from hydra import initialize, compose
 from train_action_decoder import ActionChunkDecoder
 
 
+class FlowDecoderWrapper(nn.Module):
+    """Drop-in replacement for ActionChunkDecoder when --decoder_type flow.
+
+    Wraps FlowChunkDecoder so it exposes the same call signature:
+        forward(a_first, z) → chunk_25d
+    as ActionChunkDecoder, making it transparent to _ll_action.
+    """
+
+    def __init__(self, flow_model, flow_steps=10):
+        super().__init__()
+        self.flow  = flow_model
+        self.flow_steps = flow_steps
+
+    def forward(self, a_first, z):
+        return self.flow.sample(z, a_first, flow_steps=self.flow_steps)
+
+
 # =============================================================================
 # 1. Network Architectures (verbatim copies of train_hiql_lewm.py)
 # =============================================================================
@@ -141,11 +158,18 @@ class GaussianActor(nn.Module):
         return dist.log_prob(target).sum(dim=-1)
 
 
-class TwinValue(nn.Module):
-    """V(z, rep) -> (scalar, scalar)."""
+class EnsembleValue(nn.Module):
+    """V(z, rep) -> [B, n_heads].
 
-    def __init__(self, latent_dim=192, rep_dim=10, hidden_dims=(512, 512, 512)):
+    n_heads=2 reproduces the original TwinValue (IQL twin) behavior. With
+    n_heads>2 the extra heads provide a disagreement signal usable as a
+    MOPO-style uncertainty penalty in WGSP scoring.
+    """
+
+    def __init__(self, latent_dim=192, rep_dim=10,
+                 hidden_dims=(512, 512, 512), n_heads=2):
         super().__init__()
+        self.n_heads = n_heads
         in_dim = latent_dim + rep_dim
 
         def _make_v():
@@ -160,12 +184,40 @@ class TwinValue(nn.Module):
             nn.init.constant_(net[-1].bias,   0.0)
             return net
 
-        self.v1 = _make_v()
-        self.v2 = _make_v()
+        self.heads = nn.ModuleList([_make_v() for _ in range(n_heads)])
 
     def forward(self, state, rep):
         x = torch.cat([state, rep], dim=-1)
-        return self.v1(x).squeeze(-1), self.v2(x).squeeze(-1)
+        return torch.stack([h(x).squeeze(-1) for h in self.heads], dim=-1)
+
+    def mean_v(self, state, rep):
+        return self.forward(state, rep).mean(dim=-1)
+
+    def std_v(self, state, rep):
+        # Sample std (unbiased) — note for n_heads=2 this is just |v1-v2|/sqrt(2)
+        return self.forward(state, rep).std(dim=-1, unbiased=True)
+
+
+# Back-compat alias so existing checkpoints with key prefixes 'v1.', 'v2.'
+# still load — see _load_legacy_twin_value below.
+TwinValue = EnsembleValue
+
+
+def _load_legacy_twin_value(value_net, state_dict):
+    """Map a legacy TwinValue state_dict ('v1.', 'v2.' prefixes) onto
+    EnsembleValue's 'heads.0.', 'heads.1.' prefixes. Returns the remapped
+    state_dict so caller can call value_net.load_state_dict(...)."""
+    if any(k.startswith('heads.') for k in state_dict.keys()):
+        return state_dict
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith('v1.'):
+            out['heads.0.' + k[3:]] = v
+        elif k.startswith('v2.'):
+            out['heads.1.' + k[3:]] = v
+        else:
+            out[k] = v
+    return out
 
 
 # =============================================================================
@@ -327,24 +379,31 @@ def _expectile(adv, diff, tau):
 
 def _value_step(value_net, value_target, goal_rep, goal_rep_target,
                 z, z_next, z_goal, r, gamma, expectile, value_optimizer):
+    """IQL expectile step over an arbitrary-size value ensemble.
+
+    Each head h has its own bootstrap target q_h = r + γ V_h(z'); the
+    expectile sign uses the across-head mean to keep adv consistent
+    across heads (IQL's twin trick generalises naturally to any n_heads).
+    """
     with torch.no_grad():
         rep_curr_t = goal_rep_target(z,      z_goal)
         rep_next_t = goal_rep_target(z_next, z_goal)
-        vn1_t, vn2_t = value_target(z_next, rep_next_t)
-        v_next_min_t = torch.min(vn1_t, vn2_t)
-        q            = r + gamma * v_next_min_t
+        v_next_t = value_target(z_next, rep_next_t)            # [B, n_heads]
+        v_next_min_t = v_next_t.min(dim=-1).values
+        q_min        = r + gamma * v_next_min_t                # [B]
 
-        v1_t, v2_t = value_target(z, rep_curr_t)
-        v_t        = (v1_t + v2_t) / 2
-        adv        = q - v_t
+        v_t = value_target(z, rep_curr_t).mean(dim=-1)         # [B]
+        adv = q_min - v_t                                      # [B]
 
-        q1 = r + gamma * vn1_t
-        q2 = r + gamma * vn2_t
+        q_per_head = r.unsqueeze(-1) + gamma * v_next_t        # [B, n_heads]
 
     rep_curr = goal_rep(z, z_goal)
-    v1, v2   = value_net(z, rep_curr)
-    v_loss   = (_expectile(adv, q1 - v1, expectile) +
-                _expectile(adv, q2 - v2, expectile))
+    v_pred   = value_net(z, rep_curr)                          # [B, n_heads]
+    diff     = q_per_head - v_pred                             # [B, n_heads]
+
+    # Sum expectile loss across heads
+    v_loss = sum(_expectile(adv, diff[:, h], expectile)
+                 for h in range(diff.shape[-1]))
 
     value_optimizer.zero_grad()
     v_loss.backward()
@@ -430,18 +489,33 @@ def wgsp_rollout(wm_model, ll_actor, decoder,
 
 @torch.no_grad()
 def _score_endpoints(z_k, g_ult, value_net, goal_rep, beta_geom,
-                     use_geometric_term, use_v_in_J=True):
+                     use_geometric_term, use_v_in_J=True,
+                     lambda_mopo=0.0, return_diag=False):
     """Score per-rollout endpoint.
 
-    J = use_v_in_J * V(z_k, φ(z_k, g)) − β · ‖z_k − g‖₂  (the latter optional).
+    J = V_mean(z_k, φ(z_k, g)) − β·‖z_k − g‖₂ − λ_mopo·V_std(z_k, φ(z_k, g)).
+
+    The first term is omitted if use_v_in_J=False; the second if
+    use_geometric_term=False or beta_geom=0; the third if lambda_mopo<=0
+    (and is meaningful only when value_net is an EnsembleValue with n_heads>2).
     """
     score = torch.zeros(z_k.shape[0], device=z_k.device)
-    if use_v_in_J:
+    v_mean = None
+    v_std = None
+    if use_v_in_J or lambda_mopo > 0 or return_diag:
         rep = goal_rep(z_k, g_ult)
-        v1, v2 = value_net(z_k, rep)
-        score = score + (v1 + v2) / 2
+        v_all = value_net(z_k, rep)                  # [B, n_heads]
+        v_mean = v_all.mean(dim=-1)
+        v_std = v_all.std(dim=-1, unbiased=True) if v_all.shape[-1] > 1 \
+                else torch.zeros_like(v_mean)
+    if use_v_in_J:
+        score = score + v_mean
     if use_geometric_term and beta_geom > 0:
         score = score - beta_geom * torch.norm(z_k - g_ult, p=2, dim=-1)
+    if lambda_mopo > 0:
+        score = score - lambda_mopo * v_std
+    if return_diag:
+        return score, {'v_mean': v_mean, 'v_std': v_std}
     return score
 
 
@@ -451,7 +525,20 @@ def hl_wgsp_step(z_t, g_ult,
                  N, M, k, beta_geom, alpha_H, alpha_L, action_scale,
                  use_decoder, use_geometric_term, use_v_in_J,
                  hl_optimizer, lambda_anchor=0.0,
-                 z_target=None, ll_grad_only=False, return_rollouts=False):
+                 z_target=None, ll_grad_only=False, return_rollouts=False,
+                 lambda_mopo=0.0, return_v_diag=False,
+                 ll_score_mode='goal'):
+    """One HL-WGSP gradient step. Optionally returns rollouts for distillation.
+
+    ll_score_mode:
+      'goal'      : LL within-rep advantage uses J^(i,m) (goal-based, default).
+      'rep_reach' : LL within-rep advantage uses J_LL^(i,m) =
+                    -||φ(z_t, z_k^(i,m)) - rep^(i)||_2  (faithfulness to the
+                    HL-requested rep).  Decouples LL credit assignment from
+                    the ultimate goal — addresses the "overshoot warping"
+                    pathology where goal-based J trains LL to overshoot reps
+                    in the direction of g.  Row 14 of the ablation.
+    """
     """One HL-WGSP gradient step. Optionally returns rollouts for distillation.
 
     z_t       [B, 192]
@@ -491,8 +578,15 @@ def hl_wgsp_step(z_t, g_ult,
             k=k, action_scale=action_scale, use_decoder=use_decoder)
         # traj_z [BNM, k+1, 192], traj_a_pre [BNM, k, adim]
         z_k = traj_z[:, -1, :]                                # [BNM, 192]
-        J_flat = _score_endpoints(z_k, g_NM, value_net, goal_rep,
-                                  beta_geom, use_geometric_term, use_v_in_J)
+        score_out = _score_endpoints(
+            z_k, g_NM, value_net, goal_rep,
+            beta_geom, use_geometric_term, use_v_in_J,
+            lambda_mopo=lambda_mopo, return_diag=return_v_diag)
+        if return_v_diag:
+            J_flat, v_diag = score_out
+        else:
+            J_flat = score_out
+            v_diag = None
         J = J_flat.reshape(B, N, M)
 
         # Per-rep score: mean over M
@@ -502,8 +596,20 @@ def hl_wgsp_step(z_t, g_ult,
         w_hl = torch.softmax(alpha_H * A_hl, dim=1)           # [B, N]
 
         # Per-rollout within-rep advantage (for LL distil)
-        J_rep_mean = J.mean(dim=2, keepdim=True)              # [B, N, 1]
-        A_ll = J - J_rep_mean                                 # [B, N, M]
+        if ll_score_mode == 'rep_reach':
+            # J_LL^(i,m) = -||φ(z_t, z_k^(i,m)) - rep^(i)||_2
+            # Score the LL on faithfulness to the requested rep, not on
+            # proximity to the ultimate goal.
+            z_t_NM = z_t.unsqueeze(1).unsqueeze(1).expand(
+                -1, N, M, -1).reshape(BNM, dz)
+            phi_achieved = goal_rep(z_t_NM, z_k)              # [BNM, rep_dim]
+            J_ll_flat = -torch.norm(
+                phi_achieved - rep_NM, p=2, dim=-1)           # [BNM]
+            J_ll = J_ll_flat.reshape(B, N, M)
+        else:
+            J_ll = J
+        J_ll_rep_mean = J_ll.mean(dim=2, keepdim=True)        # [B, N, 1]
+        A_ll = J_ll - J_ll_rep_mean                           # [B, N, M]
         u_ll = torch.softmax(alpha_L * A_ll, dim=2)           # [B, N, M]
 
     # ---- 3. HL loss = -Σ w·log π^H(rep)
@@ -518,9 +624,9 @@ def hl_wgsp_step(z_t, g_ult,
             with torch.no_grad():
                 rep_t  = goal_rep(z_t,      g_ult)
                 rep_tk = goal_rep(z_target, g_ult)
-                v1t,  v2t  = value_net(z_t,      rep_t)
-                v1tk, v2tk = value_net(z_target, rep_tk)
-                adv_anchor = (v1tk + v2tk) / 2 - (v1t + v2t) / 2
+                v_t  = value_net(z_t,      rep_t).mean(dim=-1)
+                v_tk = value_net(z_target, rep_tk).mean(dim=-1)
+                adv_anchor = v_tk - v_t
                 w_anchor   = (alpha_H * adv_anchor).exp().clamp(max=100.0)
             hl_loss = hl_loss + lambda_anchor * (-(w_anchor * log_p_anchor).mean())
 
@@ -537,7 +643,7 @@ def hl_wgsp_step(z_t, g_ult,
         # autograd graph (it's built from rep_cand_pre which is a Normal sample
         # from hl_actor's mean/std). After hl_loss.backward() that graph is
         # freed, so anything LL-distil tries to use must be detached first.
-        return hl_loss_val, {
+        out = {
             'traj_z':      traj_z.detach(),
             'traj_a_pre':  traj_a_pre.detach(),
             'rep_NM':      rep_NM.detach(),
@@ -545,6 +651,12 @@ def hl_wgsp_step(z_t, g_ult,
             'u_ll':        u_ll.detach(),
             'B': B, 'N': N, 'M': M, 'k': k,
         }
+        if v_diag is not None:
+            out['v_diag'] = {k: v.detach() for k, v in v_diag.items()}
+        return hl_loss_val, out
+    if return_v_diag and v_diag is not None:
+        return hl_loss_val, {'v_diag': {k: v.detach()
+                                         for k, v in v_diag.items()}}
     return hl_loss_val, None
 
 
@@ -613,10 +725,8 @@ def ll_hiql_step(real_cache, ll_actor, value_net, goal_rep,
     with torch.no_grad():
         rep_curr = goal_rep(z,      z_sub)
         rep_next = goal_rep(z_next, z_sub)
-        v1c, v2c = value_net(z,      rep_curr)
-        v1n, v2n = value_net(z_next, rep_next)
-        v_curr   = (v1c + v2c) / 2
-        v_next   = (v1n + v2n) / 2
+        v_curr   = value_net(z,      rep_curr).mean(dim=-1)
+        v_next   = value_net(z_next, rep_next).mean(dim=-1)
         adv      = v_next - v_curr
         w        = (alpha_L * adv).exp().clamp(max=100.0)
 
@@ -636,12 +746,10 @@ def hl_hiql_step(real_cache, hl_actor, value_net, goal_rep,
     with torch.no_grad():
         rep_t   = goal_rep(z_t,  g_ult)
         rep_tk  = goal_rep(z_tk, g_ult)
-        v1t,  v2t  = value_net(z_t,  rep_t)
-        v1tk, v2tk = value_net(z_tk, rep_tk)
-        v_t   = (v1t  + v2t)  / 2
-        v_tk  = (v1tk + v2tk) / 2
-        adv   = v_tk - v_t
-        w     = (alpha_H * adv).exp().clamp(max=100.0)
+        v_t  = value_net(z_t,  rep_t).mean(dim=-1)
+        v_tk = value_net(z_tk, rep_tk).mean(dim=-1)
+        adv  = v_tk - v_t
+        w    = (alpha_H * adv).exp().clamp(max=100.0)
         target_rep = goal_rep(z_t, z_tk)
 
     log_p   = hl_actor.log_prob(z_t, g_ult, target_rep)
@@ -678,6 +786,8 @@ def train_loop(
     action_scale, rep_dim,
     save_dir, device,
     log_interval=100, save_interval=1000,
+    lambda_mopo=0.0, audit_v_disagreement=True,
+    ll_score_mode='goal',
 ):
     os.makedirs(save_dir, exist_ok=True)
     warmup_steps = int(total_steps * warmup_fraction)
@@ -698,6 +808,9 @@ def train_loop(
     print(f"  total_steps        : {total_steps:,}", flush=True)
     print(f"  λ_anchor           : {lambda_anchor}", flush=True)
     print(f"  λ_distil (max)     : {lambda_distil_max}", flush=True)
+    print(f"  λ_mopo             : {lambda_mopo}", flush=True)
+    print(f"  V heads            : {value_net.n_heads}", flush=True)
+    print(f"  ll_score_mode      : {ll_score_mode}", flush=True)
     print(f"{'='*65}\n", flush=True)
 
     csv_path = os.path.join(save_dir, 'training_metrics.csv')
@@ -707,12 +820,15 @@ def train_loop(
             'll_hiql_loss', 'll_distil_loss',
             'hl_hiql_loss', 'hl_wgsp_loss',
             'lambda_distil', 'elapsed_s',
+            'v_std_endpoint', 'v_std_data',
         ])
 
     t0 = time.time()
     t_int = time.time()
     sum_v = sum_ll_hiql = sum_ll_distil = 0.0
     sum_hl_hiql = sum_hl_wgsp = 0.0
+    sum_v_std_ep = sum_v_std_dat = 0.0
+    audit_log_n = 0
     log_n = 0
     prev_phase = 1
 
@@ -773,8 +889,27 @@ def train_loop(
                 hl_optimizer=hl_optimizer,
                 lambda_anchor=lambda_anchor, z_target=z_target,
                 return_rollouts=use_distil,
+                lambda_mopo=lambda_mopo,
+                return_v_diag=audit_v_disagreement,
+                ll_score_mode=ll_score_mode,
             )
             sum_hl_wgsp += hl_wgsp_loss
+
+            if audit_v_disagreement and rollouts is not None:
+                vd = rollouts.get('v_diag')
+                if vd is not None and vd.get('v_std') is not None:
+                    sum_v_std_ep += vd['v_std'].mean().item()
+                    # Compare against disagreement on a dataset batch
+                    with torch.no_grad():
+                        z_dat, _, _, _, z_sub_dat = real_cache.sample_ll_batch(
+                            batch_size, subgoal_steps, use_5d=False)
+                        rep_dat = goal_rep(z_dat, z_sub_dat)
+                        v_dat_all = value_net(z_dat, rep_dat)
+                        v_std_dat = (v_dat_all.std(dim=-1, unbiased=True)
+                                     if v_dat_all.shape[-1] > 1
+                                     else torch.zeros(batch_size, device=device))
+                    sum_v_std_dat += v_std_dat.mean().item()
+                    audit_log_n += 1
 
             # ---- LL distil (only when WGSP active and toggle on)
             if use_distil:
@@ -804,13 +939,18 @@ def train_loop(
                       min(1.0, max(0.0, (step - warmup_steps) /
                                        max(total_steps - warmup_steps, 1)) * 2)
                       if use_distil and use_wgsp else 0.0)
+            ad = max(audit_log_n, 1)
+            v_std_ep_avg  = sum_v_std_ep  / ad
+            v_std_dat_avg = sum_v_std_dat / ad
+            v_ratio = v_std_ep_avg / max(v_std_dat_avg, 1e-8)
             print(
                 f"Step {step:06d}/{total_steps:,} ({pct:4.1f}%) | Ph{phase} | "
                 f"V {sum_v/(2*d):.4f} | "
                 f"LL_h {sum_ll_hiql/d:.4f} LL_d {sum_ll_distil/d:.4f} | "
                 f"HL_h {sum_hl_hiql/d:.4f} HL_w {sum_hl_wgsp/d:.4f} | "
-                f"λd {ld_now:.3f} | {sps:.1f} sps | "
-                f"ETA {remaining/60:.0f}m | el {elapsed/60:.0f}m",
+                f"λd {ld_now:.3f} | "
+                f"Vstd ep/dat {v_std_ep_avg:.4f}/{v_std_dat_avg:.4f}({v_ratio:.2f}x) | "
+                f"{sps:.1f} sps | ETA {remaining/60:.0f}m | el {elapsed/60:.0f}m",
                 flush=True,
             )
             with open(csv_path, 'a', newline='') as f:
@@ -819,9 +959,12 @@ def train_loop(
                     sum_ll_hiql/d, sum_ll_distil/d,
                     sum_hl_hiql/d, sum_hl_wgsp/d,
                     ld_now, now - t_int,
+                    v_std_ep_avg, v_std_dat_avg,
                 ])
             sum_v = sum_ll_hiql = sum_ll_distil = 0.0
             sum_hl_hiql = sum_hl_wgsp = 0.0
+            sum_v_std_ep = sum_v_std_dat = 0.0
+            audit_log_n = 0
             log_n = 0
             t_int = now
 
@@ -923,7 +1066,12 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_path', type=str, default=None)
     parser.add_argument('--save_dir',     type=str, default=None)
     parser.add_argument('--decoder_ckpt', type=str, default=None,
-                        help='Path to action_decoder.pth (required if --use_decoder).')
+                        help='Path to action_decoder.pth or flow_decoder.pth '
+                             '(required if --use_decoder).')
+    parser.add_argument('--decoder_type', type=str, default='mse',
+                        choices=['mse', 'flow'],
+                        help='"mse" → ActionChunkDecoder (row 1); '
+                             '"flow" → FlowDecoderWrapper (row 13).')
 
     parser.add_argument('--total_steps',     type=int,   default=200_000)
     parser.add_argument('--warmup_fraction', type=float, default=0.2)
@@ -964,6 +1112,20 @@ if __name__ == '__main__':
     parser.add_argument('--patch_size', type=int, default=14)
     parser.add_argument('--seed',       type=int, default=0)
 
+    # ---- Row-11 / V-audit flags ----
+    parser.add_argument('--n_value_heads', type=int, default=2,
+                        help='Number of V heads in EnsembleValue (2 = legacy TwinValue).')
+    parser.add_argument('--use_mopo',     type=_bool, default=False,
+                        help='Subtract λ_mopo·V_std from WGSP endpoint scores (row 11).')
+    parser.add_argument('--lambda_mopo',  type=float, default=1.0,
+                        help='Scale for MOPO-style V-disagreement penalty.')
+    parser.add_argument('--ll_score_mode', type=str, default='goal',
+                        choices=['goal', 'rep_reach'],
+                        help='LL within-rep advantage source. "goal" uses '
+                             'J^(i,m) (default, headline). "rep_reach" uses '
+                             '-||φ(z_t, z_k) - rep||_2 (row 14, decouples '
+                             'LL credit from ultimate goal).')
+
     args = parser.parse_args()
 
     if args.k_plan is None:
@@ -981,12 +1143,16 @@ if __name__ == '__main__':
     _default_ckpt = ('lejepa' if args.img_size == 224 else 'lewm_ogbench_weights.ckpt')
     ckpt_path  = args.ckpt_path or os.path.join(STABLEWM_HOME, 'cube', _default_ckpt)
     cache_path = args.cache_path or os.path.join(STABLEWM_HOME, 'lewm_224_latents_cache.pt')
+    _mopo_tag  = f'_mopo{args.lambda_mopo}' if args.use_mopo else ''
+    _heads_tag = f'_h{args.n_value_heads}' if args.n_value_heads != 2 else ''
+    _llmode_tag = f'_ll{args.ll_score_mode}' if args.ll_score_mode != 'goal' else ''
     save_dir   = args.save_dir or (
         f'./checkpoints_hiql_wgsp_k{args.subgoal_steps}_N{args.N}_M{args.M}'
         f'_b{args.beta_geom}_la{args.lambda_anchor}_ld{args.lambda_distil}'
         f'_dec{int(args.use_decoder)}_geo{int(args.use_geometric_term)}'
         f'_v{int(args.use_v_in_J)}_wgsp{int(args.use_wgsp)}'
-        f'_dis{int(args.use_distil)}_rep{args.rep_dim}_s{args.seed}')
+        f'_dis{int(args.use_distil)}_rep{args.rep_dim}'
+        f'{_heads_tag}{_mopo_tag}{_llmode_tag}_s{args.seed}')
 
     parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if parent_dir not in sys.path:
@@ -1047,33 +1213,54 @@ if __name__ == '__main__':
         hidden_dims=HIDDEN_DIMS, tanh_squash=False,
     ).to(device)
 
-    value_net = TwinValue(latent_dim=LATENT_DIM, rep_dim=REP_DIM,
-                          hidden_dims=HIDDEN_DIMS).to(device)
-    value_target = TwinValue(latent_dim=LATENT_DIM, rep_dim=REP_DIM,
-                             hidden_dims=HIDDEN_DIMS).to(device)
+    value_net = EnsembleValue(latent_dim=LATENT_DIM, rep_dim=REP_DIM,
+                              hidden_dims=HIDDEN_DIMS,
+                              n_heads=args.n_value_heads).to(device)
+    value_target = EnsembleValue(latent_dim=LATENT_DIM, rep_dim=REP_DIM,
+                                 hidden_dims=HIDDEN_DIMS,
+                                 n_heads=args.n_value_heads).to(device)
     value_target.load_state_dict(value_net.state_dict())
     for p in value_target.parameters():
         p.requires_grad = False
 
-    # Decoder (frozen). Only required if use_decoder=True OR use_wgsp=True (since
-    # the WM consumes 25-D actions, and we factor through the decoder there too).
+    # Decoder (frozen). Only required if use_decoder=True (since the WM
+    # consumes 25-D actions, factored through the decoder there too).
+    # --decoder_type mse  : ActionChunkDecoder (MSE, ~50k params)
+    # --decoder_type flow : FlowDecoderWrapper (flow-matching, row 13)
     decoder = None
     if args.use_decoder:
         if args.decoder_ckpt is None:
             raise ValueError("--decoder_ckpt is required when --use_decoder=True. "
-                             "Train one with train_action_decoder.py first.")
-        decoder = ActionChunkDecoder(in_dim=5, out_dim=25,
-                                     latent_dim=LATENT_DIM,
-                                     hidden_dims=(256, 256)).to(device)
-        decoder.load_state_dict(torch.load(args.decoder_ckpt, map_location=device))
-        decoder.eval()
-        for p in decoder.parameters():
-            p.requires_grad = False
-        print(f"  Loaded frozen ActionChunkDecoder from {args.decoder_ckpt}")
-    else:
-        # Identity-like decoder so wgsp_rollout still works in the 25-D path.
-        # We never actually call it because use_decoder=False routes around it.
-        decoder = None
+                             "Train one with train_action_decoder.py "
+                             "(MSE) or train_flow_action_decoder.py (flow) first.")
+        if args.decoder_type == 'flow':
+            from train_flow_action_decoder import FlowChunkDecoder
+            meta_path = os.path.join(
+                os.path.dirname(args.decoder_ckpt), 'flow_decoder_meta.pt')
+            flow_steps = 10
+            if os.path.exists(meta_path):
+                meta = torch.load(meta_path, map_location='cpu')
+                flow_steps = meta.get('flow_steps', 10)
+            _flow = FlowChunkDecoder(
+                latent_dim=LATENT_DIM, a_first_dim=5, action_dim=25,
+                hidden_dims=(512, 512, 512, 512),
+            ).to(device)
+            _flow.load_state_dict(torch.load(args.decoder_ckpt, map_location=device))
+            _flow.eval()
+            for p in _flow.parameters():
+                p.requires_grad = False
+            decoder = FlowDecoderWrapper(_flow, flow_steps=flow_steps).to(device)
+            print(f"  Loaded frozen FlowChunkDecoder from {args.decoder_ckpt} "
+                  f"(flow_steps={flow_steps})")
+        else:
+            decoder = ActionChunkDecoder(in_dim=5, out_dim=25,
+                                         latent_dim=LATENT_DIM,
+                                         hidden_dims=(256, 256)).to(device)
+            decoder.load_state_dict(torch.load(args.decoder_ckpt, map_location=device))
+            decoder.eval()
+            for p in decoder.parameters():
+                p.requires_grad = False
+            print(f"  Loaded frozen ActionChunkDecoder from {args.decoder_ckpt}")
 
     print(
         f'Networks (LATENT_DIM={LATENT_DIM}, REP_DIM={REP_DIM}, '
@@ -1111,4 +1298,7 @@ if __name__ == '__main__':
         lambda_distil_max=args.lambda_distil,
         action_scale=args.action_scale, rep_dim=REP_DIM,
         save_dir=save_dir, device=device,
+        lambda_mopo=args.lambda_mopo if args.use_mopo else 0.0,
+        audit_v_disagreement=True,
+        ll_score_mode=args.ll_score_mode,
     )
