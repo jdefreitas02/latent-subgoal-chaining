@@ -174,6 +174,103 @@ class _LewmGaussianActor(nn.Module):
         return action, lp.sum(dim=-1), deterministic
 
 
+class _ActionChunkDecoder(nn.Module):
+    """Frozen state-conditioned decoder D_θ(a_first, z) -> 25-D chunk.
+
+    Inline copy of latent_hindsight_rl/train_action_decoder.py:ActionChunkDecoder
+    so eval doesn't need to import the heavy training script.
+    """
+
+    def __init__(self, in_dim=5, out_dim=25, latent_dim=192,
+                 hidden_dims=(256, 256)):
+        super().__init__()
+        in_d = in_dim + latent_dim
+        layers = []
+        for h in hidden_dims:
+            layers += [nn.Linear(in_d, h), nn.LayerNorm(h), nn.GELU()]
+            in_d = h
+        layers.append(nn.Linear(in_d, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, a_first, z):
+        return self.net(torch.cat([a_first, z], dim=-1))
+
+
+class _WGSPHierarchicalPolicy:
+    """HierarchicalPolicy variant for WGSP checkpoints.
+
+    Identical to HierarchicalPolicy except: when a frozen ActionChunkDecoder
+    is provided, the LL actor is expected to output 5-D and the decoder
+    inflates it to a 25-D chunk before reshape/inverse_transform — exactly
+    matching the training-time data flow in train_hiql_wgsp.py.
+
+    If decoder=None, behaves identically to HierarchicalPolicy (LL outputs 25-D).
+    """
+
+    def __init__(self, jepa_model, actor, action_scaler, high_level, gap, device,
+                 decoder=None, subgoal_reached_threshold=0.0):
+        self.jepa_model    = jepa_model
+        self.actor         = actor
+        self.action_scaler = action_scaler
+        self.high_level    = high_level
+        self.gap           = gap
+        self.device        = device
+        self.decoder       = decoder
+        self.subgoal_reached_threshold = subgoal_reached_threshold
+        self._buf       = []
+        self._wm_steps  = 0
+        self._z_subgoal = None
+
+    def get_action(self, obs_hwc, goal_hwc=None, goal_latent=None):
+        diag = None
+        if not self._buf:
+            z_curr = encode_and_project(self.jepa_model, obs_hwc, self.device)
+            if goal_latent is not None:
+                z_final_goal = goal_latent.to(self.device)
+            else:
+                z_final_goal = encode_and_project(self.jepa_model, goal_hwc, self.device)
+            with torch.no_grad():
+                subgoal_reached = (
+                    self._z_subgoal is not None and
+                    self._z_subgoal.shape[-1] == z_curr.shape[-1] and
+                    torch.norm(z_curr - self._z_subgoal, p=2, dim=-1).item() <
+                    self.subgoal_reached_threshold
+                )
+                switched = (self._z_subgoal is None or
+                            self._wm_steps >= self.gap or subgoal_reached)
+                if switched:
+                    z_subgoal_raw = self.high_level.predict(z_curr, z_final_goal)
+                    self._z_subgoal = nn_clamp_subgoal(z_subgoal_raw)
+                    self._wm_steps  = 0
+                    self._subgoal_switches = getattr(self, '_subgoal_switches', 0) + 1
+                _, _, ll_out = self.actor.sample(z_curr, self._z_subgoal)
+                # ll_out is (1,5) if decoder present, else (1,25)
+                if self.decoder is not None:
+                    chunk_25d = self.decoder(ll_out, z_curr)            # (1,25)
+                else:
+                    chunk_25d = ll_out
+                same_dim = self._z_subgoal.shape[-1] == z_curr.shape[-1]
+                diag = {
+                    'dist_to_goal':         torch.norm(z_curr - z_final_goal, p=2, dim=-1).item(),
+                    'dist_to_subgoal':      torch.norm(z_curr - self._z_subgoal, p=2, dim=-1).item() if same_dim else float('nan'),
+                    'dist_subgoal_to_goal': torch.norm(self._z_subgoal - z_final_goal, p=2, dim=-1).item() if same_dim else float('nan'),
+                    'subgoal_switches':     getattr(self, '_subgoal_switches', 0),
+                    'subgoal_switched':     switched,
+                }
+            self._wm_steps += 1
+            raw      = chunk_25d.cpu().numpy().reshape(5, 5)
+            physical = np.clip(self.action_scaler.inverse_transform(raw), -1.0, 1.0)
+            diag['action_norm'] = float(np.mean(np.abs(physical)))
+            self._buf = [physical[t] for t in range(5)]
+        return self._buf.pop(0), diag
+
+    def reset(self):
+        self._buf = []
+        self._wm_steps = 0
+        self._z_subgoal = None
+        self._subgoal_switches = 0
+
+
 class _BaselineGaussianActor(nn.Module):
     """Baseline HIQL actor with explicit input_dim (vs _GaussianActor's latent_dim*2).
 
@@ -701,6 +798,10 @@ def main():
                         help="Baseline HIQL goal-rep dimension. Auto-detected from checkpoint "
                              "dir name (e.g. checkpoints_hiql_baseline_k5_rep10). "
                              "Required when evaluating a baseline checkpoint.")
+    parser.add_argument('--decoder_ckpt', type=str, default=None,
+                        help="Path to action_decoder.pth. Used by WGSP eval when the "
+                             "decoder is not co-located in --checkpoint_dir. Ignored if "
+                             "the checkpoint dir already contains action_decoder.pth.")
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--diagnose', action='store_true',
                         help="Print per-step diagnostics for episode 0 of each task: "
@@ -820,7 +921,10 @@ def main():
     is_hiql          = (ckpt_dir / 'll_actor.pth').exists() or is_hiql_flow
     has_goal_rep     = is_hiql and (ckpt_dir / 'goal_rep.pth').exists()
     is_hiql_baseline = has_goal_rep and 'baseline' in str(ckpt_dir).lower()
-    is_hiql_lewm_v2  = has_goal_rep and not is_hiql_baseline and not is_hiql_flow
+    is_hiql_wgsp     = (has_goal_rep and 'wgsp' in str(ckpt_dir).lower()
+                        and not is_hiql_flow and not is_hiql_baseline)
+    is_hiql_lewm_v2  = (has_goal_rep and not is_hiql_baseline
+                        and not is_hiql_wgsp and not is_hiql_flow)
     is_hiql_v1       = is_hiql and not has_goal_rep and not is_hiql_flow
 
     # Auto-detect subgoal steps: checkpoints_hiql_{lewm,baseline}_k{N}_*
@@ -920,6 +1024,60 @@ def main():
             gap=subgoal_steps, device=device,
             subgoal_reached_threshold=0.0)
         print(f"  Policy: HIQL+LeWM+Flow Hierarchical (k={subgoal_steps}, rep_dim={rep_dim})")
+
+    elif is_hiql_wgsp:
+        # ── WGSP checkpoint (train_hiql_wgsp.py) ─────────────────────────────
+        # HL: state=192, goal=192, output=rep_dim, no squash       (same as v2)
+        # LL: state=192, goal=rep_dim, output=5 OR 25, tanh_squash=True
+        #     5 if action_decoder.pth is present in ckpt_dir, else 25.
+        ll_ckpt   = ckpt_dir / 'll_actor.pth'
+        hl_ckpt   = ckpt_dir / 'hl_actor.pth'
+        dec_ckpt  = ckpt_dir / 'action_decoder.pth'
+        # Decoder may live in a sibling dir (the sweep places it there); allow override.
+        if not dec_ckpt.exists() and getattr(args, 'decoder_ckpt', None):
+            dec_ckpt = Path(args.decoder_ckpt)
+        use_decoder = dec_ckpt.exists()
+        ll_out_dim  = 5 if use_decoder else 25
+        print(f"Loading WGSP actors (k={subgoal_steps}, rep_dim={rep_dim}, "
+              f"LL_out={ll_out_dim}, decoder={'yes' if use_decoder else 'no'}) ...")
+
+        ll_actor = _LewmGaussianActor(
+            state_dim=192, goal_dim=rep_dim, output_dim=ll_out_dim,
+            hidden_dims=(512, 512, 512),
+            tanh_squash=True, action_scale=3.0,
+        ).to(device)
+        ll_actor.load_state_dict(torch.load(ll_ckpt, map_location=device))
+        ll_actor.eval()
+        for p in ll_actor.parameters():
+            p.requires_grad_(False)
+
+        hl_actor_net = _LewmGaussianActor(
+            state_dim=192, goal_dim=192, output_dim=rep_dim,
+            hidden_dims=(512, 512, 512),
+            tanh_squash=False,
+        ).to(device)
+        hl_actor_net.load_state_dict(torch.load(hl_ckpt, map_location=device))
+        hl_actor_net.eval()
+        for p in hl_actor_net.parameters():
+            p.requires_grad_(False)
+
+        decoder = None
+        if use_decoder:
+            decoder = _ActionChunkDecoder(in_dim=5, out_dim=25, latent_dim=192,
+                                          hidden_dims=(256, 256)).to(device)
+            decoder.load_state_dict(torch.load(dec_ckpt, map_location=device))
+            decoder.eval()
+            for p in decoder.parameters():
+                p.requires_grad_(False)
+            print(f"  Loaded ActionChunkDecoder from {dec_ckpt}")
+
+        hl_model = _HIQLBaselineHighLevelWrapper(hl_actor_net)
+        policy = _WGSPHierarchicalPolicy(
+            jepa_model, ll_actor, action_scaler, hl_model,
+            gap=subgoal_steps, device=device, decoder=decoder,
+            subgoal_reached_threshold=0.0,
+        )
+        print(f"  Policy: WGSP Hierarchical (k={subgoal_steps}, rep_dim={rep_dim})")
 
     elif is_hiql_lewm_v2:
         # ── LeWM-hybrid HIQL with HER + 10D goal_rep (train_hiql_lewm.py) ────
