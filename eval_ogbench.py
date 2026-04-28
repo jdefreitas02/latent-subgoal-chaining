@@ -271,11 +271,64 @@ class _WGSPHierarchicalPolicy:
         self._subgoal_switches = 0
 
 
+class _BaselineNativeHierarchicalPolicy:
+    """HIQL baseline policy: native 5D actions, encode every env step (no chunking).
+
+    Mirrors ogbench's evaluation: re-encodes the obs every env step, queries HL
+    every `gap` env steps for a fresh phi, and outputs one 5D action per step.
+    """
+
+    def __init__(self, jepa_model, ll_actor, action_scaler, hl_actor_wrapped,
+                 gap, device):
+        self.jepa_model = jepa_model
+        self.actor = ll_actor
+        self.action_scaler = action_scaler
+        self.high_level = hl_actor_wrapped
+        self.gap = gap
+        self.device = device
+        self._step = 0
+        self._z_subgoal = None
+        self._subgoal_switches = 0
+
+    def reset(self):
+        self._step = 0
+        self._z_subgoal = None
+        self._subgoal_switches = 0
+
+    def get_action(self, obs_hwc, goal_hwc=None, goal_latent=None):
+        z_curr = encode_and_project(self.jepa_model, obs_hwc, self.device)
+        if goal_latent is not None:
+            z_goal = goal_latent.to(self.device)
+        else:
+            z_goal = encode_and_project(self.jepa_model, goal_hwc, self.device)
+
+        with torch.no_grad():
+            switched = self._z_subgoal is None or self._step >= self.gap
+            if switched:
+                self._z_subgoal = self.high_level.predict(z_curr, z_goal)
+                self._step = 0
+                self._subgoal_switches += 1
+            _, _, mean = self.actor.sample(z_curr, self._z_subgoal)        # [1, 5]
+
+        self._step += 1
+        raw = mean.cpu().numpy().reshape(1, 5)
+        physical = np.clip(self.action_scaler.inverse_transform(raw), -1.0, 1.0)[0]
+        diag = {
+            'dist_to_goal': torch.norm(z_curr - z_goal, p=2, dim=-1).item(),
+            'dist_to_subgoal': float('nan'),
+            'dist_subgoal_to_goal': float('nan'),
+            'subgoal_switches': self._subgoal_switches,
+            'subgoal_switched': switched,
+            'action_norm': float(np.mean(np.abs(physical))),
+        }
+        return physical, diag
+
+
 class _BaselineGaussianActor(nn.Module):
     """Baseline HIQL actor with explicit input_dim (vs _GaussianActor's latent_dim*2).
 
     Matches train_hiql_baseline.py GaussianActor weight layout exactly.
-    Used for both HL (input=384, output=rep_dim) and LL (input=192+rep_dim, output=25).
+    Used for both HL (input=384, output=rep_dim) and LL (input=192+rep_dim, output=5).
     const_std=True: std is fixed at 1 (matches ogbench GCActor const_std=True).
     """
 
@@ -956,14 +1009,14 @@ def main():
     # ── Load actor(s) & build policy ──────────────────────────────────────────
     if is_hiql_baseline:
         # ── Baseline HIQL checkpoint (train_hiql_baseline.py) ─────────────────
-        # HL: input=384 (192+192), output=rep_dim.  LL: input=192+rep_dim, output=25.
-        # goal_rep.pth is not needed at inference — HL predicts phi directly.
+        # HL: input=384 (192+192), output=rep_dim.  LL: input=192+rep_dim, output=5.
+        # Native 5D actions, no chunking — encodes every env step.
         ll_ckpt = ckpt_dir / 'll_actor.pth'
         hl_ckpt = ckpt_dir / 'hl_actor.pth'
         print(f"Loading HIQL-baseline actors (k={subgoal_steps}, rep_dim={rep_dim}) ...")
 
         ll_actor = _BaselineGaussianActor(
-            input_dim=192 + rep_dim, output_dim=25,
+            input_dim=192 + rep_dim, output_dim=5,
             hidden_dims=(512, 512, 512),
             tanh_squash=False,
         ).to(device)
@@ -983,13 +1036,10 @@ def main():
             p.requires_grad_(False)
 
         hl_model = _HIQLBaselineHighLevelWrapper(hl_actor_net)
-        # Baseline operates in rep_dim space — no meaningful spatial done_threshold,
-        # so use time-based switching only (set threshold to 0 to disable spatial check).
-        policy = HierarchicalPolicy(
+        policy = _BaselineNativeHierarchicalPolicy(
             jepa_model, ll_actor, action_scaler, hl_model,
-            gap=subgoal_steps, device=device,
-            subgoal_reached_threshold=0.0)
-        print(f"  Policy: HIQL-baseline Hierarchical (k={subgoal_steps}, rep_dim={rep_dim})")
+            gap=subgoal_steps, device=device)
+        print(f"  Policy: HIQL-baseline Native Hierarchical (k={subgoal_steps}, rep_dim={rep_dim})")
 
     elif is_hiql_flow:
         # ── Flow LL policy (train_hiql_flow.py) ───────────────────────────────
