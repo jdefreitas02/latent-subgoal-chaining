@@ -719,16 +719,25 @@ def ll_distil_step(rollouts, ll_actor, ll_optimizer, lambda_distil):
 # =============================================================================
 
 def ll_hiql_step(real_cache, ll_actor, value_net, goal_rep,
-                 batch_size, k, alpha_L, ll_optimizer, use_5d):
+                 batch_size, k, alpha_L, ll_optimizer, use_5d, mode='awr'):
+    """LL update on real data.
+
+    mode='awr' : advantage-weighted regression (standard HIQL LL).
+    mode='bc'  : pure behavioural cloning — uniform weights, no V queries.
+                 Tests the WGSP HL + BC LL variant (ablation of AWR in LL).
+    """
     z, a, _, z_next, z_sub = real_cache.sample_ll_batch(batch_size, k, use_5d=use_5d)
 
     with torch.no_grad():
-        rep_curr = goal_rep(z,      z_sub)
-        rep_next = goal_rep(z_next, z_sub)
-        v_curr   = value_net(z,      rep_curr).mean(dim=-1)
-        v_next   = value_net(z_next, rep_next).mean(dim=-1)
-        adv      = v_next - v_curr
-        w        = (alpha_L * adv).exp().clamp(max=100.0)
+        rep_curr = goal_rep(z, z_sub)
+        if mode == 'awr':
+            rep_next = goal_rep(z_next, z_sub)
+            v_curr   = value_net(z,      rep_curr).mean(dim=-1)
+            v_next   = value_net(z_next, rep_next).mean(dim=-1)
+            adv      = v_next - v_curr
+            w        = (alpha_L * adv).exp().clamp(max=100.0)
+        else:
+            w = torch.ones(z.shape[0], device=z.device)
 
     log_p   = ll_actor.log_prob(z, rep_curr, a)
     ll_loss = -(w * log_p).mean()
@@ -788,6 +797,7 @@ def train_loop(
     log_interval=100, save_interval=1000,
     lambda_mopo=0.0, audit_v_disagreement=True,
     ll_score_mode='goal',
+    ll_mode='awr',
 ):
     os.makedirs(save_dir, exist_ok=True)
     warmup_steps = int(total_steps * warmup_fraction)
@@ -811,6 +821,7 @@ def train_loop(
     print(f"  λ_mopo             : {lambda_mopo}", flush=True)
     print(f"  V heads            : {value_net.n_heads}", flush=True)
     print(f"  ll_score_mode      : {ll_score_mode}", flush=True)
+    print(f"  ll_mode (LL step)  : {ll_mode}  (bc=pure BC, no advantage)", flush=True)
     print(f"{'='*65}\n", flush=True)
 
     csv_path = os.path.join(save_dir, 'training_metrics.csv')
@@ -862,7 +873,7 @@ def train_loop(
         # ---- LL HIQL (always on; the on-data anchor)
         ll_hiql_loss = ll_hiql_step(real_cache, ll_actor, value_net, goal_rep,
                                     batch_size, subgoal_steps, alpha_L,
-                                    ll_optimizer, use_5d=use_5d)
+                                    ll_optimizer, use_5d=use_5d, mode=ll_mode)
         sum_ll_hiql += ll_hiql_loss
 
         # ---- HL: WGSP if enabled and Phase 2; else HIQL HL
@@ -1125,6 +1136,12 @@ if __name__ == '__main__':
                              'J^(i,m) (default, headline). "rep_reach" uses '
                              '-||φ(z_t, z_k) - rep||_2 (row 14, decouples '
                              'LL credit from ultimate goal).')
+    parser.add_argument('--ll_mode', type=str, default='awr',
+                        choices=['awr', 'bc'],
+                        help='LL real-data update. "awr" (default) uses IQL '
+                             'advantage-weighted regression. "bc" uses pure '
+                             'behavioural cloning (no V queries, uniform weights). '
+                             'Tests WGSP HL + BC LL vs WGSP HL + AWR LL.')
 
     args = parser.parse_args()
 
@@ -1145,14 +1162,15 @@ if __name__ == '__main__':
     cache_path = args.cache_path or os.path.join(STABLEWM_HOME, 'lewm_224_latents_cache.pt')
     _mopo_tag  = f'_mopo{args.lambda_mopo}' if args.use_mopo else ''
     _heads_tag = f'_h{args.n_value_heads}' if args.n_value_heads != 2 else ''
-    _llmode_tag = f'_ll{args.ll_score_mode}' if args.ll_score_mode != 'goal' else ''
+    _llmode_tag  = f'_ll{args.ll_score_mode}' if args.ll_score_mode != 'goal' else ''
+    _llupd_tag   = '_llbc' if args.ll_mode == 'bc' else ''
     save_dir   = args.save_dir or (
         f'./checkpoints_hiql_wgsp_k{args.subgoal_steps}_N{args.N}_M{args.M}'
         f'_b{args.beta_geom}_la{args.lambda_anchor}_ld{args.lambda_distil}'
         f'_dec{int(args.use_decoder)}_geo{int(args.use_geometric_term)}'
         f'_v{int(args.use_v_in_J)}_wgsp{int(args.use_wgsp)}'
         f'_dis{int(args.use_distil)}_rep{args.rep_dim}'
-        f'{_heads_tag}{_mopo_tag}{_llmode_tag}_s{args.seed}')
+        f'{_heads_tag}{_mopo_tag}{_llmode_tag}{_llupd_tag}_s{args.seed}')
 
     parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if parent_dir not in sys.path:
@@ -1301,4 +1319,5 @@ if __name__ == '__main__':
         lambda_mopo=args.lambda_mopo if args.use_mopo else 0.0,
         audit_v_disagreement=True,
         ll_score_mode=args.ll_score_mode,
+        ll_mode=args.ll_mode,
     )

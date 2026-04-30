@@ -279,16 +279,22 @@ class _BaselineNativeHierarchicalPolicy:
     """
 
     def __init__(self, jepa_model, ll_actor, action_scaler, hl_actor_wrapped,
-                 gap, device):
+                 gap, device, latent_adapter=None):
         self.jepa_model = jepa_model
         self.actor = ll_actor
         self.action_scaler = action_scaler
         self.high_level = hl_actor_wrapped
         self.gap = gap
         self.device = device
+        self.latent_adapter = latent_adapter
         self._step = 0
         self._z_subgoal = None
         self._subgoal_switches = 0
+
+    def _adapt(self, z):
+        if self.latent_adapter is not None:
+            z = self.latent_adapter(z)
+        return z
 
     def reset(self):
         self._step = 0
@@ -296,13 +302,15 @@ class _BaselineNativeHierarchicalPolicy:
         self._subgoal_switches = 0
 
     def get_action(self, obs_hwc, goal_hwc=None, goal_latent=None):
-        z_curr = encode_and_project(self.jepa_model, obs_hwc, self.device)
+        z_curr_raw = encode_and_project(self.jepa_model, obs_hwc, self.device)
         if goal_latent is not None:
-            z_goal = goal_latent.to(self.device)
+            z_goal_raw = goal_latent.to(self.device)
         else:
-            z_goal = encode_and_project(self.jepa_model, goal_hwc, self.device)
+            z_goal_raw = encode_and_project(self.jepa_model, goal_hwc, self.device)
 
         with torch.no_grad():
+            z_curr = self._adapt(z_curr_raw)
+            z_goal = self._adapt(z_goal_raw)
             switched = self._z_subgoal is None or self._step >= self.gap
             if switched:
                 self._z_subgoal = self.high_level.predict(z_curr, z_goal)
@@ -314,7 +322,7 @@ class _BaselineNativeHierarchicalPolicy:
         raw = mean.cpu().numpy().reshape(1, 5)
         physical = np.clip(self.action_scaler.inverse_transform(raw), -1.0, 1.0)[0]
         diag = {
-            'dist_to_goal': torch.norm(z_curr - z_goal, p=2, dim=-1).item(),
+            'dist_to_goal': torch.norm(z_curr_raw - z_goal_raw, p=2, dim=-1).item(),
             'dist_to_subgoal': float('nan'),
             'dist_subgoal_to_goal': float('nan'),
             'subgoal_switches': self._subgoal_switches,
@@ -365,6 +373,23 @@ class _BaselineGaussianActor(nn.Module):
             lp            = dist.log_prob(raw)
             deterministic = mean
         return action, lp.sum(dim=-1), deterministic
+
+
+class _LatentAdapter(nn.Module):
+    """Eval-side mirror of LatentAdapter in train_hiql_baseline.py."""
+
+    def __init__(self, in_dim=192, out_dim=256, layer_norm=True):
+        super().__init__()
+        layers = [nn.Linear(in_dim, out_dim), nn.GELU()]
+        if layer_norm:
+            layers.append(nn.LayerNorm(out_dim))
+        layers += [nn.Linear(out_dim, out_dim), nn.GELU()]
+        if layer_norm:
+            layers.append(nn.LayerNorm(out_dim))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.mlp(x)
 
 
 class _HIQLBaselineHighLevelWrapper:
@@ -1009,14 +1034,34 @@ def main():
     # ── Load actor(s) & build policy ──────────────────────────────────────────
     if is_hiql_baseline:
         # ── Baseline HIQL checkpoint (train_hiql_baseline.py) ─────────────────
-        # HL: input=384 (192+192), output=rep_dim.  LL: input=192+rep_dim, output=5.
+        # HL: input=latent_dim*2, output=rep_dim.  LL: input=latent_dim+rep_dim, output=5.
+        # latent_dim=192 (no adapter) or adapter_out_dim (with adapter).
         # Native 5D actions, no chunking — encodes every env step.
         ll_ckpt = ckpt_dir / 'll_actor.pth'
         hl_ckpt = ckpt_dir / 'hl_actor.pth'
-        print(f"Loading HIQL-baseline actors (k={subgoal_steps}, rep_dim={rep_dim}) ...")
+
+        # Auto-detect and load trainable latent adapter if present.
+        latent_adapter = None
+        adapter_out_dim = 192
+        adapter_ckpt = ckpt_dir / 'adapter.pth'
+        if adapter_ckpt.exists():
+            adapter_sd = torch.load(adapter_ckpt, map_location='cpu')
+            # Infer output dim from the last Linear weight in the adapter.
+            last_weight_key = [k for k in adapter_sd if k.endswith('.weight')][-1]
+            adapter_out_dim = adapter_sd[last_weight_key].shape[0]
+            latent_adapter = _LatentAdapter(
+                in_dim=192, out_dim=adapter_out_dim).to(device)
+            latent_adapter.load_state_dict(adapter_sd)
+            latent_adapter.eval()
+            for p in latent_adapter.parameters():
+                p.requires_grad_(False)
+            print(f"  Loaded latent adapter: 192 → {adapter_out_dim}D")
+
+        print(f"Loading HIQL-baseline actors "
+              f"(k={subgoal_steps}, rep_dim={rep_dim}, latent_dim={adapter_out_dim}) ...")
 
         ll_actor = _BaselineGaussianActor(
-            input_dim=192 + rep_dim, output_dim=5,
+            input_dim=adapter_out_dim + rep_dim, output_dim=5,
             hidden_dims=(512, 512, 512),
             tanh_squash=False,
         ).to(device)
@@ -1026,7 +1071,7 @@ def main():
             p.requires_grad_(False)
 
         hl_actor_net = _BaselineGaussianActor(
-            input_dim=192 * 2, output_dim=rep_dim,
+            input_dim=adapter_out_dim * 2, output_dim=rep_dim,
             hidden_dims=(512, 512, 512),
             tanh_squash=False,
         ).to(device)
@@ -1038,8 +1083,10 @@ def main():
         hl_model = _HIQLBaselineHighLevelWrapper(hl_actor_net)
         policy = _BaselineNativeHierarchicalPolicy(
             jepa_model, ll_actor, action_scaler, hl_model,
-            gap=subgoal_steps, device=device)
-        print(f"  Policy: HIQL-baseline Native Hierarchical (k={subgoal_steps}, rep_dim={rep_dim})")
+            gap=subgoal_steps, device=device, latent_adapter=latent_adapter)
+        print(f"  Policy: HIQL-baseline Native Hierarchical "
+              f"(k={subgoal_steps}, rep_dim={rep_dim}, "
+              f"adapter={'yes' if latent_adapter is not None else 'no'})")
 
     elif is_hiql_flow:
         # ── Flow LL policy (train_hiql_flow.py) ───────────────────────────────
