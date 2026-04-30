@@ -127,6 +127,29 @@ class TwinValue(nn.Module):
         return self.v1(x).squeeze(-1), self.v2(x).squeeze(-1)
 
 
+class LatentAdapter(nn.Module):
+    """Trainable 2-layer MLP that projects frozen 192D LeWM latents into a
+    task-relevant space, trained end-to-end with the HIQL value/actor losses.
+
+    Maps 192D → out_dim (default 256, matching ogbench impala_small output).
+    When out_dim=256 the downstream network widths match ogbench exactly.
+    """
+
+    def __init__(self, in_dim=192, out_dim=256, layer_norm=True):
+        super().__init__()
+        layers = [nn.Linear(in_dim, out_dim), nn.GELU()]
+        if layer_norm:
+            layers.append(nn.LayerNorm(out_dim))
+        layers += [nn.Linear(out_dim, out_dim), nn.GELU()]
+        if layer_norm:
+            layers.append(nn.LayerNorm(out_dim))
+        self.mlp = nn.Sequential(*layers)
+        self.mlp.apply(_init_weights)
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
 # =============================================================================
 # 2. Data Pipeline (mirrors ogbench HGCDataset.sample exactly)
 # =============================================================================
@@ -289,8 +312,11 @@ def train_loop(
     device='cuda',
     log_interval=100,
     save_interval=10_000,
+    latent_adapter=None,
 ):
     os.makedirs(save_dir, exist_ok=True)
+
+    adapt = (lambda z: latent_adapter(z)) if latent_adapter is not None else (lambda z: z)
 
     print(f"\n{'='*65}", flush=True)
     print(f"  HIQL baseline (faithful ogbench port)", flush=True)
@@ -298,6 +324,7 @@ def train_loop(
     print(f"  subgoal_steps : {subgoal_steps}  (raw env steps)", flush=True)
     print(f"  rep_dim       : {goal_rep.mlp[-1].out_features}", flush=True)
     print(f"  batch_size    : {batch_size}", flush=True)
+    print(f"  latent_adapter: {'enabled' if latent_adapter is not None else 'disabled'}", flush=True)
     print(f"  save_dir      : {save_dir}", flush=True)
     print(f"{'='*65}\n", flush=True)
 
@@ -314,15 +341,15 @@ def train_loop(
     for step in range(total_steps):
         batch = real_cache.sample_batch(batch_size, subgoal_steps, discount=gamma)
 
-        obs = batch['observations']
-        nobs = batch['next_observations']
-        actions = batch['actions']
-        rewards = batch['rewards']
-        masks = batch['masks']
-        v_goals = batch['value_goals']
-        ll_goals = batch['low_actor_goals']
-        hl_goals = batch['high_actor_goals']
-        hl_targets = batch['high_actor_targets']
+        obs      = adapt(batch['observations'])
+        nobs     = adapt(batch['next_observations'])
+        actions  = batch['actions']
+        rewards  = batch['rewards']
+        masks    = batch['masks']
+        v_goals  = adapt(batch['value_goals'])
+        ll_goals = adapt(batch['low_actor_goals'])
+        hl_goals = adapt(batch['high_actor_goals'])
+        hl_targets = adapt(batch['high_actor_targets'])
 
         # ----- Value loss (mirrors HIQLAgent.value_loss) -----
         with torch.no_grad():
@@ -421,6 +448,9 @@ def train_loop(
             torch.save(ll_actor.state_dict(),  os.path.join(save_dir, 'll_actor.pth'))
             torch.save(hl_actor.state_dict(),  os.path.join(save_dir, 'hl_actor.pth'))
             torch.save(value_net.state_dict(), os.path.join(save_dir, 'value_net.pth'))
+            if latent_adapter is not None:
+                torch.save(latent_adapter.state_dict(),
+                           os.path.join(save_dir, 'adapter.pth'))
             print(f"  → checkpoint saved at step {step}", flush=True)
 
 
@@ -449,6 +479,10 @@ if __name__ == '__main__':
     parser.add_argument('--expectile',      type=float, default=0.7)
     parser.add_argument('--lr',             type=float, default=3e-4)
     parser.add_argument('--tau',            type=float, default=0.005)
+    parser.add_argument('--adapter_dim',    type=int,   default=0,
+                        help='Output dim of trainable MLP adapter on top of frozen 192D latents. '
+                             '0=disabled (frozen encoder as-is). '
+                             '256=recommended (matches ogbench impala_small output dim).')
 
     args = parser.parse_args()
 
@@ -502,10 +536,21 @@ if __name__ == '__main__':
         device=device,
     )
 
-    LATENT_DIM  = 192
-    ACTION_DIM  = 5
-    REP_DIM     = args.rep_dim
-    HIDDEN_DIMS = (512, 512, 512)
+    RAW_LATENT_DIM = 192
+    ACTION_DIM     = 5
+    REP_DIM        = args.rep_dim
+    HIDDEN_DIMS    = (512, 512, 512)
+
+    # Trainable adapter (optional): projects 192D frozen latents → LATENT_DIM
+    # so all downstream networks can learn task-relevant representations.
+    latent_adapter = None
+    LATENT_DIM = RAW_LATENT_DIM
+    if args.adapter_dim > 0:
+        latent_adapter = LatentAdapter(
+            in_dim=RAW_LATENT_DIM, out_dim=args.adapter_dim).to(device)
+        LATENT_DIM = args.adapter_dim
+        print(f'LatentAdapter: 192 → {LATENT_DIM}D '
+              f'({sum(p.numel() for p in latent_adapter.parameters()):,} params)')
 
     goal_rep = GoalRep(
         latent_dim=LATENT_DIM, rep_dim=REP_DIM,
@@ -536,7 +581,7 @@ if __name__ == '__main__':
         p.requires_grad = False
 
     print(
-        f'Networks (LeWM 192D encoder, rep_dim={REP_DIM}):\n'
+        f'Networks (LeWM 192D encoder → {LATENT_DIM}D, rep_dim={REP_DIM}):\n'
         f'  GoalRep:  {sum(p.numel() for p in goal_rep.parameters()):>10,} params\n'
         f'  LL Actor: {sum(p.numel() for p in ll_actor.parameters()):>10,} params\n'
         f'  HL Actor: {sum(p.numel() for p in hl_actor.parameters()):>10,} params\n'
@@ -548,6 +593,8 @@ if __name__ == '__main__':
               + list(ll_actor.parameters())
               + list(hl_actor.parameters())
               + list(value_net.parameters()))
+    if latent_adapter is not None:
+        params = list(latent_adapter.parameters()) + params
     optimizer = torch.optim.Adam(params, lr=args.lr)
 
     train_loop(
@@ -565,4 +612,5 @@ if __name__ == '__main__':
         alpha_high=args.alpha_high,
         save_dir=save_dir,
         device=device,
+        latent_adapter=latent_adapter,
     )
