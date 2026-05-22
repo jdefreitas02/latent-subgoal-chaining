@@ -128,21 +128,28 @@ class TwinValue(nn.Module):
 
 
 class LatentAdapter(nn.Module):
-    """Trainable 2-layer MLP that projects frozen 192D LeWM latents into a
-    task-relevant space, trained end-to-end with the HIQL value/actor losses.
+    """Trainable MLP adapter on top of frozen LeWM latents, trained end-to-end
+    with the HIQL value/actor losses.
 
-    Maps 192D → out_dim (default 256, matching ogbench impala_small output).
-    When out_dim=256 the downstream network widths match ogbench exactly.
+    Configurable depth and hidden width for diagnostic ablations:
+      depth=2, hidden_dim=256  — original config (baseline)
+      depth=2, hidden_dim=512  — wider (tests width hypothesis)
+      depth=3, hidden_dim=256  — deeper (tests depth hypothesis)
+
+    Maps in_dim → out_dim via `depth` layers of [Linear → GELU → LayerNorm].
     """
 
-    def __init__(self, in_dim=192, out_dim=256, layer_norm=True):
+    def __init__(self, in_dim=192, out_dim=256, hidden_dim=None,
+                 depth=2, layer_norm=True):
         super().__init__()
-        layers = [nn.Linear(in_dim, out_dim), nn.GELU()]
-        if layer_norm:
-            layers.append(nn.LayerNorm(out_dim))
-        layers += [nn.Linear(out_dim, out_dim), nn.GELU()]
-        if layer_norm:
-            layers.append(nn.LayerNorm(out_dim))
+        hidden_dim = hidden_dim or out_dim
+        dims = [in_dim] + [hidden_dim] * (depth - 1) + [out_dim]
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(nn.GELU())
+            if layer_norm:
+                layers.append(nn.LayerNorm(dims[i + 1]))
         self.mlp = nn.Sequential(*layers)
         self.mlp.apply(_init_weights)
 
@@ -313,6 +320,7 @@ def train_loop(
     log_interval=100,
     save_interval=10_000,
     latent_adapter=None,
+    encode_mode='cls_projected',
 ):
     os.makedirs(save_dir, exist_ok=True)
 
@@ -451,6 +459,9 @@ def train_loop(
             if latent_adapter is not None:
                 torch.save(latent_adapter.state_dict(),
                            os.path.join(save_dir, 'adapter.pth'))
+            import json as _json
+            with open(os.path.join(save_dir, 'metadata.json'), 'w') as _mf:
+                _json.dump({'encode_mode': encode_mode}, _mf)
             print(f"  → checkpoint saved at step {step}", flush=True)
 
 
@@ -479,10 +490,16 @@ if __name__ == '__main__':
     parser.add_argument('--expectile',      type=float, default=0.7)
     parser.add_argument('--lr',             type=float, default=3e-4)
     parser.add_argument('--tau',            type=float, default=0.005)
-    parser.add_argument('--adapter_dim',    type=int,   default=0,
+    parser.add_argument('--adapter_dim',        type=int,   default=0,
                         help='Output dim of trainable MLP adapter on top of frozen 192D latents. '
                              '0=disabled (frozen encoder as-is). '
                              '256=recommended (matches ogbench impala_small output dim).')
+    parser.add_argument('--adapter_hidden_dim', type=int,   default=None,
+                        help='Hidden layer width of adapter MLP. '
+                             'Default = adapter_dim. Set to 512 for wider-adapter ablation.')
+    parser.add_argument('--adapter_depth',      type=int,   default=2,
+                        help='Number of layers in adapter MLP (default=2). '
+                             'Set to 3 for deeper-adapter ablation.')
 
     args = parser.parse_args()
 
@@ -512,6 +529,8 @@ if __name__ == '__main__':
     cache_data  = torch.load(cache_path, map_location='cpu')
     all_latents = cache_data['all_latents']
     all_actions = cache_data.get('all_actions', [])
+    cached_mode = cache_data.get('encode_mode', 'cls_projected')
+    print(f'  Cache encode_mode: {cached_mode}')
 
     if not all_actions:
         raise RuntimeError(
@@ -536,7 +555,8 @@ if __name__ == '__main__':
         device=device,
     )
 
-    RAW_LATENT_DIM = 192
+    # Infer raw latent dim from the cache (192 for most modes, 384 for cls_patch_cat).
+    RAW_LATENT_DIM = int(cache_data.get('latent_dim') or all_latents[0].shape[-1])
     ACTION_DIM     = 5
     REP_DIM        = args.rep_dim
     HIDDEN_DIMS    = (512, 512, 512)
@@ -547,9 +567,13 @@ if __name__ == '__main__':
     LATENT_DIM = RAW_LATENT_DIM
     if args.adapter_dim > 0:
         latent_adapter = LatentAdapter(
-            in_dim=RAW_LATENT_DIM, out_dim=args.adapter_dim).to(device)
+            in_dim=RAW_LATENT_DIM, out_dim=args.adapter_dim,
+            hidden_dim=args.adapter_hidden_dim,
+            depth=args.adapter_depth,
+        ).to(device)
         LATENT_DIM = args.adapter_dim
-        print(f'LatentAdapter: 192 → {LATENT_DIM}D '
+        hidden_str = str(args.adapter_hidden_dim or args.adapter_dim)
+        print(f'LatentAdapter: 192 → [{hidden_str}]×{args.adapter_depth - 1} → {LATENT_DIM}D '
               f'({sum(p.numel() for p in latent_adapter.parameters()):,} params)')
 
     goal_rep = GoalRep(
@@ -613,4 +637,5 @@ if __name__ == '__main__':
         save_dir=save_dir,
         device=device,
         latent_adapter=latent_adapter,
+        encode_mode=cached_mode,
     )
