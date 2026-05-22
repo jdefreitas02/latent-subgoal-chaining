@@ -125,14 +125,12 @@ class _HIQLHighLevelWrapper:
 
 
 class _LewmGaussianActor(nn.Module):
-    """LeWM-hybrid HIQL actor matching train_hiql_lewm.py GaussianActor.
+    """LeWM-hybrid HIQL actor matching train_hiql_wgsp.py GaussianActor.
 
-    Layer order: Linear → LayerNorm → GELU (state-of-the-art baseline order).
-    Has learnable per-dim log_stds (const_std=True style) which the baseline
-    actor lacks.
+    Layer order: Linear → GELU → LayerNorm (matches GaussianActor in training).
 
-    Used for both HL (state=192, goal=192, output=rep_dim, no squash) and
-    LL (state=192, goal=rep_dim, output=25, tanh_squash=True).
+    Used for both HL (state=policy_dim, goal=policy_dim, output=rep_dim, no squash)
+    and LL (state=policy_dim, goal=rep_dim, output=5 or 25, tanh_squash=True).
     """
 
     LOG_STD_MIN = -5.0
@@ -147,7 +145,7 @@ class _LewmGaussianActor(nn.Module):
         in_dim = state_dim + goal_dim
         backbone = []
         for h in hidden_dims:
-            backbone += [nn.Linear(in_dim, h), nn.LayerNorm(h), nn.GELU()]
+            backbone += [nn.Linear(in_dim, h), nn.GELU(), nn.LayerNorm(h)]
             in_dim = h
         self.backbone  = nn.Sequential(*backbone)
         self.mean_head = nn.Linear(in_dim, output_dim)
@@ -175,16 +173,21 @@ class _LewmGaussianActor(nn.Module):
 
 
 class _ActionChunkDecoder(nn.Module):
-    """Frozen state-conditioned decoder D_θ(a_first, z) -> 25-D chunk.
+    """Frozen goal-conditioned decoder D_θ(a_first, z, z_goal) -> 25-D chunk.
 
     Inline copy of latent_hindsight_rl/train_action_decoder.py:ActionChunkDecoder
     so eval doesn't need to import the heavy training script.
+
+    goal_dim=0 recovers the original state-only decoder (backward compatible).
+    Auto-detected from checkpoint first-layer shape when loaded via
+    _load_action_chunk_decoder().
     """
 
     def __init__(self, in_dim=5, out_dim=25, latent_dim=192,
-                 hidden_dims=(256, 256)):
+                 hidden_dims=(256, 256), goal_dim=192):
         super().__init__()
-        in_d = in_dim + latent_dim
+        self.goal_dim = goal_dim
+        in_d = in_dim + latent_dim + goal_dim
         layers = []
         for h in hidden_dims:
             layers += [nn.Linear(in_d, h), nn.LayerNorm(h), nn.GELU()]
@@ -192,23 +195,36 @@ class _ActionChunkDecoder(nn.Module):
         layers.append(nn.Linear(in_d, out_dim))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, a_first, z):
-        return self.net(torch.cat([a_first, z], dim=-1))
+    def forward(self, a_first, z, z_goal=None):
+        parts = [a_first, z]
+        if self.goal_dim > 0:
+            if z_goal is None:
+                raise ValueError("_ActionChunkDecoder: goal_dim>0 but z_goal=None")
+            parts.append(z_goal)
+        return self.net(torch.cat(parts, dim=-1))
 
 
 class _WGSPHierarchicalPolicy:
     """HierarchicalPolicy variant for WGSP checkpoints.
 
-    Identical to HierarchicalPolicy except: when a frozen ActionChunkDecoder
-    is provided, the LL actor is expected to output 5-D and the decoder
-    inflates it to a 25-D chunk before reshape/inverse_transform — exactly
-    matching the training-time data flow in train_hiql_wgsp.py.
+    Two eval modes (selected at construction time):
 
-    If decoder=None, behaves identically to HierarchicalPolicy (LL outputs 25-D).
+    native_eval=True  (default, recommended)
+        Encode every env step, call LL every step, refresh HL every `gap` env
+        steps.  LL's 5-D output → inverse_transform → physical action.  The
+        decoder is NOT used at eval time: it is only needed during WGSP training
+        to expand 5-D LL outputs into 25-D WM action chunks.  This avoids the
+        decoder's play-data bias (val_mse ~0.23) degrading eval performance.
+
+    native_eval=False  (chunked, legacy)
+        LL is called once every 5 env steps.  Decoder inflates 5-D → 25-D
+        chunk, which is buffered and executed one action at a time.  Used for
+        ablations / backward compatibility only.
     """
 
     def __init__(self, jepa_model, actor, action_scaler, high_level, gap, device,
-                 decoder=None, subgoal_reached_threshold=0.0):
+                 decoder=None, subgoal_reached_threshold=0.0, latent_adapter=None,
+                 native_eval=True):
         self.jepa_model    = jepa_model
         self.actor         = actor
         self.action_scaler = action_scaler
@@ -217,18 +233,74 @@ class _WGSPHierarchicalPolicy:
         self.device        = device
         self.decoder       = decoder
         self.subgoal_reached_threshold = subgoal_reached_threshold
-        self._buf       = []
-        self._wm_steps  = 0
-        self._z_subgoal = None
+        self.latent_adapter = latent_adapter
+        self.native_eval   = native_eval
+        # Native-eval counters (env steps)
+        self._native_step      = 0
+        self._z_subgoal        = None
+        self._subgoal_switches = 0
+        # Chunked-eval state
+        self._buf      = []
+        self._wm_steps = 0
 
-    def get_action(self, obs_hwc, goal_hwc=None, goal_latent=None):
+    # ------------------------------------------------------------------
+    # Native eval path: encode every step, no decoder, no buffer
+    # ------------------------------------------------------------------
+    def _get_action_native(self, obs_hwc, goal_hwc, goal_latent):
+        z_raw = encode_and_project(self.jepa_model, obs_hwc, self.device)
+        if goal_latent is not None:
+            z_raw_goal = goal_latent.to(self.device)
+        else:
+            z_raw_goal = encode_and_project(self.jepa_model, goal_hwc, self.device)
+
+        with torch.no_grad():
+            if self.latent_adapter is not None:
+                z_curr       = self.latent_adapter(z_raw)
+                z_final_goal = self.latent_adapter(z_raw_goal)
+            else:
+                z_curr, z_final_goal = z_raw, z_raw_goal
+
+            switched = (self._z_subgoal is None or
+                        self._native_step >= self.gap)
+            if switched:
+                self._z_subgoal = self.high_level.predict(z_curr, z_final_goal)
+                self._native_step = 0
+                self._subgoal_switches += 1
+
+            _, _, ll_out = self.actor.sample(z_curr, self._z_subgoal)  # (1, 5)
+
+        self._native_step += 1
+        raw      = ll_out.cpu().numpy().reshape(1, 5)
+        physical = np.clip(self.action_scaler.inverse_transform(raw), -1.0, 1.0)[0]
+
+        same_dim = self._z_subgoal.shape[-1] == z_curr.shape[-1]
+        diag = {
+            'dist_to_goal':         torch.norm(z_raw - z_raw_goal, p=2, dim=-1).item(),
+            'dist_to_subgoal':      torch.norm(z_curr - self._z_subgoal, p=2, dim=-1).item() if same_dim else float('nan'),
+            'dist_subgoal_to_goal': torch.norm(self._z_subgoal - z_final_goal, p=2, dim=-1).item() if same_dim else float('nan'),
+            'subgoal_switches':     self._subgoal_switches,
+            'subgoal_switched':     switched,
+            'action_norm':          float(np.mean(np.abs(physical))),
+        }
+        return physical, diag
+
+    # ------------------------------------------------------------------
+    # Chunked eval path (legacy): decoder → 25-D buffer
+    # ------------------------------------------------------------------
+    def _get_action_chunked(self, obs_hwc, goal_hwc, goal_latent):
         diag = None
         if not self._buf:
-            z_curr = encode_and_project(self.jepa_model, obs_hwc, self.device)
+            z_raw = encode_and_project(self.jepa_model, obs_hwc, self.device)
             if goal_latent is not None:
-                z_final_goal = goal_latent.to(self.device)
+                z_raw_goal = goal_latent.to(self.device)
             else:
-                z_final_goal = encode_and_project(self.jepa_model, goal_hwc, self.device)
+                z_raw_goal = encode_and_project(self.jepa_model, goal_hwc, self.device)
+            if self.latent_adapter is not None:
+                with torch.no_grad():
+                    z_curr       = self.latent_adapter(z_raw)
+                    z_final_goal = self.latent_adapter(z_raw_goal)
+            else:
+                z_curr, z_final_goal = z_raw, z_raw_goal
             with torch.no_grad():
                 subgoal_reached = (
                     self._z_subgoal is not None and
@@ -242,11 +314,11 @@ class _WGSPHierarchicalPolicy:
                     z_subgoal_raw = self.high_level.predict(z_curr, z_final_goal)
                     self._z_subgoal = nn_clamp_subgoal(z_subgoal_raw)
                     self._wm_steps  = 0
-                    self._subgoal_switches = getattr(self, '_subgoal_switches', 0) + 1
+                    self._subgoal_switches += 1
                 _, _, ll_out = self.actor.sample(z_curr, self._z_subgoal)
-                # ll_out is (1,5) if decoder present, else (1,25)
                 if self.decoder is not None:
-                    chunk_25d = self.decoder(ll_out, z_curr)            # (1,25)
+                    goal_arg  = z_raw_goal if self.decoder.goal_dim > 0 else None
+                    chunk_25d = self.decoder(ll_out, z_raw, goal_arg)
                 else:
                     chunk_25d = ll_out
                 same_dim = self._z_subgoal.shape[-1] == z_curr.shape[-1]
@@ -254,7 +326,7 @@ class _WGSPHierarchicalPolicy:
                     'dist_to_goal':         torch.norm(z_curr - z_final_goal, p=2, dim=-1).item(),
                     'dist_to_subgoal':      torch.norm(z_curr - self._z_subgoal, p=2, dim=-1).item() if same_dim else float('nan'),
                     'dist_subgoal_to_goal': torch.norm(self._z_subgoal - z_final_goal, p=2, dim=-1).item() if same_dim else float('nan'),
-                    'subgoal_switches':     getattr(self, '_subgoal_switches', 0),
+                    'subgoal_switches':     self._subgoal_switches,
                     'subgoal_switched':     switched,
                 }
             self._wm_steps += 1
@@ -264,10 +336,16 @@ class _WGSPHierarchicalPolicy:
             self._buf = [physical[t] for t in range(5)]
         return self._buf.pop(0), diag
 
+    def get_action(self, obs_hwc, goal_hwc=None, goal_latent=None):
+        if self.native_eval:
+            return self._get_action_native(obs_hwc, goal_hwc, goal_latent)
+        return self._get_action_chunked(obs_hwc, goal_hwc, goal_latent)
+
     def reset(self):
-        self._buf = []
-        self._wm_steps = 0
-        self._z_subgoal = None
+        self._buf          = []
+        self._wm_steps     = 0
+        self._native_step  = 0
+        self._z_subgoal    = None
         self._subgoal_switches = 0
 
 
@@ -279,7 +357,8 @@ class _BaselineNativeHierarchicalPolicy:
     """
 
     def __init__(self, jepa_model, ll_actor, action_scaler, hl_actor_wrapped,
-                 gap, device, latent_adapter=None):
+                 gap, device, latent_adapter=None, adapter_in_dim=192,
+                 encode_mode='cls_projected'):
         self.jepa_model = jepa_model
         self.actor = ll_actor
         self.action_scaler = action_scaler
@@ -287,9 +366,31 @@ class _BaselineNativeHierarchicalPolicy:
         self.gap = gap
         self.device = device
         self.latent_adapter = latent_adapter
+        self.adapter_in_dim = adapter_in_dim
+        self.encode_mode = encode_mode
         self._step = 0
         self._z_subgoal = None
         self._subgoal_switches = 0
+
+    def _encode_obs_raw(self, obs_hwc):
+        """Encode obs → [1, adapter_in_dim] tensor, matching the training encode_mode."""
+        t = _IMG_TRANSFORM(obs_hwc).unsqueeze(0).unsqueeze(0)  # [1, 1, C, H, W]
+        pix = t.squeeze(0).to(self.device)                     # [1, C, H, W]
+        if self.encode_mode == 'cls_projected':
+            return encode_and_project(self.jepa_model, obs_hwc, self.device)
+        with torch.no_grad():
+            vit_out = self.jepa_model.encoder(pixel_values=pix, interpolate_pos_encoding=True)
+            tokens  = vit_out.last_hidden_state  # [1, 257, 192]
+        if self.encode_mode == 'cls_raw':
+            return tokens[:, 0, :]               # [1, 192]
+        if self.encode_mode == 'patch_mean':
+            return tokens[:, 1:, :].mean(dim=1)  # [1, 192]
+        if self.encode_mode == 'cls_patch_cat':
+            with torch.no_grad():
+                cls_proj = self.jepa_model.encode({"pixels": t.to(self.device)})["emb"][:, -1]
+            patch_mean = tokens[:, 1:, :].mean(dim=1)
+            return torch.cat([cls_proj, patch_mean], dim=-1)  # [1, 384]
+        raise ValueError(f"Unknown encode_mode: {self.encode_mode}")
 
     def _adapt(self, z):
         if self.latent_adapter is not None:
@@ -302,11 +403,11 @@ class _BaselineNativeHierarchicalPolicy:
         self._subgoal_switches = 0
 
     def get_action(self, obs_hwc, goal_hwc=None, goal_latent=None):
-        z_curr_raw = encode_and_project(self.jepa_model, obs_hwc, self.device)
+        z_curr_raw = self._encode_obs_raw(obs_hwc)
         if goal_latent is not None:
             z_goal_raw = goal_latent.to(self.device)
         else:
-            z_goal_raw = encode_and_project(self.jepa_model, goal_hwc, self.device)
+            z_goal_raw = self._encode_obs_raw(goal_hwc)
 
         with torch.no_grad():
             z_curr = self._adapt(z_curr_raw)
@@ -376,20 +477,137 @@ class _BaselineGaussianActor(nn.Module):
 
 
 class _LatentAdapter(nn.Module):
-    """Eval-side mirror of LatentAdapter in train_hiql_baseline.py."""
+    """Eval-side mirror of LatentAdapter in train_hiql_baseline.py.
 
-    def __init__(self, in_dim=192, out_dim=256, layer_norm=True):
+    Matches the training architecture exactly: configurable depth and hidden_dim.
+    Use _load_adapter() rather than constructing this directly — it infers the
+    architecture from the saved state dict so any trained variant loads correctly.
+    """
+
+    def __init__(self, in_dim=192, out_dim=256, hidden_dim=None,
+                 depth=2, layer_norm=True):
         super().__init__()
-        layers = [nn.Linear(in_dim, out_dim), nn.GELU()]
-        if layer_norm:
-            layers.append(nn.LayerNorm(out_dim))
-        layers += [nn.Linear(out_dim, out_dim), nn.GELU()]
-        if layer_norm:
-            layers.append(nn.LayerNorm(out_dim))
+        hidden_dim = hidden_dim or out_dim
+        dims = [in_dim] + [hidden_dim] * (depth - 1) + [out_dim]
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(nn.GELU())
+            if layer_norm:
+                layers.append(nn.LayerNorm(dims[i + 1]))
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.mlp(x)
+
+
+def _load_adapter(adapter_ckpt_path, device):
+    """Load a LatentAdapter from a saved .pth, inferring the architecture
+    from the weight shapes so any (in_dim, out_dim, hidden_dim, depth) works."""
+    sd = torch.load(adapter_ckpt_path, map_location='cpu')
+    # Extract only the Linear layer weights (2-D tensors, not LayerNorm 1-D)
+    linear_keys = [k for k, v in sd.items()
+                   if k.endswith('.weight') and v.ndim == 2]
+    depth      = len(linear_keys)
+    in_dim     = sd[linear_keys[0]].shape[1]
+    out_dim    = sd[linear_keys[-1]].shape[0]
+    hidden_dim = sd[linear_keys[0]].shape[0] if depth > 1 else out_dim
+    adapter = _LatentAdapter(in_dim=in_dim, out_dim=out_dim,
+                             hidden_dim=hidden_dim, depth=depth).to(device)
+    adapter.load_state_dict(sd)
+    adapter.eval()
+    for p in adapter.parameters():
+        p.requires_grad_(False)
+    return adapter, in_dim, out_dim
+
+
+_IMAGENET_MEAN_E = torch.tensor([0.485, 0.456, 0.406])
+_IMAGENET_STD_E  = torch.tensor([0.229, 0.224, 0.225])
+
+
+class _ImpalaSmallEval(nn.Module):
+    """Eval-side mirror of ImpalaSmall in train_hiql_endtoend.py."""
+
+    def __init__(self, out_dim=256):
+        super().__init__()
+        self.convs = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+        )
+        self.fc = nn.Linear(32 * 4 * 4, out_dim)
+        self.out_dim = out_dim
+
+    def forward(self, x):
+        return F.relu(self.fc(self.convs(x).flatten(1)))
+
+    def encode_obs(self, obs_hwc: np.ndarray, device) -> torch.Tensor:
+        """Encode a single HWC uint8 observation → [1, out_dim]."""
+        x = torch.from_numpy(obs_hwc).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        mean = _IMAGENET_MEAN_E.to(device).view(1, 3, 1, 1)
+        std  = _IMAGENET_STD_E.to(device).view(1, 3, 1, 1)
+        x = (x.to(device) - mean) / std
+        with torch.no_grad():
+            return self(x)
+
+
+class _EndToEndNativeHierarchicalPolicy:
+    """HIQL end-to-end policy: uses trainable CNN encoder (no JEPA required).
+
+    Encodes every env step with the ImpalaSmall CNN, queries HL every `gap`
+    env steps for a fresh phi, and outputs one 5D action per step.
+    Identical control flow to _BaselineNativeHierarchicalPolicy except
+    the encoder is ImpalaSmall instead of frozen JEPA.
+    """
+
+    def __init__(self, cnn_encoder, ll_actor, action_scaler, hl_actor_wrapped,
+                 gap, device):
+        self.encoder       = cnn_encoder
+        self.actor         = ll_actor
+        self.action_scaler = action_scaler
+        self.high_level    = hl_actor_wrapped
+        self.gap           = gap
+        self.device        = device
+        self._step         = 0
+        self._z_subgoal    = None
+        self._subgoal_switches = 0
+
+    def reset(self):
+        self._step = 0
+        self._z_subgoal = None
+        self._subgoal_switches = 0
+
+    def get_action(self, obs_hwc, goal_hwc=None, goal_latent=None):
+        z_curr = self.encoder.encode_obs(obs_hwc, self.device)
+        if goal_latent is not None:
+            z_goal = goal_latent.to(self.device)
+        else:
+            z_goal = self.encoder.encode_obs(goal_hwc, self.device)
+
+        with torch.no_grad():
+            switched = self._z_subgoal is None or self._step >= self.gap
+            if switched:
+                self._z_subgoal = self.high_level.predict(z_curr, z_goal)
+                self._step = 0
+                self._subgoal_switches += 1
+            _, _, mean = self.actor.sample(z_curr, self._z_subgoal)   # [1, 5]
+
+        self._step += 1
+        raw = mean.cpu().numpy().reshape(1, 5)
+        physical = np.clip(self.action_scaler.inverse_transform(raw), -1.0, 1.0)[0]
+        diag = {
+            'dist_to_goal':         torch.norm(z_curr - z_goal, p=2, dim=-1).item(),
+            'dist_to_subgoal':      float('nan'),
+            'dist_subgoal_to_goal': float('nan'),
+            'subgoal_switches':     self._subgoal_switches,
+            'subgoal_switched':     switched,
+            'action_norm':          float(np.mean(np.abs(physical))),
+        }
+        return physical, diag
 
 
 class _HIQLBaselineHighLevelWrapper:
@@ -990,18 +1208,21 @@ def main():
     ckpt_dir = Path(args.checkpoint_dir)
 
     # Detect HIQL checkpoint variant:
-    #   - Baseline  (train_hiql_baseline.py):  ll/hl + goal_rep.pth, dir contains 'baseline'
-    #   - LeWM v2   (train_hiql_lewm.py NEW):  ll/hl + goal_rep.pth, dir contains 'lewm'
-    #     (HER goal sampling + 10D learned goal_rep, matching ogbench HIQL)
-    #   - LeWM v1   (train_hiql_lewm.py OLD):  ll/hl only (192D native, no goal_rep)
-    # train_hiql_flow.py saves ll_onestep.pth (+ ll_bc_flow.pth) instead of ll_actor.pth
+    #   - End-to-end (train_hiql_endtoend.py): encoder.pth + ll/hl + goal_rep.pth
+    #   - Baseline   (train_hiql_baseline.py): ll/hl + goal_rep.pth, dir 'baseline'
+    #   - LeWM v2    (train_hiql_lewm.py NEW): ll/hl + goal_rep.pth, dir 'lewm'
+    #   - LeWM v1    (train_hiql_lewm.py OLD): ll/hl only (192D, no goal_rep)
+    # train_hiql_flow.py saves ll_onestep.pth instead of ll_actor.pth
     is_hiql_flow     = (ckpt_dir / 'll_onestep.pth').exists()
     is_hiql          = (ckpt_dir / 'll_actor.pth').exists() or is_hiql_flow
     has_goal_rep     = is_hiql and (ckpt_dir / 'goal_rep.pth').exists()
-    is_hiql_baseline = has_goal_rep and 'baseline' in str(ckpt_dir).lower()
-    is_hiql_wgsp     = (has_goal_rep and 'wgsp' in str(ckpt_dir).lower()
+    is_hiql_endtoend = has_goal_rep and (ckpt_dir / 'encoder.pth').exists()
+    is_hiql_baseline = (has_goal_rep and not is_hiql_endtoend
+                        and 'baseline' in str(ckpt_dir).lower())
+    is_hiql_wgsp     = (has_goal_rep and not is_hiql_endtoend
+                        and 'wgsp' in str(ckpt_dir).lower()
                         and not is_hiql_flow and not is_hiql_baseline)
-    is_hiql_lewm_v2  = (has_goal_rep and not is_hiql_baseline
+    is_hiql_lewm_v2  = (has_goal_rep and not is_hiql_endtoend and not is_hiql_baseline
                         and not is_hiql_wgsp and not is_hiql_flow)
     is_hiql_v1       = is_hiql and not has_goal_rep and not is_hiql_flow
 
@@ -1032,7 +1253,53 @@ def main():
         mode_tag = 'flat'
 
     # ── Load actor(s) & build policy ──────────────────────────────────────────
-    if is_hiql_baseline:
+    if is_hiql_endtoend:
+        # ── End-to-end HIQL checkpoint (train_hiql_endtoend.py) ───────────────
+        # encoder.pth: ImpalaSmall CNN (no JEPA needed).
+        # HL: input=enc_dim*2, output=rep_dim.  LL: input=enc_dim+rep_dim, output=5.
+        ll_ckpt  = ckpt_dir / 'll_actor.pth'
+        hl_ckpt  = ckpt_dir / 'hl_actor.pth'
+        enc_ckpt = ckpt_dir / 'encoder.pth'
+
+        # Infer encoder output dim from the fc weight shape.
+        enc_sd      = torch.load(enc_ckpt, map_location='cpu')
+        enc_out_dim = enc_sd['fc.weight'].shape[0]
+        print(f"Loading end-to-end actors "
+              f"(k={subgoal_steps}, rep_dim={rep_dim}, enc_dim={enc_out_dim}) ...")
+
+        cnn_encoder = _ImpalaSmallEval(out_dim=enc_out_dim).to(device)
+        cnn_encoder.load_state_dict(enc_sd)
+        cnn_encoder.eval()
+        for p in cnn_encoder.parameters():
+            p.requires_grad_(False)
+        print(f"  Loaded ImpalaSmall encoder: → {enc_out_dim}D")
+
+        ll_actor = _BaselineGaussianActor(
+            input_dim=enc_out_dim + rep_dim, output_dim=5,
+            hidden_dims=(512, 512, 512), tanh_squash=False,
+        ).to(device)
+        ll_actor.load_state_dict(torch.load(ll_ckpt, map_location=device))
+        ll_actor.eval()
+        for p in ll_actor.parameters():
+            p.requires_grad_(False)
+
+        hl_actor_net = _BaselineGaussianActor(
+            input_dim=enc_out_dim * 2, output_dim=rep_dim,
+            hidden_dims=(512, 512, 512), tanh_squash=False,
+        ).to(device)
+        hl_actor_net.load_state_dict(torch.load(hl_ckpt, map_location=device))
+        hl_actor_net.eval()
+        for p in hl_actor_net.parameters():
+            p.requires_grad_(False)
+
+        hl_model = _HIQLBaselineHighLevelWrapper(hl_actor_net)
+        policy = _EndToEndNativeHierarchicalPolicy(
+            cnn_encoder, ll_actor, action_scaler, hl_model,
+            gap=subgoal_steps, device=device)
+        print(f"  Policy: HIQL end-to-end (k={subgoal_steps}, rep_dim={rep_dim}, "
+              f"enc_dim={enc_out_dim})")
+
+    elif is_hiql_baseline:
         # ── Baseline HIQL checkpoint (train_hiql_baseline.py) ─────────────────
         # HL: input=latent_dim*2, output=rep_dim.  LL: input=latent_dim+rep_dim, output=5.
         # latent_dim=192 (no adapter) or adapter_out_dim (with adapter).
@@ -1042,20 +1309,23 @@ def main():
 
         # Auto-detect and load trainable latent adapter if present.
         latent_adapter = None
+        adapter_in_dim = 192
         adapter_out_dim = 192
         adapter_ckpt = ckpt_dir / 'adapter.pth'
         if adapter_ckpt.exists():
-            adapter_sd = torch.load(adapter_ckpt, map_location='cpu')
-            # Infer output dim from the last Linear weight in the adapter.
-            last_weight_key = [k for k in adapter_sd if k.endswith('.weight')][-1]
-            adapter_out_dim = adapter_sd[last_weight_key].shape[0]
-            latent_adapter = _LatentAdapter(
-                in_dim=192, out_dim=adapter_out_dim).to(device)
-            latent_adapter.load_state_dict(adapter_sd)
-            latent_adapter.eval()
-            for p in latent_adapter.parameters():
-                p.requires_grad_(False)
-            print(f"  Loaded latent adapter: 192 → {adapter_out_dim}D")
+            latent_adapter, adapter_in_dim, adapter_out_dim = _load_adapter(
+                adapter_ckpt, device)
+            print(f"  Loaded latent adapter: {adapter_in_dim}D → {adapter_out_dim}D")
+
+        # Load encode_mode from metadata.json (saved during training).
+        # Determines how the frozen encoder is queried at eval time.
+        import json as _json
+        baseline_encode_mode = 'cls_projected'
+        meta_path = ckpt_dir / 'metadata.json'
+        if meta_path.exists():
+            with open(meta_path) as _mf:
+                baseline_encode_mode = _json.load(_mf).get('encode_mode', 'cls_projected')
+        print(f"  Encode mode: {baseline_encode_mode}")
 
         print(f"Loading HIQL-baseline actors "
               f"(k={subgoal_steps}, rep_dim={rep_dim}, latent_dim={adapter_out_dim}) ...")
@@ -1083,7 +1353,8 @@ def main():
         hl_model = _HIQLBaselineHighLevelWrapper(hl_actor_net)
         policy = _BaselineNativeHierarchicalPolicy(
             jepa_model, ll_actor, action_scaler, hl_model,
-            gap=subgoal_steps, device=device, latent_adapter=latent_adapter)
+            gap=subgoal_steps, device=device, latent_adapter=latent_adapter,
+            adapter_in_dim=adapter_in_dim, encode_mode=baseline_encode_mode)
         print(f"  Policy: HIQL-baseline Native Hierarchical "
               f"(k={subgoal_steps}, rep_dim={rep_dim}, "
               f"adapter={'yes' if latent_adapter is not None else 'no'})")
@@ -1124,9 +1395,10 @@ def main():
 
     elif is_hiql_wgsp:
         # ── WGSP checkpoint (train_hiql_wgsp.py) ─────────────────────────────
-        # HL: state=192, goal=192, output=rep_dim, no squash       (same as v2)
-        # LL: state=192, goal=rep_dim, output=5 OR 25, tanh_squash=True
-        #     5 if action_decoder.pth is present in ckpt_dir, else 25.
+        # Adapter: 192 → policy_dim (default 256). Both HL and LL operate in
+        # policy space; WM rollouts / geometry use raw 192D (frozen).
+        # HL: state=policy_dim, goal=policy_dim, output=rep_dim, no squash
+        # LL: state=policy_dim, goal=rep_dim,    output=5 or 25, tanh_squash
         ll_ckpt   = ckpt_dir / 'll_actor.pth'
         hl_ckpt   = ckpt_dir / 'hl_actor.pth'
         dec_ckpt  = ckpt_dir / 'action_decoder.pth'
@@ -1134,22 +1406,42 @@ def main():
         if not dec_ckpt.exists() and getattr(args, 'decoder_ckpt', None):
             dec_ckpt = Path(args.decoder_ckpt)
         use_decoder = dec_ckpt.exists()
-        ll_out_dim  = 5 if use_decoder else 25
+
+        # Load adapter if present; determines policy_dim for actor construction.
+        adapter_ckpt = ckpt_dir / 'adapter.pth'
+        wgsp_adapter = None
+        policy_dim   = 192
+        if adapter_ckpt.exists():
+            wgsp_adapter, _, policy_dim = _load_adapter(adapter_ckpt, device)
+            print(f"  Loaded adapter: 192 → {policy_dim}")
+
+        # Infer rep_dim and ll_out_dim from LL actor weights — more reliable than
+        # heuristics based on checkpoint dir name or decoder file presence.
+        # LL weight shapes: first layer in=[policy_dim+rep_dim], mean_head out=[ll_out_dim]
+        _ll_sd = torch.load(ll_ckpt, map_location='cpu')
+        if rep_dim is None:
+            _ll_in = next(v for k, v in _ll_sd.items() if 'weight' in k and v.ndim == 2)
+            rep_dim = int(_ll_in.shape[1]) - policy_dim
+            print(f"  Auto-detected rep_dim={rep_dim} from LL actor weights")
+        ll_out_dim = int(_ll_sd['mean_head.weight'].shape[0])
+        print(f"  Auto-detected ll_out_dim={ll_out_dim} from LL actor weights")
+
         print(f"Loading WGSP actors (k={subgoal_steps}, rep_dim={rep_dim}, "
-              f"LL_out={ll_out_dim}, decoder={'yes' if use_decoder else 'no'}) ...")
+              f"policy_dim={policy_dim}, LL_out={ll_out_dim}, "
+              f"decoder={'yes' if use_decoder else 'no'}) ...")
 
         ll_actor = _LewmGaussianActor(
-            state_dim=192, goal_dim=rep_dim, output_dim=ll_out_dim,
+            state_dim=policy_dim, goal_dim=rep_dim, output_dim=ll_out_dim,
             hidden_dims=(512, 512, 512),
             tanh_squash=True, action_scale=3.0,
         ).to(device)
-        ll_actor.load_state_dict(torch.load(ll_ckpt, map_location=device))
+        ll_actor.load_state_dict({k: v.to(device) for k, v in _ll_sd.items()})
         ll_actor.eval()
         for p in ll_actor.parameters():
             p.requires_grad_(False)
 
         hl_actor_net = _LewmGaussianActor(
-            state_dim=192, goal_dim=192, output_dim=rep_dim,
+            state_dim=policy_dim, goal_dim=policy_dim, output_dim=rep_dim,
             hidden_dims=(512, 512, 512),
             tanh_squash=False,
         ).to(device)
@@ -1160,21 +1452,31 @@ def main():
 
         decoder = None
         if use_decoder:
+            # Auto-detect goal_dim from first-layer input width:
+            #   old (state-only): net.0.weight [256, 197]  → goal_dim = 0
+            #   new (goal-cond):  net.0.weight [256, 389]  → goal_dim = 192
+            sd = torch.load(dec_ckpt, map_location='cpu')
+            first_w = sd['net.0.weight']
+            inferred_goal_dim = max(0, first_w.shape[1] - 5 - 192)
             decoder = _ActionChunkDecoder(in_dim=5, out_dim=25, latent_dim=192,
-                                          hidden_dims=(256, 256)).to(device)
-            decoder.load_state_dict(torch.load(dec_ckpt, map_location=device))
+                                          hidden_dims=(256, 256),
+                                          goal_dim=inferred_goal_dim).to(device)
+            decoder.load_state_dict(sd)
             decoder.eval()
             for p in decoder.parameters():
                 p.requires_grad_(False)
-            print(f"  Loaded ActionChunkDecoder from {dec_ckpt}")
+            print(f"  Loaded ActionChunkDecoder from {dec_ckpt} "
+                  f"(goal_dim={inferred_goal_dim})")
 
         hl_model = _HIQLBaselineHighLevelWrapper(hl_actor_net)
         policy = _WGSPHierarchicalPolicy(
             jepa_model, ll_actor, action_scaler, hl_model,
             gap=subgoal_steps, device=device, decoder=decoder,
-            subgoal_reached_threshold=0.0,
+            subgoal_reached_threshold=0.0, latent_adapter=wgsp_adapter,
+            native_eval=True,
         )
-        print(f"  Policy: WGSP Hierarchical (k={subgoal_steps}, rep_dim={rep_dim})")
+        print(f"  Policy: WGSP Hierarchical native-eval (k={subgoal_steps}, rep_dim={rep_dim}, "
+              f"policy_dim={policy_dim})")
 
     elif is_hiql_lewm_v2:
         # ── LeWM-hybrid HIQL with HER + 10D goal_rep (train_hiql_lewm.py) ────
@@ -1257,8 +1559,16 @@ def main():
         actor_ckpt = ckpt_dir / 'actor_policy.pth'
         if not actor_ckpt.exists():
             raise FileNotFoundError(f"No actor checkpoint at {actor_ckpt}")
-        print(f"Loading SAC actor from {actor_ckpt} (latent_dim={latent_dim_rl}) ...")
-        actor = GoalConditionedActor(latent_dim=latent_dim_rl, action_dim=25).to(device)
+        # Read action_scale from training_config.json if present (env-trained use 1.0)
+        import json as _json
+        _tcfg = ckpt_dir / 'training_config.json'
+        _action_scale = 3.0
+        if _tcfg.exists():
+            with open(_tcfg) as _tf:
+                _action_scale = _json.load(_tf).get('action_scale', 3.0)
+            print(f"  training_config.json: action_scale={_action_scale}")
+        print(f"Loading SAC actor from {actor_ckpt} (latent_dim={latent_dim_rl}, action_scale={_action_scale}) ...")
+        actor = GoalConditionedActor(latent_dim=latent_dim_rl, action_dim=25, action_scale=_action_scale).to(device)
         actor.load_state_dict(torch.load(actor_ckpt, map_location=device))
         actor.eval()
         for p in actor.parameters():
