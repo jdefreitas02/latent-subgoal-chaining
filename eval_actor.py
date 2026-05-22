@@ -168,8 +168,17 @@ class LatentActorPolicy(swm.policy.BasePolicy):
             self.jepa_model.requires_grad_(False)
             self.jepa_model.interpolate_pos_encoding = True
 
+        # Load action_scale from training_config.json if present (env-trained checkpoints use 1.0)
+        import json as _json
+        _config_path = os.path.join(os.path.dirname(actor_ckpt_path), "training_config.json")
+        action_scale = 3.0
+        if os.path.exists(_config_path):
+            with open(_config_path) as _f:
+                action_scale = _json.load(_f).get("action_scale", 3.0)
+            print(f"  training_config.json found: action_scale={action_scale}")
+
         print(f"Loading Trained Actor from: {actor_ckpt_path}")
-        self.actor = GoalConditionedActor(latent_dim=192, action_dim=25).to(device)
+        self.actor = GoalConditionedActor(latent_dim=192, action_dim=25, action_scale=action_scale).to(device)
         self.actor.load_state_dict(torch.load(actor_ckpt_path, map_location=device))
         self.actor.eval()
 
@@ -281,8 +290,16 @@ class HierarchicalLatentActorPolicy(swm.policy.BasePolicy):
             self.jepa_model.requires_grad_(False)
             self.jepa_model.interpolate_pos_encoding = True
 
+        import json as _json
+        _config_path = os.path.join(os.path.dirname(actor_ckpt_path), "training_config.json")
+        action_scale = 3.0
+        if os.path.exists(_config_path):
+            with open(_config_path) as _f:
+                action_scale = _json.load(_f).get("action_scale", 3.0)
+            print(f"  training_config.json found: action_scale={action_scale}")
+
         print(f"Loading Trained Actor from: {actor_ckpt_path}")
-        self.actor = GoalConditionedActor(latent_dim=192, action_dim=25).to(device)
+        self.actor = GoalConditionedActor(latent_dim=192, action_dim=25, action_scale=action_scale).to(device)
         self.actor.load_state_dict(torch.load(actor_ckpt_path, map_location=device))
         self.actor.eval()
 
