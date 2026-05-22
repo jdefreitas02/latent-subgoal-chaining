@@ -30,11 +30,11 @@ def _add_paths():
     here = os.path.dirname(os.path.abspath(__file__))
     if here not in sys.path:
         sys.path.insert(0, here)
-    # Append leworldmodel/ at the END so stable_pretraining/jepa.py resolve
-    # without shadowing this package.
-    leworldmodel = os.path.abspath(os.path.join(here, "..", ".."))
-    if leworldmodel not in sys.path:
-        sys.path.append(leworldmodel)
+    # Append repo root at the END so jepa.py/module.py resolve
+    # without shadowing this package's utils/ subpackage.
+    repo_root = os.path.abspath(os.path.join(here, ".."))
+    if repo_root not in sys.path:
+        sys.path.append(repo_root)
 
 
 def check_alignment(latent_cache_path, hdf5_dataset_path):

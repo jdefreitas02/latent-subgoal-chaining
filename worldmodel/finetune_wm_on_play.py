@@ -28,6 +28,9 @@ import os
 import sys
 import time
 from pathlib import Path
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 # Make jepa.py / module.py importable from the leworldmodel root
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))

@@ -7,7 +7,7 @@ import sys
 # jepa.py lives in the parent directory. torch.load() unpickles the checkpoint
 # and needs to resolve the 'jepa' module class, so the parent must be on sys.path
 # before any model is loaded.
-_parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_parent_dir = os.path.abspath(os.path.dirname(__file__))
 if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 

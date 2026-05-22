@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torchvision.transforms.v2 as tv_transforms
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ROOT = os.path.abspath(os.path.dirname(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
@@ -52,7 +52,52 @@ def get_transform():
     ])
 
 
-def build_cache(model, dataset, device, save_path, batch_size=8):
+ENCODE_MODES = ('cls_projected', 'cls_raw', 'patch_mean', 'cls_patch_cat')
+"""
+Encoding modes for the latent cache:
+  cls_projected  — projector(CLS token). Current default. SIGReg-shaped space.
+  cls_raw        — raw CLS token before the projector MLP. Tests if projector is lossy.
+  patch_mean     — mean of all 256 spatial patch tokens. Tests if spatial detail
+                   is lost during CLS attention pooling.
+  cls_patch_cat  — concat(cls_projected, patch_mean) → 384D. Best-of-both baseline.
+"""
+
+
+def _encode_frames(model, pix_TCHW, encode_mode, transform, device):
+    """Encode [T, C, H, W] uint8 frames according to encode_mode.
+
+    Returns [T, D] float32 tensor where D depends on mode:
+      cls_projected / cls_raw / patch_mean → 192D
+      cls_patch_cat                        → 384D
+    """
+    pix = transform(pix_TCHW.to(device))   # [T, C, H, W] float, normalised
+
+    if encode_mode == 'cls_projected':
+        z = model.encode({"pixels": pix.unsqueeze(0)})["emb"].squeeze(0)  # [T, 192]
+        return z
+
+    # For raw variants, bypass model.encode() and call the HuggingFace ViT directly.
+    # model.encode() flattens [B, T, ...] → [B*T, ...]; we do the same (B=1 here).
+    vit_out = model.encoder(pixel_values=pix, interpolate_pos_encoding=True)
+    tokens = vit_out.last_hidden_state   # [T, 1+256, 192]
+
+    if encode_mode == 'cls_raw':
+        return tokens[:, 0, :]           # [T, 192]  CLS before projector
+
+    if encode_mode == 'patch_mean':
+        return tokens[:, 1:, :].mean(dim=1)  # [T, 192]  spatial average
+
+    if encode_mode == 'cls_patch_cat':
+        cls_proj = model.encode({"pixels": pix.unsqueeze(0)})["emb"].squeeze(0)  # [T, 192]
+        patch_mean = tokens[:, 1:, :].mean(dim=1)                                 # [T, 192]
+        return torch.cat([cls_proj, patch_mean], dim=-1)                          # [T, 384]
+
+    raise ValueError(f"Unknown encode_mode '{encode_mode}'. "
+                     f"Choose from: {ENCODE_MODES}")
+
+
+def build_cache(model, dataset, device, save_path, batch_size=8,
+                encode_mode='cls_projected'):
     transform = get_transform()
     num_eps = len(dataset.lengths)
     all_latents = []
@@ -60,7 +105,7 @@ def build_cache(model, dataset, device, save_path, batch_size=8):
     total_frames = 0
     t0 = time.time()
 
-    print(f"\n  Encoding {num_eps} episodes …")
+    print(f"\n  Encoding {num_eps} episodes  [mode={encode_mode}] …")
     with torch.no_grad():
         for i in range(0, num_eps, batch_size):
             end_idx = min(i + batch_size, num_eps)
@@ -70,9 +115,8 @@ def build_cache(model, dataset, device, save_path, batch_size=8):
             chunks = dataset.load_chunk(ep_idx, starts, ep_lens)
 
             for chunk in chunks:
-                raw = chunk["pixels"].to(device)
-                pix = transform(raw)
-                z = model.encode({"pixels": pix.unsqueeze(0)})["emb"].squeeze(0)
+                raw = chunk["pixels"]
+                z = _encode_frames(model, raw, encode_mode, transform, device)
                 all_latents.append(z.cpu())
                 if "action" in chunk:
                     all_actions.append(chunk["action"].cpu().float())
@@ -87,9 +131,13 @@ def build_cache(model, dataset, device, save_path, batch_size=8):
         "all_latents": all_latents,
         "all_actions": all_actions,
         "total_frames": total_frames,
+        "encode_mode": encode_mode,
+        "latent_dim": all_latents[0].shape[-1] if all_latents else None,
     }
     torch.save(cache, save_path)
-    print(f"  Saved cache → {save_path}  ({total_frames:,} frames)")
+    print(f"  Saved cache → {save_path}  "
+          f"({total_frames:,} frames, mode={encode_mode}, "
+          f"dim={cache['latent_dim']})")
     return cache
 
 
@@ -342,7 +390,15 @@ def main():
     parser.add_argument("--dataset", default=None,
                         help="HDF5 dataset path (no .h5 extension)")
     parser.add_argument("--cache_path", default=None,
-                        help="Path to save/load latent cache")
+                        help="Path to save/load latent cache. "
+                             "Defaults to lewm_224_latents_{encode_mode}.pt.")
+    parser.add_argument("--encode_mode", default="cls_projected",
+                        choices=ENCODE_MODES,
+                        help="How to aggregate ViT tokens into a latent vector:\n"
+                             "  cls_projected  — projector(CLS) [default, current cache]\n"
+                             "  cls_raw        — CLS before projector (lossy-projector test)\n"
+                             "  patch_mean     — mean of 256 spatial patches (spatial-loss test)\n"
+                             "  cls_patch_cat  — concat(cls_projected, patch_mean) → 384D")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -350,16 +406,22 @@ def main():
     stablewm_home = os.environ.get(
         "STABLEWM_HOME", os.path.join(os.path.expanduser("~"), "stable_wm_data"))
 
-    data_path = args.dataset or os.path.join(stablewm_home, "cube", "cube_single_expert")
-    cache_path = args.cache_path or os.path.join(stablewm_home, "lewm_224_latents_cache.pt")
+    data_path = args.dataset or os.path.join(
+        stablewm_home, "ogbench", "visual-cube-single-play-v0_224")
+    # Default cache name encodes the mode so different modes don't overwrite each other.
+    default_cache = os.path.join(
+        stablewm_home, "ogbench",
+        f"lewm_224_latents_{args.encode_mode}.pt")
+    cache_path = args.cache_path or default_cache
 
     print("=" * 60)
     print("  224x224 LeWM Analysis")
     print("=" * 60)
-    print(f"  Device    : {device}")
-    print(f"  Weights   : {args.weights}")
-    print(f"  Dataset   : {data_path}.h5")
-    print(f"  Cache     : {cache_path}")
+    print(f"  Device      : {device}")
+    print(f"  Weights     : {args.weights}")
+    print(f"  Dataset     : {data_path}.h5")
+    print(f"  Cache       : {cache_path}")
+    print(f"  Encode mode : {args.encode_mode}")
 
     print("\n[1/4] Loading model …")
     model = load_model(args.weights, device)
@@ -378,10 +440,15 @@ def main():
         print(f"  Cache exists at {cache_path}, loading …")
         cache = torch.load(cache_path, map_location="cpu")
         all_latents = cache["all_latents"]
+        cached_mode = cache.get("encode_mode", "cls_projected")
         print(f"  Loaded {len(all_latents)} episodes, "
-              f"{cache['total_frames']:,} frames")
+              f"{cache['total_frames']:,} frames  [mode={cached_mode}]")
+        if cached_mode != args.encode_mode:
+            print(f"  WARNING: cached mode '{cached_mode}' != requested "
+                  f"'{args.encode_mode}'. Delete the cache to rebuild.")
     else:
-        cache = build_cache(model, dataset, device, cache_path)
+        cache = build_cache(model, dataset, device, cache_path,
+                            encode_mode=args.encode_mode)
         all_latents = cache["all_latents"]
 
     print("\n[4/4] Running analysis …")

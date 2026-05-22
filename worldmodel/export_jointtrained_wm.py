@@ -23,9 +23,12 @@ import sys
 import numpy as np
 import torch
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "latent_hindsight_rl", "offline-online"))
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_OTO = os.path.join(_ROOT, "offline_to_online")
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+if _OTO not in sys.path:
+    sys.path.insert(0, _OTO)
 
 from envs.jepa_loader import load_jepa
 from wm_jax import jax_params_to_torch_state_dict

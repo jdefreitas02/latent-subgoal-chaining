@@ -917,7 +917,7 @@ if __name__ == '__main__':
         f'_sr{args.syn_ratio}_wf{args.warmup_fraction}'
         f'_rep{args.rep_dim}_fs{args.flow_steps}')
 
-    parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    parent_dir = os.path.abspath(os.path.dirname(__file__))
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
 

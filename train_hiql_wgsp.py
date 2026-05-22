@@ -1513,7 +1513,7 @@ if __name__ == '__main__':
         f'_dis{int(args.use_distil)}_rep{args.rep_dim}'
         f'{_heads_tag}{_mopo_tag}{_llmode_tag}{_llupd_tag}{_adapter_tag}_s{args.seed}')
 
-    parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    parent_dir = os.path.abspath(os.path.dirname(__file__))
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
 

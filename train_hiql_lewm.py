@@ -904,7 +904,7 @@ if __name__ == '__main__':
         f'./checkpoints_hiql_lewm_k{args.subgoal_steps}'
         f'_sr{args.syn_ratio}_wf{args.warmup_fraction}_rep{args.rep_dim}')
 
-    parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    parent_dir = os.path.abspath(os.path.dirname(__file__))
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
 

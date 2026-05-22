@@ -35,7 +35,7 @@ import numpy as np
 import torch
 from sklearn import preprocessing as sk_pre
 
-_parent = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+_parent = os.path.abspath(os.path.dirname(__file__))
 if _parent not in sys.path:
     sys.path.insert(0, _parent)
 

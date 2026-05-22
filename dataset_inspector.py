@@ -91,7 +91,7 @@ def inspect_dataset():
 
 if __name__ == "__main__":
     # Ensure the parent directory is in the path if needed for swm imports
-    parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    parent_dir = os.path.abspath(os.path.dirname(__file__))
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
         

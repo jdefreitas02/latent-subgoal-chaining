@@ -245,7 +245,7 @@ if __name__ == '__main__':
     data_path  = (args.dataset_path or
                   os.path.join(STABLEWM_HOME, 'ogbench', 'cube_single_expert'))
 
-    parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    parent_dir = os.path.abspath(os.path.dirname(__file__))
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
 

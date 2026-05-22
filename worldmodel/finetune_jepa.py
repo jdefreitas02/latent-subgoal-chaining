@@ -20,6 +20,9 @@ import argparse
 import os
 import sys
 from pathlib import Path
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 import h5py
 import hdf5plugin  # noqa: F401  -- registers Blosc plugin for compressed HDF5

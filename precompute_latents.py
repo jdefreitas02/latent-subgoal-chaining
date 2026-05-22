@@ -14,7 +14,7 @@ def precompute():
     stablewm_home = os.environ.get("STABLEWM_HOME", os.path.join(os.path.expanduser("~"), "stable_wm_data"))
     data_path = os.path.join(stablewm_home, "ogbench", "cube_single_expert")
     
-    parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    parent_dir = os.path.abspath(os.path.dirname(__file__))
     if parent_dir not in sys.path: sys.path.insert(0, parent_dir)
         
     with initialize(version_base=None, config_path="../config"): 

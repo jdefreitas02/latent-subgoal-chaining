@@ -3,3 +3,5 @@ __pycache__/
 eval_results*/
 outputs/
 *.o*
+tdmpc2
+*.sh

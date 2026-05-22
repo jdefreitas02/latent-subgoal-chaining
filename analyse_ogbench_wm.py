@@ -13,7 +13,7 @@ import torch
 import torchvision.transforms.v2 as tv_transforms
 
 # ── project root on path ──────────────────────────────────────────────────────
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ROOT = os.path.abspath(os.path.dirname(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
