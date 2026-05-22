@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import v2 as transforms
 from tqdm import tqdm
 
-sys.path.append('/home/jrd21/leworldmodel')
+sys.path.append(_ROOT)
 
 from module import SIGReg
 

@@ -20,7 +20,7 @@ import os
 import sys
 import numpy as np
 
-sys.path.insert(0, '/home/jrd21/leworldmodel/latent_hindsight_rl/offline-online')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import jax
 import jax.numpy as jnp

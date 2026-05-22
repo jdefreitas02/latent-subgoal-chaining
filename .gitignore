@@ -5,3 +5,4 @@ outputs/
 *.o*
 tdmpc2
 *.sh
+.venv

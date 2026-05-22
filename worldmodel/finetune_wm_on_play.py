@@ -32,10 +32,9 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-# Make jepa.py / module.py importable from the leworldmodel root
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "latent_hindsight_rl", "offline-online"))
+_OTO = os.path.join(_ROOT, "offline_to_online")
+if _OTO not in sys.path:
+    sys.path.insert(0, _OTO)
 
 import h5py
 import numpy as np
