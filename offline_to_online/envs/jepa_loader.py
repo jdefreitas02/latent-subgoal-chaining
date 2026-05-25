@@ -48,6 +48,53 @@ def _build_jepa_from_arch(img_size, patch_size):
                 action_encoder=action_encoder, projector=projector, pred_proj=pred_proj)
 
 
+def _fix_vit_config_compat(model):
+    """Patch models pickled with a newer transformers that changed internal
+    attribute naming or removed submodules.
+
+    Two known issues:
+    1. ViTConfig: attributes like output_attentions stored as _output_attentions
+       with empty attribute_map → accessing config.output_attentions raises
+       AttributeError.  Fix: add attribute_map entries for each _-prefixed key.
+    2. ViTSelfAttention: newer transformers replaced self.dropout (nn.Dropout
+       module) with self.dropout_prob (float) + F.dropout.  When the checkpoint
+       was saved with the newer version and loaded into 4.44.x that still calls
+       self.dropout(...), the module is missing.  Fix: add nn.Dropout back.
+    """
+    import torch.nn as _nn
+    try:
+        from transformers.models.vit.modeling_vit import ViTSelfAttention as _VSA
+    except ImportError:
+        _VSA = None
+
+    for module in model.modules():
+        # --- Fix 1: ViTConfig _-prefixed attributes ---
+        cfg = getattr(module, "config", None)
+        if cfg is not None:
+            try:
+                d = object.__getattribute__(cfg, "__dict__")
+            except Exception:
+                d = {}
+            for raw_key in list(d.keys()):
+                if not raw_key.startswith("_"):
+                    continue
+                public_key = raw_key[1:]
+                if public_key in d:
+                    continue
+                amap = getattr(cfg, "attribute_map", {})
+                if public_key not in amap:
+                    amap[public_key] = raw_key
+                    try:
+                        cfg.attribute_map = amap
+                    except Exception:
+                        pass
+
+        # --- Fix 2: ViTSelfAttention missing dropout module ---
+        if _VSA is not None and isinstance(module, _VSA):
+            if "dropout" not in module._modules and hasattr(module, "dropout_prob"):
+                module.dropout = _nn.Dropout(module.dropout_prob)
+
+
 def _load_from_state_dict(state_dict_path, device, img_size, patch_size):
     model = _build_jepa_from_arch(img_size=img_size, patch_size=patch_size)
     ckpt = torch.load(state_dict_path, map_location="cpu", weights_only=False)
@@ -60,6 +107,7 @@ def _load_from_state_dict(state_dict_path, device, img_size, patch_size):
     model = model.to(device).eval()
     for p in model.parameters():
         p.requires_grad_(False)
+    _fix_vit_config_compat(model)
     return model
 
 
@@ -81,20 +129,55 @@ def load_jepa(ckpt_path, device="cuda", img_size=224, patch_size=14):
 
     # Prefer state-dict alongside if it exists -- robust against
     # __main__.<Class> pickle entries in object.ckpt files.
+    # Fall through to AutoCostModel if the state dict keys don't match the
+    # current architecture (e.g., after a stable_pretraining version bump).
     sd_candidate = str(ckpt_path) + "_state_dict.pt"
-    if os.path.exists(sd_candidate):
-        return _load_from_state_dict(sd_candidate, device, img_size, patch_size)
-    if str(ckpt_path).endswith(".pt") and os.path.exists(ckpt_path):
-        return _load_from_state_dict(ckpt_path, device, img_size, patch_size)
+    for sd_path in [sd_candidate if os.path.exists(sd_candidate) else None,
+                    ckpt_path if str(ckpt_path).endswith(".pt") and os.path.exists(ckpt_path) else None]:
+        if sd_path is None:
+            continue
+        try:
+            return _load_from_state_dict(sd_path, device, img_size, patch_size)
+        except (RuntimeError, KeyError, ImportError) as e:
+            print(f"[load_jepa] _load_from_state_dict({sd_path}) failed ({type(e).__name__}: "
+                  f"{str(e)[:120]}); falling through to AutoCostModel.", flush=True)
 
     if img_size == 224:
+        # Inject backwards-compat stubs before torch.load unpickles them.
+        # 1. ViTEncoder was removed in transformers 5.x; needed for lejepa_object.ckpt.
+        import torch.nn as _nn
+        import transformers.models.vit.modeling_vit as _vit_mod
+        if not hasattr(_vit_mod, "ViTEncoder"):
+            class _ViTEncoderCompat(_nn.Module):
+                pass
+            _vit_mod.ViTEncoder = _ViTEncoderCompat
+
+        # 2. CostShim was defined in __main__ of finetune_wm_on_play.py; needed
+        #    for lejepa_play_ft_full_object.ckpt. Import the real class so pickle
+        #    can resolve it without rerunning __main__.
+        import __main__ as _main
+        if not hasattr(_main, "CostShim"):
+            # finetune_wm_on_play.py does `from envs.jepa_loader import ...`
+            # so offline_to_online/ must be in sys.path when we import it.
+            _o2o_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            if _o2o_dir not in sys.path:
+                sys.path.append(_o2o_dir)
+            try:
+                from finetune_wm_on_play import CostShim as _CostShim
+                _main.CostShim = _CostShim
+            except (ImportError, Exception):
+                pass  # falls through; torch.load will raise if it's truly needed
+
         model = swm.policy.AutoCostModel(ckpt_path)
         model = model.to(device).eval()
         for p in model.parameters():
             p.requires_grad_(False)
+        _fix_vit_config_compat(model)
         return model
 
-    return _load_from_state_dict(ckpt_path, device, img_size, patch_size)
+    model = _load_from_state_dict(ckpt_path, device, img_size, patch_size)
+    _fix_vit_config_compat(model)
+    return model
 
 
 def make_img_transform():
