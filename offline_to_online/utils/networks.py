@@ -194,14 +194,15 @@ class Value(nn.Module):
 
         self.value_net = value_net
 
-    def __call__(self, observations, actions=None):
+    def __call__(self, observations, actions=None, is_encoded=False):
         """Return values or critic values.
 
         Args:
             observations: Observations.
             actions: Actions (optional).
+            is_encoded: If True, skip the encoder (observations are already encoded).
         """
-        if self.encoder is not None:
+        if not is_encoded and self.encoder is not None:
             inputs = [self.encoder(observations)]
         else:
             inputs = [observations]

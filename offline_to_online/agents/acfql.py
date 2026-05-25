@@ -1,4 +1,5 @@
 import copy
+import functools
 from typing import Any
 
 import flax
@@ -370,38 +371,83 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         elif self.config["actor_type"] == "best-of-n":
             action_dim = self.config['action_dim'] * \
                         (self.config['horizon_length'] if self.config["action_chunking"] else 1)
-            noises = jax.random.normal(
-                rng,
-                (
-                    *observations.shape[: -len(self.config['ob_dims'])],  # batch_size
-                    self.config["actor_num_samples"], action_dim
-                ),
-            )
-            observations = jnp.repeat(observations[..., None, :], self.config["actor_num_samples"], axis=-2)
-            actions = self.compute_flow_actions(observations, noises)
-            actions = jnp.clip(actions, -1, 1)
-            if self.config["q_agg"] == "mean":
-                q = self.network.select("critic")(observations, actions).mean(axis=0)
-            else:
-                q = self.network.select("critic")(observations, actions).min(axis=0)
-            indices = jnp.argmax(q, axis=-1)
+            N = self.config["actor_num_samples"]
 
+            # Image encoder: ob_dims has more than 2 elements (batch + H + W + C).
+            # For 1-D latent obs ob_dims is (batch, latent_dim), len == 2.
+            image_encoder = (self.config['encoder'] is not None and
+                             len(self.config['ob_dims']) > 2)
+
+            if image_encoder:
+                # Pre-encode images → 1-D latents for the ACTOR only (avoids N CNN passes).
+                # The CRITIC must use its own encoder; we call it via a reshape trick below
+                # so no parameter-sharing conflicts arise from registering the encoder twice.
+                actor_obs = self.network.select('actor_bc_flow_encoder')(observations)
+                # actor_obs: (*batch, D)  e.g. (512,) for eval, (B, 512) for training
+                batch_prefix = actor_obs.shape[:-1]        # () for eval, (B,) for training
+                actor_obs_expanded = jnp.repeat(actor_obs[..., None, :], N, axis=-2)
+                # actor_obs_expanded: (*batch, N, D)
+                noises = jax.random.normal(rng, (*batch_prefix, N, action_dim))
+                actions = self.compute_flow_actions(actor_obs_expanded, noises, pre_encoded=True)
+                actions = jnp.clip(actions, -1, 1)  # (*batch, N, action_dim)
+
+                # Critic scoring: tile raw images so the critic's own CNN encoder is run
+                # independently per (image, action) pair.  Works for both eval (no batch
+                # dim) and training (batch dim present).
+                n_batch_dims = len(batch_prefix)
+                ob_inner = observations.shape[n_batch_dims:]   # (H, W, C)
+                # Insert N-axis right after batch dims: (*batch, 1, H, W, C) → (*batch, N, H, W, C)
+                obs_with_n = jnp.expand_dims(observations, n_batch_dims)
+                obs_tiled = jnp.broadcast_to(obs_with_n, batch_prefix + (N,) + ob_inner)
+                flat_obs = obs_tiled.reshape((-1,) + ob_inner)              # (prod(batch)*N, H, W, C)
+                flat_actions = actions.reshape(-1, action_dim)
+                q_flat = self.network.select("critic")(flat_obs, flat_actions)
+                # q_flat: (num_qs, prod(batch)*N)
+                q = q_flat.reshape((self.config['num_qs'],) + batch_prefix + (N,))
+                # q: (num_qs, *batch, N)
+                if self.config["q_agg"] == "mean":
+                    q = q.mean(axis=0)   # (*batch, N)
+                else:
+                    q = q.min(axis=0)
+            else:
+                # 1-D latent obs: repeat raw latent for both actor and critic.
+                # MLP encoders inside both networks handle arbitrary batch shapes.
+                noises = jax.random.normal(
+                    rng, (*observations.shape[:-1], N, action_dim)
+                )
+                obs_expanded = jnp.repeat(observations[..., None, :], N, axis=-2)  # (B, N, D)
+                actions = self.compute_flow_actions(obs_expanded, noises, pre_encoded=False)
+                actions = jnp.clip(actions, -1, 1)  # (B, N, action_dim)
+                if self.config["q_agg"] == "mean":
+                    q = self.network.select("critic")(obs_expanded, actions).mean(axis=0)
+                else:
+                    q = self.network.select("critic")(obs_expanded, actions).min(axis=0)
+
+            indices = jnp.argmax(q, axis=-1)
             bshape = indices.shape
             indices = indices.reshape(-1)
             bsize = len(indices)
-            actions = jnp.reshape(actions, (-1, self.config["actor_num_samples"], action_dim))[jnp.arange(bsize), indices, :].reshape(
-                bshape + (action_dim,))
+            actions = jnp.reshape(actions, (-1, N, action_dim))[
+                jnp.arange(bsize), indices, :
+            ].reshape(bshape + (action_dim,))
 
         return actions
 
-    @jax.jit
+    @functools.partial(jax.jit, static_argnames=('pre_encoded',))
     def compute_flow_actions(
         self,
         observations,
         noises,
+        pre_encoded=False,
     ):
-        """Compute actions from the BC flow model using the Euler method."""
-        if self.config['encoder'] is not None:
+        """Compute actions from the BC flow model using the Euler method.
+
+        Args:
+            pre_encoded: If True, observations are already encoded (skip encoder).
+                         Used when best-of-n pre-encodes image observations so the
+                         repeat operates on 1D latents rather than raw images.
+        """
+        if not pre_encoded and self.config['encoder'] is not None:
             observations = self.network.select('actor_bc_flow_encoder')(observations)
         actions = noises
         # Euler method.
@@ -491,6 +537,11 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         )
         if encoders.get('actor_bc_flow') is not None:
             # Add actor_bc_flow_encoder to ModuleDict to make it separately callable.
+            # NOTE: do NOT register critic's encoder here — using the same Python object
+            # in two scopes causes Flax to share params, which empties out the encoder
+            # params inside the target_critic scope.  The critic encoder is instead
+            # invoked through the Value module directly via the reshape trick in
+            # sample_actions (best-of-n / image encoder path).
             network_info['actor_bc_flow_encoder'] = (encoders.get('actor_bc_flow'), (ex_observations,))
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}

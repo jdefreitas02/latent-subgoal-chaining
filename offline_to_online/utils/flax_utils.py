@@ -227,6 +227,26 @@ def restore_agent_with_file(agent, file_path):
         for k in missing_none_keys:
             agent_state[k] = None
 
+    # Back-compat: critic_encoder was added as a separately-callable module
+    # after some checkpoints were already saved.  If the target network expects
+    # modules_critic_encoder but the checkpoint doesn't have it, bootstrap the
+    # params from modules_actor_bc_flow_encoder (same architecture, same shape).
+    # For 1-D latent encoders the critic_encoder path is never executed at eval
+    # time (image_encoder=False), so the weights don't matter.  For image
+    # encoders this gives a warm-start; new B1-BoN checkpoints will have the
+    # key and won't hit this branch.
+    ckpt_params = (agent_state.get('network') or {}).get('params') or {}
+    tgt_params  = (target_sd.get('network')   or {}).get('params') or {}
+    if ('modules_critic_encoder' in tgt_params and
+            'modules_critic_encoder' not in ckpt_params and
+            'modules_actor_bc_flow_encoder' in ckpt_params):
+        print('  [restore] critic_encoder missing from ckpt — '
+              'bootstrapping from actor_bc_flow_encoder params')
+        agent_state = {**agent_state}
+        agent_state['network'] = {**agent_state['network']}
+        agent_state['network']['params'] = {**ckpt_params,
+            'modules_critic_encoder': ckpt_params['modules_actor_bc_flow_encoder']}
+
     agent = flax.serialization.from_state_dict(agent, agent_state)
 
     print(f'Restored from {file_path}')
