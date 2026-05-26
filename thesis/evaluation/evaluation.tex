@@ -1,0 +1,399 @@
+
+\chapter{Experiments}
+\label{chap:experiments}
+
+This chapter evaluates the methods of Chapter~\ref{chap:methodology}
+on \textsc{OGBench} cube-single-play. We first describe the
+experimental setup (\S\ref{sec:exp-setup}), then characterise the
+quality of the underlying world model (\S\ref{sec:exp-wm}), and
+proceed through the five RL methods in the same order as
+Chapter~\ref{chap:methodology}: curriculum SAC
+(\S\ref{sec:exp-curr-sac}), HER+SAC (\S\ref{sec:exp-her-sac}),
+hierarchical joint SAC (\S\ref{sec:exp-joint}), HIQL+LeWM
+(\S\ref{sec:exp-hiql}), and the flow-matching variant
+(\S\ref{sec:exp-flow}). \S\ref{sec:exp-cem} reports an alternative
+evaluation in which LeWM is used as the model in a sample-based
+planner (CEM/MPC); \S\ref{sec:exp-diag} collects diagnostics; and
+\S\ref{sec:exp-discuss} concludes.
+
+% ---------------------------------------------------------------------
+\section{Experimental Setup}
+\label{sec:exp-setup}
+
+\subsection{Environment and Datasets}
+We use \textsc{OGBench} cube-single-play, a five-task object-pushing
+benchmark with $25$-D continuous actions and either $64{\times}64$ or
+$224{\times}224$ RGB observations. Each evaluation runs the five
+predefined tasks (\texttt{horizontal}, \texttt{vertical1},
+\texttt{vertical2}, \texttt{diagonal1}, \texttt{diagonal2}) for $50$
+episodes each, with a maximum of $200$ steps per episode.
+World-model and offline-cache training data come from the expert
+trajectories distributed with \textsc{OGBench}.
+
+\subsection{Evaluation Protocols}
+Three protocols are used.
+
+\paragraph{Native OGBench.} The agent is rolled out in the real
+simulator and a task counts as solved when the cube ends within
+$4$\,cm of the target (\textsc{OGBench}'s native success criterion).
+This is our headline metric and the one reported in all main tables.
+
+\paragraph{Latent goal-reaching.} An in-distribution sanity check in
+which goals are sampled from training data and the agent must drive
+the latent state to within $\delta$ of the goal embedding in
+$\mathcal{Z}$. Used during training and for the diagnostics of
+\S\ref{sec:exp-diag}.
+
+\paragraph{CEM/MPC planning.} As an alternative to learning a policy,
+we replace the actor with a cross-entropy-method planner that
+optimises action sequences against the LeWM rollout. We use $300$
+samples, $30$ CEM iterations, top-$30$ selection, planning horizon
+$5$, receding horizon $5$, and an action-block of $5$
+environment steps per planned action. Reported separately in
+\S\ref{sec:exp-cem}.
+
+\subsection{Metrics}
+\begin{itemize}
+\item \textbf{Success rate (\%):} fraction of episodes solved by the
+native OGBench criterion. Reported per-task and as a $5$-task average.
+\item \textbf{Latent drift:} $\|\hat z_{t+\Delta} - z_{t+\Delta}\|_2$
+between the predictor's $\Delta$-step rollout and the encoded ground
+truth (\S\ref{sec:exp-wm-drift}).
+\item \textbf{Per-step diagnostics:} latent distance to goal and
+action norm logged at every step (\S\ref{sec:exp-diag}).
+\end{itemize}
+
+% ---------------------------------------------------------------------
+\section{World Model Quality}
+\label{sec:exp-wm}
+
+\subsection{Predictor Drift vs Horizon}
+\label{sec:exp-wm-drift}
+We measure mean L2 drift in latent space as a function of the
+predictor rollout horizon $\Delta$ (in raw frames). This is the most
+useful single diagnostic of whether downstream RL can be expected to
+succeed, because every method in Chapter~\ref{chap:methodology} uses
+$\|z_{t+1} - g\|_2$ as a learning signal.
+
+\begin{table}[h]
+\centering
+\caption{Mean latent-space drift
+$\|\hat z_{t+\Delta}-z_{t+\Delta}\|_2$ as a function of prediction
+horizon $\Delta$ (frames). The non-linear growth explains the
+gap-cliff in Table~\ref{tab:joint-gap}.}
+\label{tab:drift}
+\begin{tabular}{lccccc}
+\toprule
+$\Delta$ (frames) & 1 & 5 & 10 & 25 & 50 \\
+\midrule
+mean L2 drift & 1.77 & \todo{verify} & \todo{verify} & \todo{verify} & 16.54 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.65\linewidth]{figures/l2_vs_gap.png}
+\caption{Mean latent-space drift versus prediction horizon
+$\Delta$. Single-step drift of $\sim\!1.77$ calibrates the
+done-threshold $\delta_d=2.0$ used in
+Eqs.~\eqref{eq:her-sparse}--\eqref{eq:her-dense}; the rapid
+super-linear growth beyond $\Delta\!\approx\!10$ frames is the source
+of the failure mode discussed in \S\ref{sec:exp-joint-gap}.}
+\label{fig:drift}
+\end{figure}
+
+\subsection{Latent Geometry under SIGReg}
+The spectral isotropy regulariser
+(Eq.~\eqref{eq:sigreg}) is intended to make $\|z-g\|_2$ a meaningful
+distance. Figure~\ref{fig:latent-norms} shows histograms of latent
+norms and goal distances on in-distribution and out-of-distribution
+states; the distributions are well-concentrated, justifying the use
+of a single done-threshold across tasks.
+
+\begin{figure}[h]
+\centering
+\begin{tabular}{cc}
+\includegraphics[width=0.45\linewidth]{figures/goal_norms_ood.png} &
+%\includegraphics[width=0.45\linewidth]{../diagnostics_lewm/goal_distance_histograms.png}
+\end{tabular}
+\caption{Left: distribution of latent norms on OOD goals. Right:
+distribution of goal-to-state L2 distances for the OGBench tasks,
+used to set $\delta_d$ and $\kappa$.}
+\label{fig:latent-norms}
+\end{figure}
+
+\subsection{Resolution Study}
+\todo{verify: paste numbers from \texttt{run\_resolution\_experiment.sh}
+output (\texttt{resolution\_experiment.py}) comparing $64{\times}64$
+and $224{\times}224$ LeWM models on (a) predictor drift and (b)
+downstream HIQL+LeWM success.}
+
+% ---------------------------------------------------------------------
+\section{Curriculum SAC (\S\ref{sec:curr-sac})}
+\label{sec:exp-curr-sac}
+
+\todo{verify: report final curriculum stage reached, success rate at
+each stage, and headline native-OGBench success rate. Source: SAC
+baseline log files.}
+
+The flat curriculum SAC of \S\ref{sec:curr-sac} establishes a lower
+bound: with no hindsight relabelling and no expert data, even the
+dense potential reward in Eq.~\eqref{eq:sac-reward} provides little
+useful signal once the goal is more than a handful of LeWM steps
+away. Empirically, the curriculum advances quickly through the early
+stages but stalls at the longer-horizon ones, motivating the
+introduction of HER in \S\ref{sec:her-sac}.
+
+% ---------------------------------------------------------------------
+\section{HER+SAC (\S\ref{sec:her-sac})}
+\label{sec:exp-her-sac}
+
+\subsection{Curriculum vs Fixed-Gap vs Pure-Distance}
+\label{sec:exp-her-tasks}
+
+We compare the three task-sampling modes of
+Eqs.~\eqref{eq:her-curr}--\eqref{eq:her-pure}, each with both the
+sparse and the dense reward of
+Eqs.~\eqref{eq:her-sparse}--\eqref{eq:her-dense}.
+
+\begin{table}[h]
+\centering
+\caption{HER+SAC (\S\ref{sec:her-sac}) on OGBench cube-single.
+Task-sampling mode $\times$ reward type. Numbers in italics are to be
+filled from
+\texttt{old\_checkpoints\_and\_outputs/eval\_native\_checkpoints\_her\_*}.}
+\label{tab:her-sac}
+\begin{tabular}{lcc}
+\toprule
+mode & sparse & dense \\
+\midrule
+curriculum & \todo{verify} & \todo{verify} \\
+fixed-gap ($G=5$) & 0.0 & \todo{verify} \\
+pure-distance & 0.0 & \todo{verify} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Sparse vs Dense Reward}
+\todo{verify: discuss trade-off — sparse reward is uniformative but
+unbiased; dense reward is denser but introduces a clip-induced bias.}
+
+% ---------------------------------------------------------------------
+\section{Joint Hierarchical SAC (\S\ref{sec:joint})}
+\label{sec:exp-joint}
+
+\subsection{Effect of High-Level Gap}
+\label{sec:exp-joint-gap}
+
+We sweep the high-level gap $G$ that separates $z_t$ from the
+predicted waypoint $z_{\mathrm{sub}}$.
+
+\begin{table}[h]
+\centering
+\caption{Joint hierarchical SAC (\S\ref{sec:joint}) on OGBench
+cube-single. Success rate (\%) as a function of high-level gap $G$
+and reward type. The performance cliff at $G\!\geq\!2$ motivates the
+move to HIQL in \S\ref{sec:exp-hiql}.}
+\label{tab:joint-gap}
+\begin{tabular}{lcc}
+\toprule
+$G$ & sparse & dense \\
+\midrule
+1 & 0.8 & 2.4 \\
+2 & 0.0 & 0.0 \\
+5 & 0.0 & 0.0 \\
+10 & 0.0 & 0.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The cliff at $G \geq 2$ is consistent with the predictor-drift curve
+of Fig.~\ref{fig:drift}: at $G \geq 2$ the high-level waypoint
+$z_{\mathrm{sub}}$ lies $G\cdot 5 \geq 10$ frames into the future,
+where the LeWM error has grown beyond the done-threshold $\delta_d$.
+
+\subsection{Effect of \texttt{cache\_ratio}}
+\todo{verify: report success rate as a function of \texttt{cache\_ratio}
+$\in\{0, 0.5, 0.75, 0.8, 0.9, 1.0\}$. Source: \texttt{logs/eval\_gap*\_cr*.out}.}
+
+\subsection{Cost Regularisation Sweep}
+\todo{verify: report success rate as a function of the action-cost
+weight in the dense reward. Source: \texttt{logs/eval\_gap*\_cr*.out}.}
+
+% ---------------------------------------------------------------------
+\section{HIQL with LeWM (\S\ref{sec:hiql-lewm})}
+\label{sec:exp-hiql}
+
+\subsection{Warm-up Fraction $\times$ Subgoal Horizon}
+\label{sec:exp-hiql-sweep}
+
+\begin{table}[h]
+\centering
+\caption{HIQL+LeWM on OGBench cube-single ($5$ tasks $\times$ $50$
+episodes). Success rate (\%) as a function of warm-up fraction
+$\rho_{\mathrm{wu}}$ (Eqs.~\eqref{eq:hiql-phase1}--\eqref{eq:hiql-phase2})
+and subgoal horizon $k$, with $d_r{=}10$.}
+\label{tab:hiql-lewm-sweep}
+\begin{tabular}{lcc}
+\toprule
+$\rho_{\mathrm{wu}}$ & $k=2$ & $k=5$ \\
+\midrule
+0.0 & 11.2 & 14.4 \\
+0.5 & 7.2 & 10.0 \\
+1.0 & \textbf{20.8} & 7.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+.
+
+\subsection{Per-Task Breakdown}
+\begin{table}[h]
+\centering
+\caption{Per-task success rate (\%) for the best HIQL+LeWM
+configuration ($k{=}2$, $\rho_{\mathrm{wu}}{=}1$, $d_r{=}10$).}
+\label{tab:per-task}
+\begin{tabular}{lc}
+\toprule
+Task & success \\
+\midrule
+\texttt{task1\_horizontal} & \todo{verify} \\
+\texttt{task2\_vertical1} & \todo{verify} \\
+\texttt{task3\_vertical2} & \todo{verify} \\
+\texttt{task4\_diagonal1} & \todo{verify} \\
+\texttt{task5\_diagonal2} & \todo{verify} \\
+\midrule
+overall & 20.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Comparison to HIQL Baseline (no World Model)}
+
+\begin{table}[h]
+\centering
+\caption{HIQL baseline (no LeWM, raw $224{\times}224$ pixels) sweep
+over subgoal horizon $k$ and goal-rep dim $d_r$. Reproduces a plain
+\textsc{OGBench} HIQL upper bound for context.}
+\label{tab:hiql-baseline}
+\begin{tabular}{lcc}
+\toprule
+config & $d_r=10$ & $d_r=192$ \\
+\midrule
+$k=2$ & \todo{verify} & \todo{verify} \\
+$k=5$ & \textbf{37.6} & \todo{verify} \\
+$k=10$ & \todo{verify} & \todo{verify} \\
+$k=25$ & 7.2 & \todo{verify} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The plain HIQL baseline outperforms HIQL+LeWM at the same $k=5$
+($37.6\%$ vs $14.4\%$), establishing that the world model is
+currently \emph{losing} information that the raw-pixel HIQL retains.
+The same pattern is visible at $k=2$, where HIQL+LeWM recovers most
+but not all of the baseline gap (Table~\ref{tab:hiql-lewm-sweep}).
+
+% ---------------------------------------------------------------------
+\section{HIQL with Flow-Matching Policy (\S\ref{sec:hiql-flow})}
+\label{sec:exp-flow}
+
+\todo{verify: paste headline numbers from
+\texttt{eval\_hiql\_flow\_224\_sweep.sh} runs. Cells should match the
+sweep over $\rho_{\mathrm{wu}}$ and $k$ used in
+Table~\ref{tab:hiql-lewm-sweep} so the two are directly comparable.}
+
+The flow-matching policy is designed to capture multimodal expert
+behaviour at the same inference cost as the Gaussian actor of
+\S\ref{sec:hiql-lewm}. We expect the gain to be largest in
+configurations where the dataset shows multiple plausible action
+modes for the same latent state.
+
+% ---------------------------------------------------------------------
+\section{Headline Comparison}
+\label{sec:exp-headline}
+
+\begin{table}[h]
+\centering
+\caption{Best-configuration comparison on OGBench cube-single
+(5 tasks, 50 episodes each).}
+\label{tab:headline}
+\begin{tabular}{lcc}
+\toprule
+Method & Latent space & Success (\%) \\
+\midrule
+Curriculum SAC (\S\ref{sec:curr-sac}) & $192$-D LeWM & \todo{verify} \\
+HER+SAC (\S\ref{sec:her-sac}, best mode) & $192$-D LeWM & 0.0 \\
+Joint hier.\ SAC (\S\ref{sec:joint}, $G{=}1$, dense) & $192$-D LeWM & 2.4 \\
+HIQL baseline (no WM, $k{=}5$, $d_r{=}10$) & $224{\times}224$ raw & \textbf{37.6} \\
+HIQL+LeWM (\S\ref{sec:hiql-lewm}, $k{=}2$, $\rho_{\mathrm{wu}}{=}1$) & $192$-D LeWM & 20.8 \\
+HIQL+LeWM+Flow (\S\ref{sec:hiql-flow}) & $192$-D LeWM & \todo{verify} \\
+CEM/MPC with LeWM (\S\ref{sec:exp-cem}, 224) & $192$-D LeWM & 0.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------
+\section{CEM/MPC with the Learned World Model}
+\label{sec:exp-cem}
+
+We replace the learned policy with a CEM planner that optimises
+action sequences against LeWM rollouts (settings in
+\S\ref{sec:exp-setup}). On OGBench cube-single this approach scores
+$0.0\%$, confirming that the predictor drift documented in
+Fig.~\ref{fig:drift} is large enough that pure model-based planning
+without a learned policy is not viable at our horizons.
+
+% ---------------------------------------------------------------------
+\section{Diagnostics and Failure Mode Analysis}
+\label{sec:exp-diag}
+
+\subsection{Flat vs Hierarchical}
+The diagnostic suite (\texttt{run\_diagnostics.sh}, step A) evaluates
+the low-level actor of \S\ref{sec:joint} \emph{without} the
+high-level head, treating it as a flat goal-conditioned policy. \todo{verify:
+paste flat-policy success rates and compare to the corresponding
+hierarchical row of Table~\ref{tab:joint-gap}.}
+
+\subsection{Predictor Consistency}
+Step C of the diagnostic suite checks
+$\|f_\psi(z_t, a_t) - E_\xi(s_{t+1})\|$ over the on-policy roll-out
+distribution. \todo{verify: paste mean and standard deviation across
+$20$ episodes $\times$ $10$ steps and compare to the in-distribution
+drift of Fig.~\ref{fig:drift}.}
+
+\subsection{Goal-Reachability}
+Step B of the diagnostic suite logs
+$\|z_t - g\|_2$ and $\|a_t\|_2$ at every environment step. The
+characteristic failure mode is a slow distance reduction that
+plateaus before crossing $\delta_d = 2.0$, suggesting that the policy
+has learned a useful direction but cannot refine the final
+positioning step.
+
+% ---------------------------------------------------------------------
+\section{Discussion}
+\label{sec:exp-discuss}
+
+The progression from \S\ref{sec:exp-curr-sac} to
+\S\ref{sec:exp-flow} maps cleanly onto the algorithmic progression of
+Chapter~\ref{chap:methodology}. Curriculum SAC fails for lack of a
+learning signal on long-horizon tasks; HER+SAC adds the signal but
+still underperforms; the hierarchical joint variant collapses
+whenever the high-level gap exceeds the predictor's horizon of
+fidelity (Fig.~\ref{fig:drift}); HIQL+LeWM is the first method to
+break double-digit success, and is best when imagination is
+\emph{disabled} ($\rho_{\mathrm{wu}}=1$, Table~\ref{tab:hiql-lewm-sweep});
+the flow-matching variant
+\todo{verify: confirm whether it improves on the Gaussian actor or
+not.}
+
+The single most informative diagnostic is the predictor-drift curve
+in Fig.~\ref{fig:drift}: every method whose effective horizon exceeds
+$\sim\!10$ raw frames falls off a cliff. This frames the principal
+direction for future work as improving long-horizon predictor
+fidelity, either by (i) larger or longer-trained world models, (ii)
+a contrastive auxiliary objective on top of the JEPA loss in
+Eq.~\eqref{eq:pred-loss}, or (iii) abandoning closed-form roll-outs
+in favour of a hybrid offline+real-data training regime in which the
+world model is consulted only on short horizons.

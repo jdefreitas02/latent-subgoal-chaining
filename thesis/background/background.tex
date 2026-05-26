@@ -1,0 +1,424 @@
+\chapter{Background}
+\section{Reinforcement Learning}
+
+Many decision-making problems can be formalised as sequential optimisation tasks in which an agent interacts with an environment over time. A standard mathematical framework for this process is the Markov Decision Process (MDP), which provides a basis for analysing and designing algorithms that balance immediate rewards with long-term outcomes. Building on this framework, reinforcement learning (RL) has emerged as a central approach to learning action policies through trial and error. 
+
+\subsection{Markov Decision Processes}
+
+A Markov Decision Process (MDP) is a framework for modelling sequential decision making under uncertainty, where an agent’s actions influence both future states and cumulative rewards \cite{puterman2014markov}. An MDP is defined by the tuple $(\mathcal{S}, \mathcal{A}, P, R, \gamma)$, where:
+
+\begin{itemize}
+    \item $\mathcal{S}$ is the set of possible states the environment can occupy.
+    \item $\mathcal{A}$ is the set of available actions the agent can take.
+    \item $P: \mathcal{S} \times \mathcal{A} \times \mathcal{S} \to [0,1]$ is the transition probability function, with
+    \[
+    P(s' \mid s, a) = \Pr(s_{t+1} = s' \mid s_t = s, a_t = a),
+    \]
+    describing the likelihood of transitioning to state $s'$ given current state $s$ and action $a$.
+    \item $R: \mathcal{S} \times \mathcal{A} \to \mathbb{R}$ is the reward function, specifying the immediate return received after taking action $a$ in state $s$:
+    \[
+    r_t = R(s_t, a_t).
+    \]
+    \item $\gamma \in [0,1]$ is the discount factor, which balances the importance of immediate versus future rewards.
+\end{itemize}
+
+The key assumption of the Markov property is that the next state and reward depend only on the current state and action, not on the full history:
+\[
+\Pr(s_{t+1}, r_t \mid s_0, a_0, \dots, s_t, a_t) = \Pr(s_{t+1}, r_t \mid s_t, a_t).
+\]
+This property simplifies sequential decision making and underlies dynamic programming, reinforcement learning, and planning algorithms.
+
+A \emph{policy} $\pi: \mathcal{S} \to \mathcal{P}(\mathcal{A})$ defines a mapping from states to probability distributions over actions. The agent's objective is to find a policy $\pi^\ast$ that maximises the expected cumulative discounted reward:
+\[
+\pi^\ast = \arg\max_\pi \mathbb{E}_{\pi}\Bigg[ \sum_{t=0}^\infty \gamma^t r_t \Bigg].
+\]
+
+The \emph{state-value function} $V^\pi(s)$ and the \emph{action-value function} $Q^\pi(s,a)$ formalise the expected returns under a policy $\pi$:
+\[
+V^\pi(s) = \mathbb{E}_\pi \Bigg[ \sum_{t=0}^\infty \gamma^t r_t \,\Big|\, s_0 = s \Bigg], \qquad
+Q^\pi(s,a) = \mathbb{E}_\pi \Bigg[ \sum_{t=0}^\infty \gamma^t r_t \,\Big|\, s_0 = s, a_0 = a \Bigg].
+\]
+These functions satisfy the \emph{Bellman equations}:
+\[
+V^\pi(s) = \sum_{a \in \mathcal{A}} \pi(a \mid s) \Big[ R(s,a) + \gamma \sum_{s' \in \mathcal{S}} P(s' \mid s, a) V^\pi(s') \Big],
+\]
+\[
+Q^\pi(s,a) = R(s,a) + \gamma \sum_{s' \in \mathcal{S}} P(s' \mid s, a) \sum_{a' \in \mathcal{A}} \pi(a' \mid s') Q^\pi(s',a').
+\]
+
+
+Overall, MDPs and their extensions provide a foundation for modelling and analysing sequential decision making problems, including planning, reinforcement learning, and agent-based interactions in complex environments. 
+
+
+\subsection{Model-Free vs Model-Based Reinforcement Learning}
+
+Reinforcement learning algorithms can be broadly split into  model-free and model-based approaches, depending on whether the agent explicitly learns a model of the environment's dynamics.
+
+\paragraph{Model-Free Reinforcement Learning.}  
+Model-free methods learn optimal behaviours directly from interactions with the environment without constructing an explicit representation of the transition dynamics or reward function. The agent estimates value functions or policies using observed rewards and transitions. For example, in Q-learning \cite{watkins1992qlearning}, the agent maintains an action-value function $Q(s,a)$, which is updated iteratively according to the Bellman optimality equation:
+\[
+Q(s_t, a_t) \leftarrow Q(s_t, a_t) + \alpha \Big[ r_t + \gamma \max_{a'} Q(s_{t+1}, a') - Q(s_t, a_t) \Big],
+\]
+where $\alpha$ is the learning rate and $\gamma$ the discount factor. SARSA, an on-policy variant, instead updates based on the action actually taken:
+\[
+Q(s_t, a_t) \leftarrow Q(s_t, a_t) + \alpha \Big[ r_t + \gamma Q(s_{t+1}, a_{t+1}) - Q(s_t, a_t) \Big].
+\]
+
+Model-free methods can also learn a policy $\pi_\theta(a \mid s)$ directly, using policy gradient approaches. The objective is to maximise the expected return:
+\[
+J(\theta) = \mathbb{E}_{\pi_\theta}\Bigg[ \sum_{t=0}^\infty \gamma^t r_t \Bigg],
+\]
+with gradient estimated via
+\[
+\nabla_\theta J(\theta) = \mathbb{E}_{\pi_\theta} \Big[ \nabla_\theta \log \pi_\theta(a_t \mid s_t) \, G_t \Big],
+\]
+where $G_t$ is the discounted return from timestep $t$. While model-free methods are simple to implement and can perform well in practice, they tend to be sample-inefficient because all learning comes from trial-and-error interactions with the environment.
+
+\paragraph{Model-Based Reinforcement Learning.}  
+In contrast, model-based RL explicitly approximates the transition dynamics $P(s_{t+1} \mid s_t, a_t)$ and reward function $R(s_t, a_t)$. This internal model allows the agent to simulate potential future outcomes and plan actions by reasoning over imagined trajectories. Let $\hat{P}_\phi$ and $\hat{R}_\psi$ denote learned approximations of the transition and reward functions:
+\[
+s_{t+1} \sim \hat{P}_\phi(s_{t+1} \mid s_t, a_t), \qquad r_t \approx \hat{R}_\psi(s_t, a_t).
+\]
+
+Planning can then be performed by simulating trajectories $\tau = (s_0, a_0, s_1, a_1, \dots)$ under the learned model and computing expected returns:
+\[
+\hat{G}_t = \sum_{k=0}^{H} \gamma^k \hat{R}_\psi(s_{t+k}, a_{t+k}),
+\]
+allowing the agent to choose actions that maximise anticipated outcomes:
+\[
+a_t = \arg\max_a \mathbb{E}_{\tau \sim \hat{P}_\phi}[\hat{G}_t \mid a_0 = a]
+\]
+
+Model-based approaches can significantly improve sample efficiency by leveraging knowledge of cause and effect relationships, enabling lookahead planning and counterfactual reasoning. They are often compared to human decision-making theories: deliberate, model-based planning corresponds to evaluating potential future outcomes, while model-free methods resemble habitual, experience driven responses \cite{daw2011model}.
+
+\subsection{Continuous Control and Actor-Critic Methods}
+
+Early successes in deep reinforcement learning (RL), such as Deep Q-Networks (DQN), were primarily demonstrated in discrete-action domains like Atari \cite{mnih2013playingatarideepreinforcement}. These methods rely on learning an action-value function $Q(s,a)$ and selecting actions via a maximization step:
+\begin{equation}
+    a^* = \arg\max_{a \in \mathcal{A}} Q(s,a)
+\end{equation}
+This approach is tractable when the action space $\mathcal{A}$ is small and discrete, as the maximization can be performed by exhaustively evaluating all possible actions. However, this formulation does not extend naturally to continuous control problems.
+
+In continuous and high-dimensional action spaces, such as those encountered in robotics, the action space is no longer enumerable. A naive approach is to discretize each action dimension, but this quickly becomes impractical due to the curse of dimensionality: if each of $d$ action dimensions is discretized into $k$ bins, the total number of discrete actions grows as $k^d$. Even for modest values of $k$ and $d$, this leads to an exponential explosion in the size of the action space, rendering exhaustive evaluation infeasible \cite{lillicrap2019continuouscontroldeepreinforcement}. Moreover, directly optimizing $Q(s,a)$ with respect to $a$ in continuous spaces requires solving a non-convex optimization problem at every decision step, which is computationally prohibitive and unstable in practice.
+
+These challenges motivated a shift toward policy-based methods, which avoid the explicit maximization over actions. Instead of deriving actions from a value function, policy gradient methods directly parameterize a policy $\pi_\theta(a|s)$ and optimize it to maximize expected return:
+\begin{equation}
+    J(\theta) = \mathbb{E}_{s \sim \rho^\pi,\, a \sim \pi_\theta} \left[ R \right]
+\end{equation}
+Actor-critic methods combine the strengths of both approaches by learning a parameterized policy (the actor) alongside a value function (the critic), which provides gradient estimates for policy improvement \cite{Silver2014DeterministicPG}. In particular, deterministic policy gradient methods enable learning in continuous action spaces by directly outputting actions $a = \pi_\theta(s)$, thereby bypassing the need for an $\arg\max$ operation.
+
+While actor-critic methods address the fundamental limitations of value-based approaches in continuous domains, they introduce new challenges, particularly in exploration and sample efficiency. Recent advances, such as entropy-regularized methods, attempt to mitigate these issues by encouraging more diverse exploration strategies \cite{haarnoja2018softactorcriticoffpolicymaximum}.
+\subsection{Soft Actor-Critic (SAC)}
+Soft Actor-Critic (SAC) is an off-policy actor–critic algorithm designed for continuous control tasks \cite{haarnoja2018softactorcriticoffpolicymaximum}. Unlike standard reinforcement learning methods that optimise only for expected return, SAC additionally maximises the entropy of the policy. This encourages exploration by preventing premature convergence to deterministic policies and improves robustness.
+
+
+
+SAC optimises the following maximum entropy objective:
+\begin{equation}
+    J(\pi) = \mathbb{E}_{(s_t,a_t) \sim \pi} \left[
+        \sum_{t} r(s_t,a_t)
+        + \alpha \mathcal{H}(\pi(\cdot|s_t))
+    \right],
+\end{equation}
+where $\mathcal{H}(\pi(\cdot|s_t)) = -\mathbb{E}_{a \sim \pi}[\log \pi(a|s_t)]$ is the entropy of the policy, and $\alpha > 0$ is a temperature parameter that controls the trade-off between reward maximisation and entropy maximisation.
+
+
+SAC maintains:
+\begin{itemize}
+    \item a stochastic policy (actor) $\pi_\theta(a|s)$, typically modelled as a Gaussian distribution,
+    \item two Q-functions (critics) $Q_{\phi_1}(s,a)$ and $Q_{\phi_2}(s,a)$ to reduce overestimation bias,
+    \item target networks $Q_{\bar{\phi}_1}, Q_{\bar{\phi}_2}$ for stabilised bootstrapping.
+\end{itemize}
+
+The critics are trained to satisfy a soft Bellman equation. The corresponding loss is given by:
+\begin{equation}
+\mathcal{L}_Q =
+\mathbb{E}_{(s,a,r,s') \sim \mathcal{D}}
+\left[
+\left(
+Q_\phi(s,a)
+-
+\left(
+r + \gamma \mathbb{E}_{a' \sim \pi_\theta}
+\left[
+\min_{i=1,2} Q_{\bar{\phi}_i}(s',a')
+- \alpha \log \pi_\theta(a'|s')
+\right]
+\right)
+\right)^2
+\right]
+\end{equation}
+
+Here, the target combines expected future value and an entropy term, ensuring that uncertainty in future actions is explicitly accounted for.
+
+
+The policy is trained by minimising the Kullback–Leibler divergence between the policy and a Boltzmann (energy-based) distribution induced by the Q-function. This leads to the practical objective:
+\begin{equation}
+\mathcal{L}_\pi =
+\mathbb{E}_{s \sim \mathcal{D}, a \sim \pi_\theta}
+\left[
+\alpha \log \pi_\theta(a|s)
+- Q_\phi(s,a)
+\right]
+\end{equation}
+
+Intuitively, this objective encourages the policy to assign higher probability to actions with high Q-values while maintaining sufficient entropy.
+
+By combining off-policy learning, entropy regularisation, and double Q-learning, SAC achieves stable and sample-efficient learning in high-dimensional continuous control tasks.
+
+\section{Goal-Conditioned Reinforcement Learning}
+
+\subsection{Goal-Conditioned RL Formulations}
+
+Standard reinforcement learning assumes a fixed reward function $r(s,a)$, implicitly defining a single task. This formulation is inherently restrictive, as it requires retraining an agent for each new objective. Goal-conditioned reinforcement learning (GCRL) addresses this limitation by extending the problem to a multi-task setting, where the objective is specified by a goal variable $g$. The agent is thus trained to achieve arbitrary goals within a shared environment.
+
+Formally, this can be expressed by augmenting the state space to include the goal, yielding an augmented state $(s, g) \in \mathcal{S} \times \mathcal{G}$. The reward function becomes goal-dependent:
+\begin{equation}
+    r(s, a, g)
+\end{equation}
+and the policy is conditioned on both the state and goal:
+\begin{equation}
+    \pi(a \mid s, g)
+\end{equation}
+
+A common instantiation defines the reward as a distance to the goal, for example:
+\begin{equation}
+    r(s, a, g) = -\| f(s') - g \|,
+\end{equation}
+where $f(s')$ extracts a goal-relevant representation of the next state. This formulation connects to early work on goal-directed behaviour, where the objective is to minimize the distance to a desired state \cite{Kaelbling1993LearningTA}.
+
+Universal Value Function Approximators (UVFAs) provide a practical mechanism for learning in this setting by parameterizing the value function over both states and goals:
+\begin{equation}
+    Q(s, a, g; \theta) \approx Q^*(s, a, g).
+\end{equation}
+By leveraging function approximation, UVFAs enable generalization across goals, allowing the agent to infer how to reach previously unseen targets \cite{pmlr-v37-schaul15}. This generalization is critical for scaling RL to multi-task and goal-driven scenarios.
+
+\subsection{Hindsight Experience Replay (HER)}
+
+Despite its flexibility, GCRL suffers from a fundamental challenge: sparse rewards. In many environments, the agent only receives a non-zero reward upon reaching the exact goal, making successful experiences exceedingly rare during early training. As a result, naive learning becomes highly inefficient.
+
+Hindsight Experience Replay (HER) addresses this issue by reinterpreting failed trajectories as successful ones for alternative goals \cite{her}. Given a trajectory $\tau = (s_0, a_0, \dots, s_T)$ collected while attempting to reach a goal $g$, HER relabels transitions by replacing $g$ with a goal $\tilde{g}$ that was actually achieved later in the trajectory. The reward is then recomputed as:
+\begin{equation}
+    r(s, a, \tilde{g}).
+\end{equation}
+
+This simple relabeling strategy dramatically increases the density of meaningful learning signals. Crucially, HER transforms reinforcement learning from a purely on-policy, trial-and-error process into an off-policy data reuse paradigm, where each trajectory can be leveraged to learn about many different goals. This perspective naturally motivates the broader setting of offline reinforcement learning, where agents learn entirely from fixed datasets.
+
+\subsection{Offline Reinforcement Learning and Implicit Q-Learning}
+
+Offline reinforcement learning considers the setting where an agent must learn exclusively from a static dataset $\mathcal{D}$ of transitions, without further interaction with the environment. While appealing in practice, this setting introduces a fundamental challenge: distributional shift. The learned policy may select actions that are not well represented in the dataset, leading to erroneous Q-value estimates and compounding errors during training \cite{levine2020offlinereinforcementlearningtutorial}.
+
+Standard off-policy algorithms such as Q-learning or actor-critic methods are particularly susceptible to this issue, as they rely on evaluating and maximizing over actions that may lie outside the data distribution. Prior approaches, such as Conservative Q-Learning (CQL), address this by explicitly penalizing Q-values for out-of-distribution actions \cite{kumar2020conservativeqlearningofflinereinforcement}. However, these methods can be overly restrictive and difficult to tune.
+
+Implicit Q-Learning (IQL) takes a fundamentally different approach by avoiding explicit evaluation of unseen actions altogether \cite{kostrikov2021offlinereinforcementlearningimplicit}. Instead of performing a maximization over actions, IQL decomposes learning into three components: a state-value function $V(s)$, an action-value function $Q(s,a)$, and a policy $\pi(a|s)$.
+
+The key idea is to estimate the value function using expectile regression, which performs asymmetric least squares to approximate the upper expectile of the Q-function:
+\begin{equation}
+    \mathcal{L}_V = \mathbb{E}_{(s,a) \sim \mathcal{D}} \left[ \rho_\tau \left( Q(s,a) - V(s) \right) \right],
+\end{equation}
+where $\rho_\tau(u)$ is the expectile loss:
+\begin{equation}
+    \rho_\tau(u) = |\tau - \mathbb{I}(u < 0)| u^2.
+\end{equation}
+This biases $V(s)$ toward higher Q-values without requiring an explicit maximization.
+
+The Q-function is then trained using a standard Bellman backup:
+\begin{equation}
+    \mathcal{L}_Q = \mathbb{E}_{(s,a,r,s') \sim \mathcal{D}} \left[ \left( Q(s,a) - (r + \gamma V(s')) \right)^2 \right].
+\end{equation}
+
+Finally, the policy is extracted via advantage-weighted regression:
+\begin{equation}
+    \mathcal{L}_\pi = \mathbb{E}_{(s,a) \sim \mathcal{D}} \left[ \exp\left( {\beta} (Q(s,a) - V(s)) \right) \log \pi(a|s) \right],
+\end{equation}
+which encourages the policy to imitate actions with high advantage.
+
+By avoiding explicit queries of out-of-distribution actions, IQL achieves stable and effective learning in the offline setting. This makes it particularly well-suited for integration with goal-conditioned and data-augmented frameworks, where robustness to dataset limitations is critical.
+
+\section{Hierarchical Reinforcement Learning}
+
+\subsection{The Curse of Long-Horizon Planning}
+
+While goal-conditioned policies provide a mechanism for generalisation across tasks, they remain fundamentally limited when applied to long-horizon problems. In particular, as the temporal distance between the current state and the goal increases, the learning problem becomes significantly more difficult. In offline GCRL, this manifests as a rapid degradation in the signal-to-noise ratio of the value function for distant goals: value estimates become increasingly dominated by extrapolation error rather than meaningful supervision.
+
+This issue is closely related to temporal credit assignment. When rewards are sparse and delayed, the agent must propagate learning signals across many intermediate transitions. In flat architectures, where a single policy is responsible for both high-level planning and low-level control, this creates a bottleneck: the policy must implicitly learn multi-step reasoning over long horizons from a single decision-making process. As the horizon increases, errors in value estimation compound recursively, leading to unstable or overly conservative policies. This limitation becomes particularly severe in offline settings, where the agent cannot correct its behaviour through additional environment interaction.
+
+\subsection{Foundations of Hierarchical Reinforcement Learning}
+
+Hierarchical reinforcement learning (HRL) addresses this limitation by introducing temporal abstraction. Instead of relying on a single flat policy, HRL decomposes decision-making into multiple levels operating at different temporal resolutions. The classical formulation of this idea is captured by the options framework, which generalises Markov Decision Processes to include temporally extended actions, or ``options'' \cite{SUTTON1999181}. Each option consists of a policy, a termination condition, and an initiation set, allowing the agent to reason over higher-level behaviours rather than primitive actions.
+
+In modern deep RL, this idea is often implemented as a bipartite hierarchy. A high-level policy operates at a lower frequency, selecting intermediate subgoals or waypoints, while a low-level policy executes primitive actions to achieve these subgoals. Formally, the high-level policy selects a subgoal $g_t$ every $k$ steps:
+\begin{equation}
+    g_t \sim \pi_H(g \mid s_t),
+\end{equation}
+while the low-level policy conditions on both the current state and the subgoal:
+\begin{equation}
+    a_t \sim \pi_L(a \mid s_t, g_t).
+\end{equation}
+
+TODO: rewrite HIRO part
+
+A key challenge in making this decomposition work in practice is ensuring consistency between the two levels during learning, particularly in off-policy settings. HIRO addresses this by introducing a relabelling mechanism that accounts for the evolving low-level policy, enabling stable off-policy training of both levels in continuous control tasks \cite{nachum2018dataefficienthierarchicalreinforcementlearning}. This demonstrated that hierarchical structures can significantly improve sample efficiency and long-horizon performance when properly trained.
+
+\subsection{Hierarchical Implicit Q-Learning (HIQL)}
+
+Extending hierarchical RL to offline settings introduces additional challenges. In particular, both the high-level and low-level policies are subject to distribution shift: the high-level policy may propose subgoals that are not supported by the dataset, while the low-level policy may be required to execute actions that lie outside the behavior distribution. These issues make extensions of HRL to offline data unstable and prone to compounding errors.
+
+A primary reason non-hierarchical policies struggle with distant goals is the ``signal-to-noise'' ratio in the value function. When a goal is far away, the optimal action is often only marginally better than suboptimal actions. Consequently, small errors in the learned value function can drown out this signal, leading to an erroneous policy. Hierarchical Implicit Q-Learning (HIQL) mitigates this by decomposing the policy into two levels, enabling the value function to provide clearer learning signals for both \cite{park2024hiqlofflinegoalconditionedrl}. 
+
+A distinguishing feature of HIQL is that it extracts all necessary components---a representation function, a high-level policy, and a low-level policy---from a single goal-conditioned value function. Instead of treating subgoals as raw, high-dimensional states, HIQL introduces a latent encoder $\phi(\cdot)$ and defines a value function over these representations:
+\begin{equation}
+    V(s, \phi(g))
+\end{equation}
+\textit{(Note: In practice, HIQL often concatenates the goal and the current state into the representation function as $\phi([g, s])$ to provide the low-level policy with better contextualized relative information).}
+
+The hierarchy operates across a temporal offset of $k$ steps. The high-level policy, conditioned on the current state $s_t$ and the ultimate goal $g$, predicts a latent representation of a $k$-step future subgoal $z_{t+k} = \phi(s_{t+k})$:
+\begin{equation}
+    z_{t+k} \sim \pi^h(z_{t+k} \mid s_t, g)
+\end{equation}
+
+The low-level policy then takes this latent subgoal representation as input to produce primitive actions:
+\begin{equation}
+    a_t \sim \pi^l(a_t \mid s_t, z_{t+k})
+\end{equation}
+
+Both levels are extracted from the shared value function using an Advantage-Weighted Regression (AWR) style objective, avoiding explicit maximization over out-of-distribution actions. The high-level policy optimizes for subgoals that maximize the value difference towards the final goal, with its advantage approximated as $A^h \approx V(s_{t+k}, g) - V(s_t, g)$. The low-level policy optimizes for actions that successfully reach the nearby subgoal, utilizing the advantage $A^l \approx V(s_{t+1}, s_{t+k}) - V(s_t, s_{t+k})$.
+
+This formulation yields a significant practical advantage: because the high-level policy effectively treats states as actions and predicts future subgoals, neither the value function nor the high-level policy requires action labels. They can be trained entirely on passive, action-free state trajectories. Only the low-level policy requires action-labeled data to ground the representations into environmental controls, significantly improving data efficiency and scalability in offline settings.
+
+\section{World Models}
+
+World models are a class of model-based reinforcement learning approaches in which an agent learns a model of its environment and uses this model to plan, reason, or optimise behaviour without relying solely on real-world interaction. Instead of treating the environment as a black box, the agent learns an internal representation of environment dynamics and rewards, enabling decision making through simulated or imagined trajectories. This paradigm was popularised by Ha and Schmidhuber, who demonstrated that agents could learn a latent dynamics model and train policies entirely within a learned “dream” environment \cite{ha2018worldmodels}.
+
+\subsection{Learning Latent Environment Dynamics}
+TODO: Add references
+A world model typically decomposes the problem into three components: a perceptual encoder, a dynamics model, and a controller or policy. Given high-dimensional observations $o_t$ (e.g.\ image frames), an encoder maps observations into a latent state
+\[
+z_t = f_\phi(o_t),
+\]
+where $z_t$ captures the features of the environment necessary for prediction and control. This compression reduces the dimensionality of the modelling problem and filters out irrelevant visual details.
+
+The latent dynamics model predicts how the environment evolves under actions. Given the current latent state $z_t$ and action $a_t$, the model estimates a distribution over the next latent state:
+\[
+p_\theta(z_{t+1} \mid z_t, a_t).
+\]
+In early world models, this transition function is parameterised by a recurrent neural network (RNN) with stochastic outputs. The recurrent hidden state $h_t$ summarises past information, creating transitions of the form
+\[
+p_\theta(z_{t+1} \mid z_t, a_t, h_t),
+\qquad
+h_{t+1} = g_\theta(h_t, z_t, a_t).
+\]
+This formulation allows the model to capture both stochasticity and temporal dependencies in the environment.
+
+Action selection is handled by a controller or policy $\pi_\psi(a_t \mid z_t, h_t)$, which is deliberately kept lightweight to encourage the world model to handle most of the complexity. In the original formulation, the controller is a linear mapping
+\[
+a_t = W_c [z_t, h_t] + b_c,
+\]
+with parameters optimised to maximise cumulative reward, often using optimisation methods such as evolutionary strategies. This separation highlights a key principle of world models: intelligence is concentrated in the learned dynamics, while control remains simple.
+
+While this formulation demonstrated the feasibility of learning and planning in latent spaces, modern approaches have significantly evolved. Contemporary world models replace recurrent architectures with Transformer-based sequence models, which are better suited to capturing long-range temporal dependencies and scaling to large datasets \cite{ha2018worldmodels, hafner2020dreamer}. Similarly, simple linear controllers are replaced with powerful reinforcement learning algorithms such as Soft Actor-Critic (SAC) or advantage-weighted regression methods, enabling more expressive and adaptive policies. This shift reflects a broader trend: rather than relying on handcrafted simplicity, modern systems leverage high-capacity models for both dynamics and control.
+
+The main motivation for operating in latent space is efficiency. Modelling directly in pixel space is computationally expensive and forces the model to reconstruct visually irrelevant details (e.g.\ textures or lighting variations) that are not important for control. By contrast, latent representations focus on task-relevant structure, enabling more efficient learning, better generalisation, and more stable long-horizon prediction.
+
+\subsection{Joint-Embedding Predictive Architectures}
+
+Traditional world models, particularly those based on variational autoencoders or latent generative models, aim to reconstruct observations at the pixel level while learning dynamics \cite{hafner2019planet}. While effective, this objective is often unnecessarily complex: reconstructing every pixel requires modelling high-frequency visual details that are irrelevant for decision-making.
+
+Joint-Embedding Predictive Architectures (JEPAs) propose a fundamentally different approach. Instead of reconstructing observations, JEPA models learn to predict future latent representations directly. Given an encoded state $z_t$, the model predicts a future embedding $z_{t+1}$ (or further into the future), focusing only on the abstract features necessary for downstream tasks. This avoids the overhead of pixel-level reconstruction and shifts the learning objective toward capturing semantic and dynamical structure.
+
+However, this formulation introduces a critical challenge: representation collapse. If the model is trained solely to minimise the distance between predicted and target embeddings, it can trivially satisfy the objective by mapping all inputs to a constant vector. In this degenerate solution, predictions are always correct, but the representation carries no useful information.
+
+Standard JEPA-style methods address this issue through architectural and optimisation tricks, such as using exponential moving average (EMA) target networks or applying stop-gradient operations to prevent collapse. While effective, these techniques introduce additional complexity and can make training brittle.
+
+\subsection{Latent-Environment World Models}
+
+Latent-Environment World Models (LeWM) provide a stable and scalable instantiation of the JEPA paradigm, enabling end-to-end learning directly from high-dimensional observations without relying on EMA targets or stop-gradient heuristics. Instead, LeWM achieves stability through explicit regularisation of the latent space.
+
+The architecture consists of two primary components. First, a high-capacity encoder (a Vision Transformer) maps observations to latent representations:
+\[
+z_t = \text{enc}_\theta(o_t).
+\]
+Second, a Transformer-based predictor models the latent dynamics:
+\[
+\hat{z}_{t+1} = \text{pred}_\phi(z_t, a_t).
+\]
+
+The model is trained using a simple prediction objective, encouraging the predicted latent state to match the encoded next state:
+\[
+\mathcal{L}_{\text{pred}} = \|\hat{z}_{t+1} - z_{t+1}\|_2^2.
+\]
+
+To prevent representation collapse, LeWM introduces the Sketched-Isotropic-Gaussian Regularizer (SIGReg), which enforces that the distribution of latent embeddings matches an isotropic Gaussian. This promotes diversity and prevents degenerate solutions by ensuring that different inputs map to distinct regions of the latent space. The full training objective is therefore:
+\[
+\mathcal{L}_{\text{LeWM}} = \mathcal{L}_{\text{pred}} + \lambda \, \text{SIGReg}(Z).
+\]
+
+A crucial consequence of this formulation is the geometric structure it imposes on the latent space. Because the embeddings are regularised to follow an isotropic Gaussian distribution, and the dynamics model is trained using an $\ell_2$ prediction loss, Euclidean distances in latent space become semantically meaningful. In particular, the distance between two latent states reflects the degree of physical or dynamical separation between the corresponding observations.
+
+This property provides a direct justification for using latent distances as a reward signal in goal-conditioned settings. Specifically, defining rewards of the form
+\[
+r = -\| z_{\text{next}} - z_{\text{subgoal}} \|_2
+\]
+encourages the agent to minimise distance in a space where geometry aligns with environment dynamics. This ``geometric consistency'' forms the critical link between latent world modelling and downstream reinforcement learning, enabling dense and informative reward signals even in environments with sparse or undefined external rewards.
+
+
+\section{Action Spaces and Generation}
+TODO: fill in with q-chunking, flow policies etc.
+
+\section{Experimental Environment and Benchmarks}
+
+\subsection{Physics Simulation and MuJoCo}
+
+Reinforcement learning for robotics is fundamentally constrained by the cost and risk of real-world data collection. Physical experiments are slow, expensive, and often unsafe, particularly during early stages of learning when policies are highly exploratory. As a result, high-fidelity simulation has become the standard paradigm for developing and evaluating continuous control algorithms.
+
+MuJoCo (Multi-Joint dynamics with Contact) is widely regarded as the gold standard physics engine for this purpose \cite{MUJOCO}. It provides accurate and efficient simulation of rigid body dynamics, supporting continuous control inputs such as joint torques, as well as complex contact interactions including friction and collisions. Crucially, MuJoCo enables fast simulation at scale, allowing agents to collect large amounts of data that would be infeasible in real-world settings.
+
+However, this realism comes at a cost: MuJoCo environments operate in high-dimensional continuous state and action spaces. Even moderately complex robotic systems involve multiple degrees of freedom, leading to an exponential increase in the size of the action space. This curse of dimensionality poses significant challenges for standard RL algorithms.
+
+\subsection{The Challenge of Robotic Manipulation}
+
+Building on this simulation framework, robotic manipulation tasks introduce a set of additional challenges that make them particularly demanding benchmarks for reinforcement learning. Tasks such as object pushing, reaching, or pick-and-place require precise coordination across multiple joints, often resulting in high-dimensional action spaces. For example, controlling a robotic arm may involve 5 or more degrees of freedom, each of which must be optimised simultaneously.
+
+A key difficulty arises from contact-rich dynamics. Unlike simple locomotion tasks, manipulation involves interactions with external objects, where small errors in force or positioning can lead to highly nonlinear and unpredictable outcomes. Modelling and controlling these interactions is inherently challenging, especially in the absence of dense reward signals.
+
+Furthermore, many manipulation tasks are long-horizon in nature. Successfully completing a task such as pushing an object to a target location or picking and placing a cube requires executing a sequence of coordinated actions over hundreds of time steps. Errors accumulate over time, and a single failure can invalidate the entire trajectory. This makes temporal credit assignment particularly difficult and motivates the use of hierarchical methods, such as HIQL, which decompose long-horizon objectives into sequences of intermediate subgoals.
+
+In recent work, environments such as Push-T have emerged as standard benchmarks for evaluating visuomotor policies in manipulation settings \cite{chi2023diffusion}. These tasks highlight the importance of learning structured, multi-step behaviours and have driven the development of generative policy representations, including diffusion and flow-based approaches for modelling high-dimensional action sequences.
+
+\subsection{The OGBench Framework}
+
+To evaluate performance in this setting, we adopt the OGBench framework, a benchmark suite specifically designed for offline goal-conditioned reinforcement learning \cite{ogbench_park2025}. Traditional offline RL benchmarks, such as D4RL \cite{fu2020d4rl}, focus primarily on task-conditioned settings where the objective is to maximise a fixed reward function (e.g.\ locomotion speed). While useful, these benchmarks do not capture the compositional and generalisation challenges inherent in goal-conditioned tasks.
+
+OGBench addresses this limitation by constructing datasets and evaluation protocols tailored to goal-reaching. Instead of optimising a single objective, agents are trained to reach a wide range of target states sampled from the dataset. Offline data is typically generated using a mixture of exploratory or pseudo-expert policies, resulting in diverse but sub-optimal trajectories. During evaluation, goals are often sampled by selecting a future state from the same trajectory, requiring the agent to ``stitch together'' behaviours observed in the dataset.
+
+This formulation places a strong emphasis on generalisation and compositional reasoning, as the agent must infer how to reach novel goals by recombining previously observed transitions. Importantly, the dataset structure aligns closely with hindsight relabeling strategies, enabling direct integration with methods such as HER.
+
+In our implementation, we leverage the HGCDataset structure provided by OGBench, which is specifically designed for goal-conditioned learning. This allows seamless incorporation of hindsight goal relabeling and ensures consistency between training and evaluation protocols, forming a direct bridge between the offline dataset and the hierarchical, latent-space methods developed in this work.
+
+\section{Related Work}
+
+
+
+
+
+
+
+
+
+% \subsection{Scalable World Models}
+
+% Subsequent work has significantly extended this framework. While early approaches relied on RNNs (such as the RSSM used in previous Dreamer iterations \cite{hafner2020dreamer}), recent advancements {DreamerV4 have transitioned to scalable transformer architectures \cite{hafner2025dreamerv4}. Rather than predicting the next latent state directly, DreamerV4 formulates world modelling as a continuous-time generative process trained using flow matching objectives.
+
+% In this formulation, the model learns a vector field $f_\theta(x_\tau, \tau)$ that predicts the velocity required to transform a noisy latent state $x_\tau$ into clean data $x_1$. Training minimises the flow matching loss
+% \[
+% \mathcal{L}(\theta) = \mathbb{E}\big[\| f_\theta(x_\tau, \tau) - (x_1 - x_0) \|^2\big],
+% \]
+% where $x_0$ is noise, $x_1$ is the target latent trajectory, and $\tau \in [0,1]$ controls the corruption level. This approach enables stable long-horizon prediction and supports interactive rollouts with only a small number of inference steps, while maintaining temporal consistency.
+
+% An advantage of world models is the ability to perform policy optimisation in imagination. Instead of collecting real trajectories, the agent samples imagined rollouts from the learned dynamics model and optimises its policy using predicted rewards. In Dreamer-style methods, gradients are back-propagated through imagined trajectories, allowing the policy and value functions to be updated efficiently. Long-term returns are estimated using $\lambda$-returns:
+% \[
+% R_t^\lambda = r_t + \gamma c_t \big((1 - \lambda) v_t + \lambda R_{t+1}^\lambda\big),
+% \]
+% where $r_t$ is the predicted reward, $v_t$ is the value estimate, and $c_t$ is a continuation signal. This allows the agent to reason beyond the finite imagination horizon.
+
+% Policy updates in DreamerV4 employ Preference Model Policy Optimisation (PMPO), which stabilises learning across tasks with heterogeneous reward scales by separating updates based on the sign of the advantage. Positive and negative advantages are treated differently, improving robustness in diverse environments.

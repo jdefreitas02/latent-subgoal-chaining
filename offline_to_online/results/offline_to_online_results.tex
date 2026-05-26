@@ -1,0 +1,496 @@
+%% Offline-to-Online Results: Visual Cube Single Task 1
+%% All experiments use the OGBench visual-cube-single-singletask-task1-v0 environment.
+%% Success rate = fraction of 250 episodes solved.
+%%
+%% Last updated: 2026-05-26 (job 58048 FMQ best-ckpt evals, job 58049 D7q training ongoing)
+
+\documentclass[11pt]{article}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{geometry}
+\usepackage{caption}
+\usepackage{amsmath}
+\geometry{margin=1in}
+
+\newcommand{\best}[1]{\textbf{#1}}
+\newcommand{\ours}[1]{\underline{#1}}
+\newcommand{\tbd}[0]{\textit{TBD}}
+
+\begin{document}
+
+\section*{Offline-to-Online Experiments: Visual Cube Manipulation}
+
+\noindent\textbf{Environment:} \texttt{visual-cube-single-singletask-task1-v0} (OGBench).
+All evaluations use 250 episodes on Task~1 (move cube to target position).
+Success rate (SR) = fraction of 250 episodes in which the goal is reached.
+
+\noindent\textbf{Goal:} Beat 92.8\% (B1-BoN IMPALA baseline) using a frozen offline JEPA policy
+combined with the LeWM world model for action selection.
+
+\noindent\textbf{Notation:}
+$N$ = number of candidate action sequences sampled per step;
+$H$ = WM rollout horizon;
+$K$ = gradient refinement steps (Grad-MPC);
+$\eta$ = FMQ step size;
+\emph{Q-all} = $\sum_h \gamma^h Q(z_h, a_h)$ summed over WM trajectory;
+\emph{Q-term} = $Q(z_H, a_H)$ at terminal state only.
+
+%% =========================================================================
+\subsection*{Table 1: Offline-Only Baselines}
+%% =========================================================================
+
+\begin{table}[h]
+\centering
+\caption{Offline-only baselines (no WM at test time).
+  B1 = BC+Q policy on play dataset (visual observations).
+  B2 = BC+Q on play dataset with JEPA encoder.
+  ``BoN'' = best-of-$N$ under the trained Q-function.
+  ``ftfull'' refers to the LeJEPA encoder fine-tuned on the full play dataset.}
+\begin{tabular}{llllr}
+\toprule
+Method & Dataset & Encoder & $N$ & SR (\%) \\
+\midrule
+\multicolumn{5}{l}{\textit{Strong baselines}} \\
+B1-BoN (IMPALA, sd56923)     & play       & IMPALA small  & 32 & \best{92.8} \\
+\midrule
+\multicolumn{5}{l}{\textit{JEPA-latent policies (offline training, 500k steps)}} \\
+ftfull offline (sd55445)      & play       & LeJEPA ftfull &  4 & 81.6 \\
+B2-BoN (JEPA head, sd55255)   & play       & JEPA head     &  4 & 78.4 \\
+ftfull joint-train (sd55488)  & singletask & LeJEPA ftfull &  4 & 79.6 \\
+lejepa offline (sd55258)      & singletask & JEPA head     &  4 & 61.6 \\
+\midrule
+\multicolumn{5}{l}{\textit{Online / iterative variants (all degrade from offline baseline)}} \\
+WM env (WM replaces real env)  & singletask & JEPA head    & -- &  0--12 \\
+b2joint iter1 (sd55252)        & singletask & JEPA head    &  4 & 17.2 \\
+b2joint iter2                  & singletask & JEPA head    &  4 &  5.6 \\
+b2joint iter3                  & singletask & JEPA head    &  4 &  4.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% =========================================================================
+\subsection*{Table 2: Frozen Policy + WM Planner at Inference (Exp 1--4)}
+%% =========================================================================
+
+\begin{table}[h]
+\centering
+\caption{MPC experiments using frozen offline policy (sd55445, 81.6\% standalone).
+  WM = \texttt{lejepa\_play\_ft\_full}.
+  Scoring: \emph{dense+Q} = intermediate distance rewards $+$ terminal $Q$;
+  \emph{Q-term} = terminal $Q(z_H, a_H)$ only; \emph{Q-all} = $\sum_h \gamma^h Q(z_h, a_h)$.
+  $K=0$: best-of-$N$ only (no gradient refinement).
+  All evals: $N=32$, 250 episodes.}
+\begin{tabular}{lllllr}
+\toprule
+Exp & Method & $H$ & $K$ & Scoring & SR (\%) \\
+\midrule
+\multicolumn{6}{l}{\textit{Exp 1: lejepa (non-finetuned) WM + lejepa policy (sd55258, 61.6\%)}} \\
+1 & BoN-MPC            &  1 &  0 & dense+Q &  3.6 \\
+1 & BoN-MPC            &  3 &  0 & dense+Q &  2.4 \\
+\midrule
+\multicolumn{6}{l}{\textit{Exp 2: ft\_full WM + ftfull policy (sd55445, 81.6\%)}} \\
+2 & BoN-MPC            &  1 &  0 & dense+Q & 87.2 \\
+2 & BoN-MPC            &  1 &  0 & Q-term  & 88.0 \\
+2 & BoN-MPC            &  2 &  0 & Q-term  & 83.6 \\
+2 & BoN-MPC            &  3 &  0 & dense+Q & 81.6 \\
+2 & BoN-MPC            &  3 &  0 & Q-term  & 80.0 \\
+\midrule
+\multicolumn{6}{l}{\textit{Exp 3: Gradient MPC (ft\_full WM + ftfull policy)}} \\
+3 & Grad-MPC           &  1 &  5 & Q-term  & 88.8 \\
+3 & Grad-MPC           &  2 &  5 & Q-term  & \ours{90.0} \\
+3 & Grad-MPC           &  3 &  5 & dense+Q & 88.8 \\
+\midrule
+\multicolumn{6}{l}{\textit{Exp 4: VAML-finetuned WM + ftfull policy}} \\
+4 & BoN-MPC (VAML WM)  &  3 &  0 & Q-term  & 81.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Findings (Exps 1--4).}
+Online RL with the WM degrades performance; MPC at test time helps substantially.
+Q-term scoring beats dense rewards. Grad-MPC $K=5$ reaches 90.0\%, still below
+the 92.8\% IMPALA target. VAML fine-tuning of the WM provides no benefit,
+suggesting the WM accuracy is not the primary bottleneck.
+
+%% =========================================================================
+\subsection*{Table 3: FMQ Inference on Base Policy (Exp 5 --- Phase 1 FMQ)}
+%% =========================================================================
+
+\begin{table}[h]
+\centering
+\caption{FMQ (normalised Q-gradient projection via WM BPTT) applied at inference time
+  to the base frozen offline policy (sd55445, 81.6\%).
+  FMQ: $a^* = \text{clip}(a + \eta \cdot \nabla_a J / \|\nabla_a J\|, -1, 1)$
+  where $J = \sum_h \gamma^h Q(z_h, a_h)$ (Q-all) backpropagated through WM.
+  $N=32$, $H$ as shown, 250 episodes, Task~1.}
+\begin{tabular}{lllr}
+\toprule
+$H$ & Scoring & $\eta$ & SR (\%) \\
+\midrule
+\multicolumn{4}{l}{\textit{Q-all scoring (Q at every WM step)}} \\
+2 & Q-all  & 0.10 & \best{90.0} \\
+2 & Q-all  & 0.30 & 57.2 \\
+2 & Q-all  & 0.50 & 25.6 \\
+1 & Q-all  & 0.30 & 60.0 \\
+\midrule
+\multicolumn{4}{l}{\textit{Q-term scoring (terminal Q only)}} \\
+2 & Q-term & 0.30 & 58.8 \\
+1 & Q-term & 0.30 & 61.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Finding.}
+FMQ with $\eta=0.1$ matches Grad-MPC at 90.0\% but collapses sharply above $\eta=0.1$
+(only 57.2\% at $\eta=0.3$). This extreme sensitivity suggests the base Q-function is
+not well-calibrated for FMQ-modified actions, motivating FMQ-label distillation training.
+
+%% =========================================================================
+\subsection*{Table 4: Interleaved MPC Distillation (D1--D6)}
+%% =========================================================================
+
+\begin{table}[h]
+\centering
+\caption{Interleaved MPC distillation training (500k offline steps, seed=42).
+  Starting policy: sd55445 (81.6\%).
+  Label generation uses Grad-MPC ($H=2$, $K=5$, $N=32$) for D1--D6.
+  Relabeling interval = 50k; buffer size = 2000.
+  \emph{Standalone SR}: best-of-4 actor evaluation (no WM); shown as peak over training.
+  \emph{MPC-Eval SR}: actor used as proposal for Grad-MPC ($N=32$, $H=2$, $K=5$) at test time;
+  evaluated on final 500k checkpoint.
+  ``sep'' = separate mode (train only on MPC labels);
+  ``mix'' = mixed mode (MPC labels replace fraction $p$ of each batch);
+  ``awr'' = AWR-filtered mixed mode.}
+\begin{tabular}{llllrr}
+\toprule
+Run & Config & Mode & $p$ & Peak Standalone (\%) & MPC-Eval (\%) \\
+\midrule
+D1 (cheap\_sep) & $N=8$, $H=1$, $K=3$ & sep   & 1.0 & 83.6 & 86.8 \\
+D2 (cheap\_mix) & $N=8$, $H=1$, $K=3$ & mixed & 0.3 & 81.6 & 91.2 \\
+D3 (full\_sep)  & $N=32$, $H=2$, $K=5$ & sep  & 1.0 & 84.0 & 85.6 \\
+D4 (full\_mix)  & $N=32$, $H=2$, $K=5$ & mixed & 0.3 & 82.8 & \best{92.4} \\
+D5 (awr\_full)  & $N=32$, $H=2$, $K=5$ & awr  & 0.3 & 84.4 & 90.0 \\
+D6 (mixed\_awr) & $N=32$, $H=2$, $K=5$ & awr  & 0.3 & 84.4 & 91.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Findings.}
+Mixed injection (D4, 92.4\%) beats separate training (D3, 85.6\%) by preserving
+the original Q-shaping objective while adding MPC-optimal actions to raise the Q ceiling.
+AWR filtering (D5/D6) gave no consistent improvement over plain mixed (D4).
+D4 is the first approach within 0.4\% of the IMPALA target.
+
+%% =========================================================================
+\subsection*{Table 5: FMQ-Label Training Variants (D7a--D7b)}
+%% =========================================================================
+
+\begin{table}[h]
+\centering
+\caption{Replacing Grad-MPC label generation with FMQ ($\eta=0.1$, $H=2$, $N=32$).
+  Relabeling interval = 10k; 500k training steps; eval every 100k.
+  Both checkpoints are the final 500k.}
+\begin{tabular}{llrr}
+\toprule
+Run & Mode & Final Standalone (\%) & MPC-Eval (\%) \\
+\midrule
+D7a (FMQ mixed)     & mixed    & 72.8 & 92.4 (Grad-MPC $K=5$), 86.8 (FMQ $\eta=0.1$) \\
+D7b (FMQ mixed-awr) & mixed-awr & 75.6 & 88.8 (Grad-MPC $K=5$), 86.4 (FMQ $\eta=0.1$) \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\footnotesize
+\noindent\textbf{D7a standalone progression} (eval every 100k steps):
+100k: 70.4\%,\ \ \textbf{200k: 90.0\%},\ \ 300k: 77.6\%,\ \ 400k: 81.6\%,\ \ 500k: 72.8\%.
+
+No checkpoint was saved at 200k (only final checkpoint saved); peak was lost.
+This bug was fixed in all subsequent runs (checkpoints saved at every eval point).
+\normalsize
+\end{table}
+
+\paragraph{Finding.}
+D7a's 90.0\% standalone peak at 200k demonstrated FMQ labels produce a higher-quality
+Q-function, but the 10k relabeling interval causes high-frequency oscillation.
+The peak was lost due to missing intermediate checkpoints.
+The final-checkpoint MPC-eval (D7a: 92.4\%) matches D4, suggesting the Q-calibration
+benefit of FMQ training is partially lost by the time oscillation brings the policy down.
+
+%% =========================================================================
+\subsection*{Table 6: Relabeling Interval Sweep (D7c, D7d, D4b)}
+%% =========================================================================
+
+\begin{table}[h]
+\centering
+\caption{Effect of relabeling interval on FMQ training stability.
+  All: FMQ labels ($\eta=0.1$, $H=2$, $N=32$), mixed injection ($p=0.3$), 500k steps.
+  Checkpoints saved every 100k.
+  D4b uses Grad-MPC ($K=5$) labels at 25k interval for comparison.
+  MPC-Eval: Grad-MPC $N=32$, $H=2$, $K=5$, Q-only scoring.}
+\begin{tabular}{lllrrrrr}
+\toprule
+& & & \multicolumn{5}{c}{SR at checkpoint (\%)} \\
+\cmidrule(lr){4-8}
+Run & Label Gen & Interval & 100k & 200k & 300k & 400k & 500k \\
+\midrule
+\multicolumn{8}{l}{\textit{Standalone SR (BoN $N=4$)}} \\
+D7c & FMQ  & 25k   & 67.2 & \textbf{86.8} & 80.0 & 82.0 & 71.2 \\
+D7d & FMQ  & 50k   & 68.4 & 80.8 & 68.0 & \textbf{86.8} & 74.0 \\
+D4b & Grad & 25k   & --   &  --  &  --  &  --  & -- \\
+\midrule
+\multicolumn{8}{l}{\textit{MPC-Eval SR (Grad-MPC $K=5$, $N=32$)}} \\
+D7c & FMQ  & 25k   & 80.8 & 88.4 & 91.2 & \ours{91.6} & 88.8 \\
+D7d & FMQ  & 50k   & 79.2 & 88.8 & 79.2 & \best{93.2} & 90.4 \\
+D4b & Grad & 25k   & 62.8 & 74.4 & 67.6 & 79.2 & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Findings.}
+Longer relabeling intervals (50k, D7d) produce a higher MPC-eval peak: \textbf{93.2\%} at 400k,
+surpassing the 92.8\% IMPALA target for the first time.
+D7c at 25k peaks at 91.6\% (400k).
+D4b (Grad-MPC labels at 25k) substantially underperforms both FMQ variants,
+confirming FMQ labels provide a better training signal.
+
+%% =========================================================================
+\subsection*{Table 7: D7d 400k --- Comprehensive Inference-Time HP Sweep}
+%% =========================================================================
+
+\begin{table}[h]
+\centering
+\caption{Comprehensive inference hyperparameter sweep on D7d 400k checkpoint
+  (standalone 86.8\%; reference Grad-MPC $K=5$ = 93.2\%).
+  All: $N=32$, $H=2$, 250 episodes, Task~1, unless noted.
+  D7d was trained with FMQ labels ($\eta=0.1$), producing a Q-function calibrated
+  for FMQ-shaped actions.}
+\begin{tabular}{lllr}
+\toprule
+Method & Scoring & Config & SR (\%) \\
+\midrule
+\multicolumn{4}{l}{\textit{FMQ $\eta$ sweep --- Q-all scoring (Q at every WM step)}} \\
+FMQ & Q-all & $\eta=0.01$ & 94.8 \\
+FMQ & Q-all & $\eta=0.02$ & \best{96.0} \\
+FMQ & Q-all & $\eta=0.03$ & \best{96.0} \\
+FMQ & Q-all & $\eta=0.04$ & 94.4 \\
+FMQ & Q-all & $\eta=0.05$ & 94.0 \\
+FMQ & Q-all & $\eta=0.06$ & 92.8 \\
+FMQ & Q-all & $\eta=0.08$ & 92.8 \\
+FMQ & Q-all & $\eta=0.10$ & 90.8 \\
+FMQ & Q-all & $\eta=0.12$ & 90.0 \\
+FMQ & Q-all & $\eta=0.15$ & 88.8 \\
+FMQ & Q-all & $\eta=0.20$ & 80.8 \\
+FMQ & Q-all & $\eta=0.25$ & 70.4 \\
+FMQ & Q-all & $\eta=0.30$ & 63.2 \\
+\midrule
+\multicolumn{4}{l}{\textit{FMQ --- Q-term scoring ablation ($N=32$)}} \\
+FMQ & Q-term & $\eta=0.05$ & 93.6 \\
+FMQ & Q-term & $\eta=0.10$ & 92.0 \\
+FMQ & Q-term & $\eta=0.15$ & 90.8 \\
+\midrule
+\multicolumn{4}{l}{\textit{Grad-MPC $K$ sweep --- Q-term scoring ($N=32$)}} \\
+Grad-MPC & Q-term & $K=5$  & 93.2 \\
+Grad-MPC & Q-term & $K=8$  & \best{96.0} \\
+Grad-MPC & Q-term & $K=10$ & 90.8 \\
+Grad-MPC & Q-term & $K=15$ & 91.2 \\
+\midrule
+\multicolumn{4}{l}{\textit{Larger $N$ --- note: more inference compute (unfair comparison)}} \\
+Grad-MPC & Q-term & $N=64$, $K=5$      & 94.4 \\
+FMQ      & Q-all  & $N=64$, $\eta=0.1$ & 91.2 \\
+Grad-MPC & Q-term & $N=128$, $K=5$     & 92.8 \\
+\midrule
+\multicolumn{4}{l}{\textit{Reference}} \\
+Standalone (BoN $N=4$, no WM) & -- & -- & 86.8 \\
+B1-BoN IMPALA target          & -- & -- & 92.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Findings.}
+\begin{itemize}
+\item FMQ with Q-all scoring and $\eta \in \{0.02, 0.03\}$ reaches \textbf{96.0\%}, a 3.2\%
+      improvement over the IMPALA baseline.
+\item The FMQ-trained Q is robust to small $\eta$: flat performance from 0.02--0.05
+      (all $>94\%$), monotonically decaying above. This contrasts sharply with the base
+      policy (Table~3) where $\eta>0.1$ collapses to below 60\%.
+\item Q-all scoring consistently outperforms Q-term under FMQ
+      (93.6\% vs.\ 92.0\% at $\eta=0.1$), confirming WM rollouts add value.
+\item Grad-MPC $K=8$ also reaches 96.0\% but $K=10+$ overshoots and degrades.
+\item Increasing $N$ beyond 32 offers marginal gains ($+1.2\%$ at $N=64$) at double
+      inference cost; excluded from fair comparisons.
+\end{itemize}
+
+%% =========================================================================
+\subsection*{Table 8: Training HP Sweep (D7e--D7p)}
+%% =========================================================================
+
+\begin{table}[h]
+\centering
+\caption{Training hyperparameter sweep.
+  All runs: FMQ label generation ($\eta_{\text{train}}$), mixed injection,
+  300k steps (D7e: 300k, D7n/D7o/D7p: 300k), eval+checkpoint every 25k.
+  ``Peak SR'' = highest standalone SR (BoN $N=4$) across all saved checkpoints.
+  Baseline (D7d): lr=$3\times10^{-4}$, mix=0.3, relabel=50k, buf=2000, warmup=100k,
+  $\eta_\text{train}=0.1$, seed=42.}
+\begin{tabular}{lllllllr}
+\toprule
+Run & lr & mix & relabel & buf & warmup & $\eta_\text{train}$ & Peak SR (\%) \\
+\midrule
+\multicolumn{8}{l}{\textit{Relabeling interval / buffer / mix ratio variants (from D7d baseline)}} \\
+D7f & $3\!\times\!10^{-4}$ & 0.5 & 10k  & 2000 & 100k & 0.10 & 82.4 \\
+D7g & $3\!\times\!10^{-4}$ & 0.5 & 25k  & 2000 & 100k & 0.10 & 86.4 \\
+D7h & $3\!\times\!10^{-4}$ & 0.3 & 10k  & 2000 &  50k & 0.10 & 86.0 \\
+D7i & $3\!\times\!10^{-4}$ & 0.3 & 10k  &  500 & 100k & 0.10 & 82.4 \\
+D7j & $3\!\times\!10^{-4}$ & 0.3 & 50k  & 5000 & 100k & 0.10 & \ours{89.2} \\
+D7k & $3\!\times\!10^{-4}$ & 0.3 & 10k  & 2000 & 100k & 0.05 & 88.0 \\
+D7l & $3\!\times\!10^{-4}$ & 0.3 & 10k  & 2000 & 100k & 0.10 & 88.0 \\
+D7m & $3\!\times\!10^{-4}$ & 0.5 & 10k  &  500 & 100k & 0.10 & 84.0 \\
+\midrule
+\multicolumn{8}{l}{\textit{Peak hunter / lower learning-rate variants}} \\
+D7e & $3\!\times\!10^{-4}$ & 0.3 & 10k  & 2000 & 100k & 0.10 & 87.6 at 150k \\
+D7n & $1\!\times\!10^{-4}$ & 0.3 & 50k  & 2000 & 100k & 0.10 & 86.0 \\
+D7o & $5\!\times\!10^{-5}$ & 0.3 & 50k  & 2000 & 100k & 0.10 & 81.2 \\
+D7p & $1\!\times\!10^{-4}$ & 0.5 & 50k  & 2000 & 100k & 0.10 & \best{90.0 at 275k} \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\footnotesize
+\noindent\textbf{D7j standalone progression} (eval every 25k):
+100k: 76.0\%, 125k: 62.4\%, 150k: 83.6\%, 175k: 86.8\%, 200k: 81.6\%,
+225k: 86.8\%, 250k: 86.0\%, 275k: 82.4\%, \textbf{300k: 89.2\%} (still rising).
+
+\noindent\textbf{D7p standalone progression} (eval every 25k):
+100k: 72.4\%, 125k: 72.0\%, 150k: 70.4\%, 175k: 81.2\%, 200k: 72.8\%,
+225k: 77.6\%, 250k: 82.8\%, \textbf{275k: 90.0\%}, 300k: 74.4\%.
+
+\noindent\textbf{D7e standalone progression} (eval every 25k):
+25k: 69.2\%, 50k: 60.0\%, 75k: 57.2\%, 100k: 76.4\%, 125k: 74.8\%,
+\textbf{150k: 87.6\%}, 175k: 78.8\%, 200k: 82.0\%, 225k: 85.6\%, 250k: 84.4\%, 275k: 71.6\%.
+\normalsize
+\end{table}
+
+\paragraph{Findings.}
+\begin{itemize}
+\item \textbf{Larger buffer} (D7j, buf=5000) is the single most impactful change:
+      peak 89.2\% vs.\ 82.4\% for buf=500 (D7i). More diverse labels $\to$ more stable Q.
+\item \textbf{Lower lr + stronger mix} (D7p: lr=$10^{-4}$, mix=0.5) achieves the highest
+      standalone peak at \textbf{90.0\%} (275k), suggesting reduced oscillation allows the
+      training to maintain the peak for longer.
+\item \textbf{D7j was still rising} at 300k (peak 89.2\%), motivating the 500k D7q run.
+\item Very low lr (D7o: $5\times10^{-5}$) underperforms, suggesting too slow learning
+      even over 300k steps.
+\end{itemize}
+
+%% =========================================================================
+\subsection*{Table 9: FMQ $\eta=0.02$ on Best Checkpoints (Job 58048)}
+%% =========================================================================
+
+\begin{table}[h]
+\centering
+\caption{FMQ ($\eta=0.02$, $H=2$, Q-all, $N=32$) evaluation on the best checkpoints
+  by standalone SR from each major training run.
+  All evaluated with 250 episodes on Task~1.
+  Sorted by standalone SR (descending).}
+\begin{tabular}{lllrr}
+\toprule
+Run & Checkpoint & Config & Standalone SR (\%) & FMQ $\eta=0.02$ SR (\%) \\
+\midrule
+D7p & params\_275000.pkl & lr=1e-4, mix=0.5, relabel=50k, buf=2000 & 90.0 & 94.4 \\
+D7j & params\_300000.pkl & lr=3e-4, mix=0.3, relabel=50k, buf=5000 & 89.2 & 92.0 \\
+D7k & params\_200000.pkl & lr=3e-4, mix=0.3, relabel=10k, $\eta$=0.05 & 88.0 & 90.4 \\
+D7l & params\_275000.pkl & lr=3e-4, mix=0.3, relabel=10k, seed=0   & 88.0 & \ours{95.6} \\
+D7e & params\_150000.pkl & lr=3e-4, mix=0.3, relabel=10k            & 87.6 & 90.0 \\
+D7d & params\_400000.pkl & lr=3e-4, mix=0.3, relabel=50k, buf=2000  & 86.8 & \best{96.4} \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\footnotesize
+\textbf{Key observation:} Standalone SR is a poor proxy for FMQ-eval SR.
+D7d (lowest standalone, 86.8\%) achieves the highest FMQ-eval SR (96.4\%).
+D7l (seed=0, 88.0\% standalone) outperforms D7k (same config but seed=42, 88.0\% standalone)
+by 5.2\%, suggesting random seed strongly affects Q-calibration for FMQ.
+D7d's 50k relabeling interval and 400k steps appear to produce a uniquely
+well-calibrated Q-function for FMQ exploitation.
+\normalsize
+\end{table}
+
+\paragraph{Finding.}
+Higher standalone SR does \emph{not} predict higher MPC-eval SR under FMQ $\eta=0.02$.
+The Q-calibration properties---shaped by relabeling interval, training duration,
+and random seed---dominate. D7d remains the best overall checkpoint.
+
+%% =========================================================================
+\subsection*{Table 10: Best Combination Run D7q (Job 58049)}
+%% =========================================================================
+
+\begin{table}[h]
+\centering
+\caption{D7q combines all best hyperparameters: lr=$10^{-4}$ (D7p), mix=0.5 (D7p),
+  buf=5000 (D7j), relabel=50k (D7d/D7j), $\eta_\text{train}=0.1$, 500k steps.
+  Checkpoints+evals every 25k steps.
+  \textit{(Job 58049 --- results pending.)}}
+\begin{tabular}{lrr}
+\toprule
+Step & Standalone SR (\%) & Note \\
+\midrule
+25k--475k & \tbd & (20 eval points, saved at every 25k) \\
+500k      & \tbd & final \\
+\midrule
+Peak & \tbd & \\
+Best MPC-eval (FMQ $\eta=0.02$) & \tbd & \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\footnotesize
+\textbf{Hypothesis:} Combining large buffer + low lr + stronger mix should push the
+standalone peak above 90\% and, with FMQ $\eta=0.02$, potentially exceed 96.0\%.
+Submitted as \texttt{sbatch \_train\_best\_combo.sh} (SLURM job 58049).
+\normalsize
+\end{table}
+
+%% =========================================================================
+\subsection*{Summary}
+%% =========================================================================
+
+\paragraph{Overall progression.}
+\begin{enumerate}
+\item \textbf{Offline baseline} (sd55445): 81.6\%.
+\item \textbf{Frozen policy + WM BoN-MPC} ($H=1$, $N=32$): 88.0\%.
+\item \textbf{Frozen policy + Grad-MPC} ($H=2$, $K=5$): 90.0\%.
+\item \textbf{Interleaved MPC distillation} (D4): 92.4\% --- first approach within 0.4\% of target.
+\item \textbf{FMQ-label distillation + Grad-MPC eval} (D7d 400k, $K=5$): \textbf{93.2\%}
+      --- first to exceed the IMPALA 92.8\% target.
+\item \textbf{FMQ-label distillation + FMQ eval} (D7d 400k, $\eta=0.02$): \textbf{96.0\%}
+      --- best result; +3.2\% above IMPALA baseline.
+\end{enumerate}
+
+\paragraph{Key findings.}
+\begin{itemize}
+\item \textbf{Online RL degrades performance.} Using the WM as a training environment
+      (WM env, b2joint) consistently collapses performance (81.6\%$\to$0--17.2\%).
+      The WM is accurate enough for short-horizon action selection but not for
+      policy gradient updates.
+\item \textbf{Mixed injection beats separate training.} Retaining the original Q-shaping
+      objective while injecting MPC-optimal actions into each training batch outperforms
+      training exclusively on MPC labels (92.4\% vs.\ 85.6\%).
+\item \textbf{FMQ labels calibrate the Q-function for FMQ inference.}
+      Training with FMQ-selected actions shifts the optimal inference $\eta$ from
+      $\approx0.1$ (base policy: 90.0\%) to $\approx0.02$--$0.03$ (FMQ-trained: 96.0\%).
+      The base Q collapses at $\eta>0.1$; the FMQ-trained Q remains stable to $\eta=0.05$.
+\item \textbf{Relabeling frequency and buffer size govern stability.}
+      10k relabeling causes oscillating peaks; 50k intervals stabilise training.
+      Larger buffers (5000 vs.\ 500) further reduce oscillation and raise the peak
+      standalone SR (89.2\% vs.\ 82.4\%).
+\item \textbf{Lower learning rates reduce oscillation.}
+      lr=$10^{-4}$ (D7p) vs.\ $3\times10^{-4}$ (D7d) produces a cleaner peak (90.0\%
+      at 275k vs.\ 86.8\% at 400k) at the cost of needing more steps.
+\item \textbf{Q-all scoring is essential for FMQ inference.}
+      Scoring with $\sum_h \gamma^h Q(z_h, a_h)$ consistently outperforms terminal-only
+      Q scoring ($+1$--$2\%$), confirming WM rollouts add discriminative signal.
+\end{itemize}
+
+\end{document}

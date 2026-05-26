@@ -1,0 +1,120 @@
+\appendix
+\chapter{First Appendix}
+
+\section{Offline-to-Online Hyperparameter Sweeps}
+\label{app:oo-sweeps}
+
+The tables below collect the full hyperparameter sweeps referenced in
+Chapter~\ref{chap:mpc-distill}. All entries use the same environment
+(\texttt{visual-cube-single-singletask-task1-v0}, $250$ episodes per
+evaluation) and the same offline policy starting point
+(\texttt{sd55445}, $81.6\%$).
+
+\begin{table}[h]
+\centering
+\caption{FMQ-label early variants (D7a, D7b) at a $10$k relabeling
+   interval. The high-frequency relabeling causes oscillation: D7a
+   reaches $90.0\%$ standalone at $200$k but the checkpoint was not
+   saved, and the final-checkpoint MPC-eval matches the D4 Grad-MPC
+   baseline.}
+\label{tab:app-d7ab}
+\begin{tabular}{l l r l}
+\toprule
+Run & Mode & Final SA (\%) & MPC-eval (\%) \\
+\midrule
+D7a (FMQ mixed)     & mixed     & 72.8 & 92.4 (Grad-MPC $K{=}5$); 86.8 (FMQ $\eta{=}0.1$) \\
+D7b (FMQ mixed-awr) & mixed-awr & 75.6 & 88.8 (Grad-MPC $K{=}5$); 86.4 (FMQ $\eta{=}0.1$) \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{D7a standalone progression} (eval every $100$k steps):
+$100$k:~$70.4\%$, \textbf{$200$k:~$90.0\%$}, $300$k:~$77.6\%$,
+$400$k:~$81.6\%$, $500$k:~$72.8\%$. The $200$k peak was lost due to
+missing intermediate checkpoints; this bug was fixed in all subsequent
+runs (D7c onwards).
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Training hyperparameter sweep (D7e--D7p). All runs use FMQ
+   label generation at $\eta_{\text{train}}$, mixed injection,
+   eval+checkpoint every $25$k. Baseline (D7d): $\mathrm{lr}{=}3\times
+   10^{-4}$, $\mathrm{mix}{=}0.3$, $\mathrm{relabel}{=}50$k,
+   $\mathrm{buf}{=}2000$, $\mathrm{warmup}{=}100$k,
+   $\eta_{\text{train}}{=}0.1$, seed $42$. ``Peak SA'' is the highest
+   standalone success rate ($\mathrm{BoN}\,N{=}4$) across all saved
+   checkpoints. D7e/D7n/D7o/D7p were run for $300$k steps; the rest are
+   $500$k.}
+\label{tab:app-d7-train-sweep}
+\begin{tabular}{l l l l l l l l}
+\toprule
+Run & lr & mix & relabel & buf & warmup & $\eta_{\text{train}}$ & Peak SA (\%) \\
+\midrule
+\multicolumn{8}{l}{\emph{Relabeling interval / buffer / mix ratio variants}} \\
+D7f & $3{\times}10^{-4}$ & 0.5 & 10k & 2000 & 100k & 0.10 & 82.4 \\
+D7g & $3{\times}10^{-4}$ & 0.5 & 25k & 2000 & 100k & 0.10 & 86.4 \\
+D7h & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 &  50k & 0.10 & 86.0 \\
+D7i & $3{\times}10^{-4}$ & 0.3 & 10k &  500 & 100k & 0.10 & 82.4 \\
+D7j & $3{\times}10^{-4}$ & 0.3 & 50k & 5000 & 100k & 0.10 & 89.2 \\
+D7k & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 & 100k & 0.05 & 88.0 \\
+D7l & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 & 100k & 0.10 & 88.0 \\
+D7m & $3{\times}10^{-4}$ & 0.5 & 10k &  500 & 100k & 0.10 & 84.0 \\
+\midrule
+\multicolumn{8}{l}{\emph{Lower learning-rate variants}} \\
+D7e & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 & 100k & 0.10 & 87.6 (at 150k) \\
+D7n & $1{\times}10^{-4}$ & 0.3 & 50k & 2000 & 100k & 0.10 & 86.0 \\
+D7o & $5{\times}10^{-5}$ & 0.3 & 50k & 2000 & 100k & 0.10 & 81.2 \\
+D7p & $1{\times}10^{-4}$ & 0.5 & 50k & 2000 & 100k & 0.10 & \textbf{90.0 (at 275k)} \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{Key takeaways.} Buffer size has the largest single
+effect: D7j ($\mathrm{buf}{=}5000$, peak $89.2\%$) vs.\ D7i
+($\mathrm{buf}{=}500$, $82.4\%$) is a $+6.8\%$ absolute lift. A lower
+learning rate paired with a stronger mix ratio (D7p) produces the
+cleanest single peak ($90.0\%$ at $275$k), suggesting reduced
+oscillation lets the training maintain the peak. The very low learning
+rate $5\times 10^{-5}$ (D7o) underperforms: too slow even at $300$k.
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{FMQ ($\eta=0.02$, $H=2$, $J_{\text{Q-all}}$, $N=32$)
+   evaluation on the best-of-each-run standalone checkpoints. Pending
+   evaluations are marked ``--''.}
+\label{tab:app-d7-fmq002}
+\begin{tabular}{l l r r}
+\toprule
+Run & Checkpoint & Standalone SR (\%) & FMQ $\eta{=}0.02$ SR (\%) \\
+\midrule
+D7p & \texttt{params\_275000.pkl} & 90.0 & -- \\
+D7j & \texttt{params\_300000.pkl} & 89.2 & -- \\
+D7k & \texttt{params\_200000.pkl} & 88.0 & -- \\
+D7l & \texttt{params\_275000.pkl} & 88.0 & -- \\
+D7e & \texttt{params\_150000.pkl} & 87.6 & -- \\
+D7d & \texttt{params\_400000.pkl} & 86.8 & 96.0 (ref., Table~\ref{tab:mpc-fmq-distilled}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{D7q combined-best run, $500$k steps: $\mathrm{lr}{=}10^{-4}$
+   (from D7p), $\mathrm{mix}{=}0.5$ (D7p), $\mathrm{buf}{=}5000$
+   (D7j), $\mathrm{relabel}{=}50$k (D7d/D7j),
+   $\eta_{\text{train}}{=}0.1$. Pending at the time of writing.}
+\label{tab:app-d7q}
+\begin{tabular}{l r l}
+\toprule
+Step & Standalone SR (\%) & Note \\
+\midrule
+25k--475k & -- & ($20$ eval points, saved at every $25$k) \\
+500k      & -- & final \\
+\midrule
+Peak                            & -- & \\
+Best MPC-eval (FMQ $\eta=0.02$) & -- & \\
+\bottomrule
+\end{tabular}
+\end{table}

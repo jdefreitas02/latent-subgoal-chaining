@@ -1,0 +1,24 @@
+\chapter{Introduction}
+\section{Motivation}
+A defining trend in modern machine learning is the rise of general-purpose models trained using self-supervised objectives on large-scale, unlabelled datasets \cite{ogbench_park2025}. This paradigm has proven highly effective, largely because unannotated data is abundant and inexpensive to collect, enabling models to scale without the bottleneck of manual labeling. In contrast, reinforcement learning (RL) has traditionally relied on a very different paradigm: agents learn through interaction with an environment, guided by carefully designed, task-specific reward functions. This reliance on online interaction makes RL both computationally expensive and difficult to deploy safely in real-world settings such as robotics, where exploration can be costly or even dangerous.
+
+Offline reinforcement learning offers a promising alternative by learning entirely from previously collected datasets, avoiding the need for further interaction. Within this setting, goal-conditioned reinforcement learning (GCRL) provides a natural framework for learning general-purpose behaviours. The idea of learning to achieve multiple goals has long been studied in RL \cite{Kaelbling1993LearningTA}, and was later formalized through architectures such as Universal Value Function Approximators (UVFAs), which enable value functions to generalize across goals \cite{pmlr-v37-schaul15}. Offline GCRL builds on these ideas by training agents to reach arbitrary states using static datasets of past experience, bringing RL closer in spirit to the data-driven, self-supervised approaches that have driven progress in other areas of machine learning \cite{ogbench_park2025}.
+
+Despite its conceptual simplicity, learning to reach goals from offline data is challenging in practice. In long-horizon, continuous control tasks, reward signals are often sparse, making credit assignment difficult and limiting sample efficiency. Techniques such as Hindsight Experience Replay (HER) address this issue by relabeling trajectories with goals that were actually achieved, effectively turning failed attempts into useful training signals \cite{her}. This idea has inspired a broader view of goal-reaching as a form of supervised learning over relabeled data \cite{ghosh2020learningreachgoalsiterated}. However, offline learning introduces a fundamental challenge: distribution shift. When a learned policy deviates from the behavior policy that generated the dataset, it may encounter out-of-distribution states, leading to compounding errors in value estimation and policy learning.
+
+Model-based reinforcement learning provides a potential solution by learning a model of the environment dynamics. Such world models have been widely studied, particularly in high-dimensional and visual domains \cite{ha2018worldmodels, hafner2019planet}, where they enable agents to simulate future trajectories and plan using imagined rollouts \cite{hafner2020dreamer, hafner2025dreamerv4}. While these approaches have demonstrated strong performance, applying world models effectively in offline, long-horizon GCRL remains an open problem. In particular, it is unclear how to generate synthetic data that is both realistic enough to avoid compounding errors and diverse enough to support multi-step planning.
+
+\section{Contributions}
+
+In this work, we propose a novel approach to offline goal-conditioned reinforcement learning that leverages latent world models to generate synthetic experience, improving both robustness and sample efficiency. By operating entirely in a learned latent space, the method decouples representation learning from control, avoiding the complexity of pixel-based inputs. To address the challenges of long-horizon reasoning, we further introduce a hierarchical control structure.
+
+Specifically, our contributions are as follows:
+\begin{itemize}
+    \item Latent-Space Episodic Relabeling: We extend hindsight goal relabeling to operate in latent space, enabling dense reward signals to be extracted from sparse, offline datasets.
+    \item Imagination-Driven Data Augmentation: We use a learned latent world model to generate $k$-step synthetic trajectories, augmenting the dataset without additional environment interaction.
+    \item Hierarchical Offline Control: We introduce a two-level policy architecture in which a high-level planner proposes intermediate latent subgoals, and a low-level controller learns to achieve them, improving performance on long-horizon tasks.
+    \item High-Dimensional Action Modeling: We explore action-chunking strategies, including flow-based policies, to address the increased action dimensionality induced by multi-step latent predictions.
+\end{itemize}
+
+
+

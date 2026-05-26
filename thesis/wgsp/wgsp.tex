@@ -1,0 +1,883 @@
+% =====================================================================
+% wgsp.tex
+% World-Grounded Subgoal Planning for Offline Hierarchical RL.
+% Self-contained chapter: input from main.tex via \input{wgsp}.
+% Required packages (already in main.tex): amsmath, amssymb, booktabs,
+% graphicx, hyperref, algorithm, algpseudocode.
+% =====================================================================
+
+\chapter{World-Grounded Subgoal Planning (WGSP)}
+\label{ch:wgsp}
+
+\section{Motivation}
+\label{sec:wgsp:motivation}
+
+Hierarchical Implicit Q-Learning (HIQL) \cite{park2024hiqlofflinegoalconditionedrl}
+provides a principled framework for offline goal-conditioned control by
+decomposing behaviour into two levels: a high-level (HL) policy that proposes
+subgoals over a temporal horizon of $k$ steps, and a low-level (LL) policy that
+executes actions to reach these subgoals. Both policies are trained using
+advantage-weighted regression (AWR) \citep{awr,iql}, which reweights actions observed in an offline dataset according to their estimated value.
+
+A central strength of HIQL lies in its strict adherence to the support of the behaviour policy $\pi_\beta$. Because all updates are computed from dataset samples, the learned policy avoids querying out-of-distribution actions, thereby sidestepping the instability and overestimation issues that arise in standard off-policy $Q$-learning under distributional shift.
+
+However, this same property imposes a fundamental limitation. Since AWR can be interpreted as a weighted behavioural cloning procedure, both the HL and LL policies are ultimately constrained to reproduce combinations of behaviours already present in the dataset. This restriction is particularly pronounced at the high level. The HL policy is trained to predict subgoals of the form $\phi(z_t, z_{t+k})$, where $z_{t+k}$ is a \emph{future state observed in the dataset}. As a result, the distribution of subgoals is inherited directly from the data, limiting the agent's ability to propose novel or improved plans that go beyond demonstrated trajectories.
+
+This limitation becomes critical in long-horizon tasks, where optimal behaviour often requires composing or refining subgoals that are not explicitly observed. In such settings, the ability to \emph{reason about counterfactual futures}—to evaluate where a candidate subgoal would lead—is essential.
+
+The learned world model introduced in Chapter~\ref{sec:lewm-bg} provides exactly this capability. By combining a JEPA-style encoder \citep{jepa}, regularised with SIGReg \citep{lejepa}, and an action-conditioned latent dynamics model, LeWM defines a structured latent space in which transitions can be predicted and evaluated without further interaction with the environment. This suggests a natural extension to HIQL: instead of restricting subgoals to states observed in the dataset, we can use the world model to \emph{imagine} the consequences of candidate subgoals and select those that are both feasible and advantageous.
+
+In the following sections, we build on this insight to introduce
+\emph{World-Grounded Subgoal Planning (WGSP)}, a method that augments HIQL with model-based reasoning in latent space, enabling the high-level policy to move beyond the limitations of purely dataset-driven subgoal selection.
+
+% Our previous attempt at combining the two---the imagination engine in
+% \verb|train_hiql_lewm.py|---rolls out the world model under the
+% \emph{live} LL policy and feeds the synthetic transitions into both the
+% value and the LL AWR updates. This is mathematically incoherent for two
+% reasons:
+% \begin{enumerate}
+% \item AWR's analytical solution
+% $\pi^\star \propto \pi_\beta\exp(\alpha A)$ presupposes that the
+% sampling distribution is $\pi_\beta$. Once synthetic transitions come
+% from $\pi_{LL}$, the implicit importance ratio is non-unity and there
+% is no correction.
+% \item The dense reward $r=-\|z'-z_{\text{sub}}\|_2$ is well-defined
+% only when $z'$ is an encoder output; for synthetic $z'$ produced by the
+% world model, it lives off the JEPA manifold and the value function
+% inherits a systematic bias.
+% \end{enumerate}
+% Worst of all, the world model is invoked precisely where it harms the
+% method most (LL augmentation) and not at all where it would help most
+% (HL subgoal discovery).
+
+\paragraph{Dynamics coverage vs.\ behavioural coverage.}
+A natural question is whether a world model (WM) trained on the
+\emph{same dataset} as the policy can provide any additional benefit.
+At first glance, both the policy and the WM are limited by the same
+data, suggesting that no new information can be gained. The key to
+understanding why this is not the case lies in distinguishing between
+two different notions of coverage.
+
+\emph{Dynamics coverage} refers to the distribution over local
+transitions $(z, c)$ that the world model observes during training,
+where $c$ denotes the action (or action chunk). Because the WM is
+trained on broad, often exploratory or random-play data, it learns how
+the environment evolves across a wide range of state--action pairs.
+
+In contrast, \emph{behavioural coverage} refers to the distribution over
+state pairs $(z_t, z_{t+k})$ that the high-level (HL) policy in HIQL is
+trained on. These pairs are drawn from goal-directed trajectories in
+the dataset and therefore reflect only a narrow subset of possible
+behaviours.
+
+This distinction is crucial. Even if individual states $z$ and actions
+$c$ are well represented in the dataset, the \emph{compositions} of
+these transitions over multiple steps—i.e., the induced distribution
+over $(z_t, z_{t+k})$—may be highly limited. As a result, the HL policy
+is constrained to regress onto a restricted set of observed subgoals.
+
+The world model, however, can compose short-horizon transitions into
+longer imagined trajectories. This allows it to generate rollout
+endpoints $z_k^{(i,m)}$ that lie outside the behavioural distribution
+$\mathcal{R}_\beta$, even though each individual transition remains
+within the WM's training support. From the perspective of the HL
+policy, such imagined endpoints constitute \emph{genuine extrapolation}:
+they correspond to subgoals that were never observed in the dataset,
+but are nevertheless dynamically plausible. We empirically quantify
+this gap between dynamics and behavioural coverage in
+Audit~A1 (\S\ref{sec:wgsp:results}).
+
+\paragraph{Contribution.}
+Building on the limitations of HIQL discussed above, this chapter
+introduces \textbf{World-Grounded Subgoal Planning (WGSP)}, an offline
+hierarchical reinforcement learning method that leverages a frozen
+latent world model to improve \emph{subgoal selection} while preserving
+the stability of offline training.
+
+The key contributions of WGSP are as follows:
+
+\begin{itemize}
+    \item \textbf{Subgoal-level policy improvement via imagination.}
+    Rather than constraining the high-level (HL) policy to imitate
+    subgoals observed in the dataset, WGSP performs
+    Advantage-Weighted Regression (AWR) directly over \emph{imagined}
+    subgoal outcomes. Candidate subgoals are sampled from the current
+    HL policy, evaluated via world-model rollouts, and reweighted
+    according to their predicted long-horizon utility. This breaks the
+    behavioural cloning ceiling of HIQL and enables systematic
+    improvement beyond the dataset distribution.
+
+    \item \textbf{Decoupling value estimation from policy improvement.}
+    A central design principle of WGSP is that the value function is
+    trained \emph{exclusively on real data}. All policy improvement is
+    driven by imagined trajectories, but these trajectories are never
+    used to update the value function. This separation preserves the
+    offline stability of IQL-style methods while still allowing the
+    agent to reason about unseen outcomes.
+
+    \item \textbf{Within-representation advantage for low-level learning.}
+    The low-level (LL) policy is trained via distillation on the same
+    imagined rollouts used by the HL. Crucially, WGSP introduces a
+    \emph{within-representation advantage} that assigns credit across
+    multiple rollouts of the same subgoal. This resolves a key credit
+    assignment issue: without it, all rollouts of a subgoal would be
+    treated equally, leading to high-variance or vanishing gradients.
+    The proposed estimator provides a principled, low-variance signal
+    that emphasises successful executions of each subgoal.
+
+    \item \textbf{World-grounded subgoal evaluation.}
+    Subgoals are evaluated using a combination of a learned value
+    function (capturing long-horizon reachability) and a geometric
+    distance term in the SIGReg-regularised latent space. This hybrid
+    objective provides robustness against value-function
+    extrapolation, ensuring that imagined improvements remain
+    consistent with the underlying latent geometry.
+
+\end{itemize}
+% We claim three findings:
+% \begin{enumerate}
+% \item BC-anchoring is mainly a \emph{high-level} disease.
+% \item The SIGReg latent geometry is load-bearing: a geometric residual
+% in the candidate score is what distinguishes WGSP from a generic
+% latent-WM method.
+% \item Action-chunk dimensionality is a confound that low-rank
+% factorisation removes.
+% \end{enumerate}
+
+\section{Background and Notation}
+\label{sec:wgsp:background}
+
+\paragraph{Latent states and action chunks.}
+We operate entirely in the latent space induced by the learned world
+model (LeWM). Let $z \in \mathbb{R}^{192}$ denote the latent
+representation of an observation at a single world-model (WM) step.
+
+The dataset is processed with a frame-skip of $5$, meaning that each WM
+step corresponds to a sequence of $5$ environment actions. These are
+grouped into an \emph{action chunk}
+\[
+c = (a_0, \dots, a_4) \in \mathbb{R}^{5 \times 5} \cong \mathbb{R}^{25},
+\]
+where each $a_i \in \mathbb{R}^5$ is a primitive action. The world model
+is a frozen transition function
+\[
+f_{\mathrm{WM}} : \mathbb{R}^{192} \times \mathbb{R}^{25} \to \mathbb{R}^{192},
+\]
+which predicts the next latent state given the current latent and an
+action chunk.
+
+Crucially, the encoder and predictor are trained jointly with the
+SIGReg regulariser, which encourages the latent space to be
+approximately isotropic Gaussian. As a result, Euclidean distance
+$\|z - z'\|_2$ serves as a meaningful proxy for semantic and physical
+proximity in the environment \citep{lejepa}.
+
+\paragraph{Model components.}
+Our learning framework builds directly on HIQL, and maintains the
+following components:
+
+\begin{itemize}
+\item A \emph{goal representation function}
+\[
+\phi : \mathbb{R}^{192} \times \mathbb{R}^{192} \to \mathbb{R}^{d_{\mathrm{rep}}},
+\]
+which maps a state--goal pair to a latent representation. The output is
+normalised onto the sphere of radius $\sqrt{d_{\mathrm{rep}}}$ to
+stabilise training.
+
+\item A \emph{twin value function}
+\[
+V(z, z_{\mathrm{rep}}),
+\]
+trained using Implicit Q-Learning (IQL) via expectile regression. The
+value function is defined over latent states and goal representations,
+and is trained using the dense reward
+\[
+r_{\mathrm{env}} = -\|z' - z_{\mathrm{sub}}\|_2.
+\]
+Here, we explicitly distinguish the representation input
+$z_{\mathrm{rep}} = \phi(z, g)$ from the reward $r_{\mathrm{env}}$.
+
+\item A \emph{high-level policy}
+\[
+\pi^H(\cdot \mid z, g),
+\]
+modelled as a Gaussian distribution over goal representations. This
+policy proposes subgoals in representation space.
+
+\item A \emph{low-level policy}
+\[
+\pi^L(\cdot \mid z, z_{\mathrm{rep}}),
+\]
+parameterised as a $\tanh$-squashed Gaussian. Unlike the world model,
+which operates on 25-dimensional action chunks, the policy outputs a
+single 5-dimensional environment action $\bar{a} \in \mathbb{R}^5$.
+
+\item A \emph{frozen action-chunk decoder}
+\[
+D_\theta : \mathbb{R}^5 \times \mathbb{R}^{192} \to \mathbb{R}^{25},
+\]
+which maps the low-level action $\bar{a}$ and current latent state $z$
+to a full action chunk $c$. This allows the policy to remain in the
+environment action space while still interfacing correctly with the
+world model.
+\end{itemize}
+
+\paragraph{Value training distribution.}
+The value function is trained exclusively on real dataset transitions.
+At each update, we sample two types of batches:
+\begin{itemize}
+\item \emph{Subgoal batches} $(z, z', z_{\mathrm{sub}}) \sim \mathcal{D}$,
+where $z_{\mathrm{sub}}$ is a future state from the same trajectory.
+\item \emph{HER goal batches} $(z, z', g_{\mathrm{HER}}) \sim \mathcal{D}$,
+where $g_{\mathrm{HER}}$ is sampled from future states within the same
+episode.
+\end{itemize}
+
+The HER-based updates broaden the distribution of goals that the value
+function is trained on. This is important for WGSP, where we evaluate
+values of states relative to a wide range of goals. However, the value
+function is \emph{never} trained on synthetic states generated by the
+world model. This ensures that value estimation remains grounded in
+real data and avoids distributional shift.
+
+\paragraph{HIQL high-level update (recap).}
+For completeness, we briefly recall the HIQL high-level objective. Given
+a transition $(z_t, z_{t+k}, g)$, the high-level policy is trained via
+advantage-weighted regression:
+\begin{equation}
+\mathcal{L}_H^{\mathrm{HIQL}} =
+-\mathbb{E}\!\left[
+\exp\!\big(\alpha_H A_H\big)\,
+\log \pi^H\!\big(\phi(z_t, z_{t+k}) \mid z_t, g\big)
+\right],
+\end{equation}
+where the advantage is defined as
+\begin{equation}
+A_H =
+V(z_{t+k}, \phi(z_{t+k}, g))
+-
+V(z_t, \phi(z_t, g)).
+\end{equation}
+
+Importantly, the regression target $\phi(z_t, z_{t+k})$ corresponds to
+a \emph{real future state} from the dataset. This anchors the high-level
+policy to observed trajectories, but also limits its ability to propose
+novel subgoals—an issue that WGSP aims to address.
+
+\section{Method}
+\label{sec:wgsp:method}
+
+WGSP replaces \eqref{eq:hiql-hl} with an AWR step over imagined
+endpoints, distils the LL on the same rollouts, and factors the
+LL action through $D_\theta$.
+
+% \subsection{Action-chunk decoder $D_\theta$}
+% \label{sec:wgsp:decoder}
+
+% The 25-D chunk space is heavily redundant: the five 5-D actions inside a
+% chunk are strongly temporally correlated because they are sampled from
+% smooth motor commands. A diagonal Gaussian over $\mathbb{R}^{25}$ wastes
+% modelling capacity and inflates the variance of the AWR weight
+% $\exp(\alpha_L A)$. We learn a frozen, state-conditioned decoder
+% \begin{equation}
+% D_\theta(\bar a, z_t)\approx c,\qquad
+% \mathcal{L}_D = \mathbb{E}_{(c,z_t)\sim\mathcal D}\!
+% \big\|D_\theta(c_{0:5},z_t)-c\big\|_2^2,
+% \label{eq:wgsp-decoder}
+% \end{equation}
+% on the dataset's $(z_t,c)$ tuples. The first 5 dimensions of $c$ are the
+% ``intent'' input and the full 25-D chunk is the target. After training
+% $D_\theta$ is frozen; the LL emits $\bar a\in\mathbb{R}^5$ throughout
+% training and inference, and the WM (which still requires 25-D input)
+% consumes $D_\theta(\bar a,z)$.
+
+% This factorisation has two consequences. First, the LL log-probability
+% in AWR sums over 5 dimensions instead of 25, reducing the variance of
+% the AWR weight by a factor of about five (the source of finding 3 in
+% \S\ref{sec:wgsp:motivation}). Second, the entire training pipeline can
+% be freely toggled to 25-D LL by setting \verb|use_decoder=False|, giving
+% a clean ablation.
+
+\subsection{HL-WGSP: Subgoal Selection via Imagined Rollouts}
+\label{sec:wgsp:hlwgsp}
+
+We now describe how WGSP improves the high-level (HL) policy by
+evaluating \emph{imagined subgoals} using the world model. The key idea
+is to replace regression onto dataset subgoals with a
+\emph{sample-and-evaluate} procedure: the HL policy proposes candidate
+subgoals, the world model simulates their outcomes, and the policy is
+updated to favour those that lead to desirable futures.
+
+\paragraph{Candidate subgoal generation.}
+For a given anchor state--goal pair $(z_t, g)$ (typically sampled via
+HER), the HL policy first generates a set of $N$ candidate subgoals in
+representation space:
+\begin{equation}
+\text{rep}^{(i)} \sim \pi^H(\cdot \mid z_t, g), \qquad i = 1, \dots, N.
+\label{eq:wgsp-rep-sample-clean}
+\end{equation}
+Each sampled representation is normalised onto the unit sphere (scaled
+by $\sqrt{d_{\mathrm{rep}}}$) to match the training distribution of
+$\phi$. At this stage, the policy is effectively ``brainstorming''
+possible intermediate targets.
+
+\paragraph{Imagined rollouts.}
+To evaluate each candidate subgoal, we simulate how the low-level (LL)
+policy would behave if conditioned on that subgoal. For each candidate
+$\text{rep}^{(i)}$, we perform $M$ stochastic rollouts of length $k$
+using the learned world model:
+\begin{equation}
+\bar a_\tau^{(i,m)} \sim \pi^L(\cdot \mid z_\tau^{(i,m)}, \text{rep}^{(i)}), \quad
+c_\tau^{(i,m)} = D_\theta(\bar a_\tau^{(i,m)}, z_\tau^{(i,m)}), \quad
+z_{\tau+1}^{(i,m)} = f_{\mathrm{WM}}(z_\tau^{(i,m)}, c_\tau^{(i,m)}).
+\label{eq:wgsp-rollout-clean}
+\end{equation}
+
+Each rollout produces a final latent state $z_k^{(i,m)}$, which we refer
+to as the \emph{endpoint}. Intuitively, this answers the question:
+\emph{“If I commit to this subgoal, where will I actually end up?”}
+
+\paragraph{Scoring imagined outcomes.}
+We assign a score to each imagined endpoint using two complementary
+signals:
+\begin{equation}
+J^{(i,m)} =
+\underbrace{V\!\big(z_k^{(i,m)}, \phi(z_k^{(i,m)}, g)\big)}_{\text{value estimate}}
+\;-\;
+\underbrace{\beta \|z_k^{(i,m)} - g\|_2}_{\text{geometric penalty}}.
+\label{eq:wgsp-J-clean}
+\end{equation}
+
+The first term evaluates how promising the endpoint is according to the
+value function, i.e.\ how easy it is to reach the final goal $g$ from
+that state. This captures long-horizon reasoning, but may be unreliable
+when queried on states outside the dataset distribution.
+
+The second term provides a geometric consistency check. Because the
+latent space is approximately isotropic (due to SIGReg), Euclidean
+distance $\|z - g\|_2$ is a meaningful proxy for physical proximity.
+This term penalises endpoints that are not actually closer to the goal,
+mitigating potential overestimation by the value function.
+
+We average over the $M$ rollouts to obtain a per-candidate score:
+\begin{equation}
+J^{(i)} = \frac{1}{M} \sum_{m=1}^M J^{(i,m)}.
+\end{equation}
+
+\paragraph{Relative scoring and weighting.}
+Rather than using absolute scores, we compare candidates relative to
+each other. We compute a per-anchor advantage:
+\begin{equation}
+A^{(i)} = J^{(i)} - \frac{1}{N} \sum_{i'=1}^N J^{(i')}.
+\end{equation}
+
+These advantages are then converted into weights using a softmax:
+\begin{equation}
+w^{(i)} = \mathrm{softmax}_i\!\big(\alpha_H A^{(i)}\big).
+\label{eq:wgsp-w-clean}
+\end{equation}
+
+This produces a probability distribution over the $N$ candidates,
+assigning high weight to subgoals that lead to better imagined outcomes.
+The use of softmax (rather than independent exponentiation) reflects the
+fact that we are selecting among a \emph{finite set of candidates} per
+anchor, in the spirit of multi-sample policy improvement methods such
+as CRR.
+
+\paragraph{High-level policy update.}
+Finally, the HL policy is updated using an advantage-weighted regression
+step over the sampled candidates:
+\begin{equation}
+\boxed{
+\mathcal{L}_H^{\mathrm{WGSP}} =
+- \sum_{i=1}^{N} w^{(i)} \log \pi^H(\text{rep}^{(i)} \mid z_t, g)
+}
+\label{eq:wgsp-hl-clean}
+\end{equation}
+
+This objective increases the probability of subgoals that produced
+high-scoring imagined outcomes, and decreases the probability of those
+that performed poorly.
+
+\paragraph{Discussion.}
+This procedure can be interpreted as a form of \emph{model-based policy
+improvement in subgoal space}. Unlike standard HIQL, which regresses
+onto subgoals observed in the dataset, WGSP allows the policy to explore
+a much richer set of candidates by leveraging the world model. At the
+same time, the use of a value function trained exclusively on real data
+ensures that learning remains grounded and stable.
+
+Optionally, this loss can be combined with the original HIQL HL loss
+(Eq.~\ref{eq:hiql-hl}) with weight $\lambda_{\mathrm{anchor}}$,
+providing a regularisation effect that anchors learning to the dataset.
+
+\paragraph{Population fixed point.}
+It is helpful to interpret the WGSP update in the limit of a large
+candidate set. As $N \to \infty$, the sampled subgoals
+$\text{rep}^{(i)} \sim \pi^H(\cdot \mid z_t, g)$ densely cover the
+high-level policy’s output distribution. In this regime, the stochastic
+``brainstorm--imagine--score'' procedure of
+\S\ref{sec:wgsp:hlwgsp} becomes an \emph{exact} policy improvement step
+with respect to an \emph{implicit} high-level action-value function,
+\begin{equation*}
+\hat Q^H(z_t, r; g)
+\;\equiv\;
+V^\star\!\big(\Psi_k(z_t, r),\,
+\phi(\Psi_k(z_t, r), g)\big),
+\end{equation*}
+where $r$ denotes a candidate representation (subgoal),
+$\Psi_k(z_t, r)$ is the endpoint reached after $k$ steps of rolling out
+the low-level policy and world model from $z_t$ towards $r$, and
+$V^\star$ is the optimal value function. Intuitively, $\hat Q^H$
+answers the question: \emph{“If I choose this subgoal, where will I end
+up, and how good is that endpoint for reaching the final goal?”}
+
+Under this interpretation, WGSP reduces to a standard
+Advantage-Weighted Regression (AWR) update applied to $\hat Q^H$.
+Classical AWR results \citep{awr} imply that the updated policy takes
+the form
+\begin{equation*}
+\pi^H_{\text{new}}(r \mid z_t, g)
+\;\propto\;
+\pi^H_{\text{old}}(r \mid z_t, g)\,
+\exp\!\big(\alpha_H \hat Q^H(z_t, r; g)\big),
+\end{equation*}
+i.e.\ the policy is reweighted to favour subgoals that lead to
+high-value imagined outcomes.
+
+Two important consequences follow. \emph{First}, if both the value
+function $V^\star$ and the rollout map $\Psi_k$ are accurate, repeated
+application of this update converges to the AWR-optimal high-level
+policy with respect to $\hat Q^H$. In contrast to HIQL—where the
+high-level is anchored to behaviour cloning targets drawn from the
+dataset—WGSP can in principle discover strictly better subgoals by
+optimising over imagined outcomes. \emph{Second}, the exponential
+reweighting induces an implicit KL regularisation: the new policy
+remains close to the old policy unless there is strong evidence (high
+$\hat Q^H$) to favour certain subgoals. This prevents large,
+destabilising updates and ensures that policy improvement proceeds in a
+conservative, incremental manner.
+
+% \paragraph{AWR vs.\ CEM.}
+% The HL update \eqref{eq:wgsp-hl} is \emph{not} the Cross-Entropy Method
+% (CEM). CEM would discard all but the top $k_\text{elite}$ reps and refit
+% a Gaussian to them, with no policy-gradient interpretation and no
+% convergence guarantee in the offline setting. By contrast,
+% \eqref{eq:wgsp-hl} is a standard AWR step \citep{awr,awac} with
+% softmax weights: \emph{all} $N$ reps contribute to the gradient,
+% weighted by their exponentiated advantage, and the update is equivalent
+% to one step of natural-gradient ascent on the policy log-likelihood. The
+% fixed-point analysis above directly inherits AWR's policy improvement
+% guarantee. CEM would instead produce a one-step optimal-rep solution
+% with no guarantee of consistent improvement across updates.
+
+% The question of CEM at \emph{evaluation time} is orthogonal. One could
+% search in rep space using the trained WM and $V$ rather than the trained
+% $\pi^H$, analogously to MPC. Row~12 of the ablation tests exactly this:
+% it replaces $\pi^H$ with eval-time CEM in rep space (population 64,
+% elites 8, 3 iterations per subgoal decision), using the same scoring
+% function \eqref{eq:wgsp-J}. If row~12 $\approx$ row~1, the gain is
+% mostly from the scoring mechanism (WM + V + geometry) rather than from
+% training $\pi^H$ via AWR; if row~12 $\ll$ row~1, the AWR training step
+% is load-bearing.
+
+\subsection{WGSP-distil: low-level distillation with within-rep advantage}
+\label{sec:wgsp:distil}
+
+The high-level (HL) update in Eq.~\eqref{eq:wgsp-hl} selects promising
+subgoal representations, but it does not guarantee that the low-level
+(LL) policy can reliably execute them. As training progresses, the HL
+begins to propose subgoals that lie outside the distribution of
+representations observed in the dataset,
+\[
+\mathcal R_\beta=\{\phi(z_t,z_{t+k}) : (\cdot)\in\mathcal D\},
+\]
+leading to a growing \emph{covariate shift} for the LL. In other words,
+even if a subgoal is optimal under the imagined evaluation, the LL may
+fail to realise it in practice because it has never been trained to act
+in that region of the representation space. To address this, we
+\emph{distil} the LL policy directly on the same world-model rollouts
+used to train the HL.
+
+\paragraph{Why naive distillation fails.}
+A straightforward approach is to treat the WGSP rollouts as supervised
+data and train the LL via weighted behaviour cloning:
+\begin{equation}
+\mathcal{L}_L^\text{naive}
+= -\sum_i w^{(i)}\sum_m\sum_\tau
+\log\pi^L\!\big(\bar a_\tau^{(i,m)}\,\big|\,z_\tau^{(i,m)},\text{rep}^{(i)}\big),
+\label{eq:wgsp-naive-rewrite}
+\end{equation}
+where $w^{(i)}$ is the HL weight assigned to representation
+$\text{rep}^{(i)}$. Although this objective is formally valid (it can
+be interpreted as a REINFORCE estimator since $w^{(i)}$ depends on the
+sampled trajectories), it suffers from a critical limitation:
+\emph{all rollouts associated with the same representation receive the
+same weight}. 
+
+This creates a credit-assignment problem \emph{within} each
+representation. Some rollouts may reach highly favourable endpoints,
+while others may fail due to stochasticity in the LL policy, yet they
+are treated identically in Eq.~\eqref{eq:wgsp-naive-rewrite}. As a
+result, the LL update is dominated by sampling noise rather than by
+which behaviours are actually successful. In the extreme case of
+deterministic rollouts, the policy collapses to a single mode
+($\sigma^L \to 0$), eliminating useful exploration.
+
+\paragraph{Within-representation credit assignment.}
+To resolve this issue, we introduce a second level of weighting that
+distinguishes between rollouts associated with the same
+representation. Inspired by multi-sample variance reduction methods
+such as VIMCO \citep{vimco}, we define a \emph{within-rep advantage}
+\begin{equation}
+A^{(i,m)} = J^{(i,m)} - \tfrac{1}{M}\sum_{m'} J^{(i,m')},\qquad
+u^{(i,m)} = \mathrm{softmax}_m\!\big(\alpha_L A^{(i,m)}\big),
+\label{eq:wgsp-distil-u-rewrite}
+\end{equation}
+where $J^{(i,m)}$ is the score of rollout $m$ for representation $i$.
+This subtracts a per-representation baseline (the mean score across
+rollouts), ensuring that only \emph{relative} performance within the
+same representation matters.
+
+Intuitively, $u^{(i,m)}$ assigns higher weight to rollouts that perform
+better than average for a given subgoal, and lower weight to those that
+perform worse. This restores meaningful credit assignment: the LL is
+encouraged to reproduce \emph{successful executions} of a subgoal,
+rather than averaging over all attempts.
+
+\paragraph{Distillation objective.}
+The resulting LL distillation loss is
+\begin{equation}
+\boxed{\;\mathcal{L}_L^\text{distil}
+= -\sum_i w^{(i)}\sum_m u^{(i,m)}\sum_\tau
+\log\pi^L\!\big(\bar a_\tau^{(i,m)}\,\big|\,z_\tau^{(i,m)},\text{rep}^{(i)}\big).\;}
+\label{eq:wgsp-distil-rewrite}
+\end{equation}
+This objective can be viewed as a two-level Advantage-Weighted
+Regression procedure: the outer weights $w^{(i)}$ select promising
+subgoals, while the inner weights $u^{(i,m)}$ identify the best
+executions of each subgoal. From a policy-gradient perspective, this
+corresponds to a REINFORCE estimator with a per-representation
+baseline, which is unbiased and exhibits reduced variance
+\citep{reinforce-baseline,vimco}.
+
+A useful sanity check is the case $M=1$. Then the within-rep baseline
+vanishes, $u^{(i,m)} \equiv 1$, and the objective reduces to the naive
+form, recovering the degenerate behaviour described above (see
+ablation row~9).
+
+\paragraph{Total low-level objective.}
+Finally, we combine the distillation loss with the standard HIQL
+low-level objective:
+\begin{equation}
+\mathcal{L}_L^\text{total}
+= \mathcal{L}_L^\text{HIQL}
++ \lambda_\text{distil}(t)\,\mathcal{L}_L^\text{distil},
+\end{equation}
+where the weighting $\lambda_\text{distil}(t)$ is increased gradually
+during training. This schedule ensures that early learning remains
+anchored to the stable, dataset-driven HIQL objective, while later
+training increasingly incorporates guidance from imagined rollouts as
+the HL policy improves.
+
+% \paragraph{LL credit assignment: goal-based vs.\ rep-reachability.}
+% An important subtlety in WGSP lies in how credit is assigned to the
+% low-level (LL) policy. The rollout scores $J^{(i,m)}$ in
+% Eq.~\eqref{eq:wgsp-J} evaluate endpoints based on progress towards the
+% \emph{ultimate} goal $g$, whereas the LL policy is conditioned only on
+% the \emph{intermediate} representation $\text{rep}^{(i)}$. This creates
+% a mismatch: the LL is trained to execute a subgoal, but is rewarded
+% based on how much that execution helps with the final objective.
+
+% This mismatch gives rise to two potential failure modes.
+
+% \emph{First}, consider the extreme case of \emph{posterior collapse} in
+% the LL policy, where $\pi^L(a \mid z, \text{rep})$ becomes effectively
+% independent of the representation input. In this regime, all $M$
+% rollouts for a given $\text{rep}^{(i)}$ produce statistically
+% indistinguishable trajectories. As a result, their scores
+% $J^{(i,m)}$ are also identical, the within-representation advantages
+% $A^{(i,m)}$ in Eq.~\eqref{eq:wgsp-distil-u} vanish, and the weights
+% $u^{(i,m)}$ become uniform. Consequently, the gradient from the
+% distillation loss in Eq.~\eqref{eq:wgsp-distil} collapses to zero, and
+% no learning signal remains. The within-representation baseline is
+% therefore not merely a variance-reduction device—it is structurally
+% necessary to prevent this degenerate fixed point. In addition, the
+% always-on real-data objective $\mathcal{L}_L^\text{HIQL}$ acts as an
+% implicit entropy regulariser, ensuring that the LL retains sensitivity
+% to the representation input.
+
+% \emph{Second}, a more subtle and practically relevant issue is
+% \emph{magnitude warping}. Suppose the HL proposes a representation that
+% corresponds to an intermediate state on the path towards $g$. During
+% rollouts, some LL trajectories may \emph{overshoot} this intermediate
+% target but land closer to the final goal. Because $J^{(i,m)}$ rewards
+% proximity to $g$, such overshooting trajectories receive higher scores
+% than those that accurately stop at the intended representation. As a
+% result, the within-representation weights $u^{(i,m)}$ implicitly
+% encourage the LL to overshoot its assigned subgoals. Over time, this
+% induces a systematic bias: the LL learns to go “too far,” while the HL
+% compensates by proposing shorter subgoals. Whether this feedback loop
+% leads to harmful miscalibration depends on the rollout horizon $k$ and
+% the stochasticity of the LL, and must ultimately be evaluated
+% empirically.
+
+% To isolate this effect, we introduce an alternative scoring function
+% that removes any dependence on the final goal $g$ when assigning credit
+% to the LL:
+% \begin{equation}
+% J_{LL}^{(i,m)} = -\big\|\phi\big(z_t, z_k^{(i,m)}\big) - \text{rep}^{(i)}\big\|_2,
+% \label{eq:wgsp-jll-rewrite}
+% \end{equation}
+% which replaces $J^{(i,m)}$ \emph{only} in the computation of the
+% within-representation weights $u^{(i,m)}$ for the LL distillation loss.
+% The HL update continues to use the original goal-based scoring
+% function. 
+
+% This alternative corresponds to the standard formulation in
+% goal-conditioned hierarchical RL \citep{fun,hiro}, where the LL is
+% responsible solely for reaching the proposed subgoal, and the HL is
+% fully responsible for selecting subgoals that make progress towards the
+% final objective. Comparing this variant (ablation row~14) to the
+% default WGSP formulation (row~1) allows us to directly measure whether
+% goal-based credit assignment at the LL introduces a measurable
+% performance cost.
+
+\subsection{Algorithm}
+\label{sec:wgsp:algo}
+
+\begin{algorithm}[t]
+\caption{WGSP training step (single iteration of \texttt{train\_hiql\_wgsp.py})}
+\label{alg:wgsp}
+\begin{algorithmic}[1]
+
+\State \textbf{Value learning (real data only).}
+Sample $(z,a,r,z',z_\text{sub}) \sim \mathcal{D}$ and
+$(z,z',g_\text{HER}) \sim \mathcal{D}$.
+Perform two IQL updates (expectile regression) on $V$ and $\phi$.
+
+\State \textbf{Low-level HIQL update (real data).}
+Sample $(z,a,r,z',z_\text{sub}) \sim \mathcal{D}$.
+Update $\pi^L$ using AWR on real transitions.
+
+\If{phase $=2$ and \texttt{use\_wgsp}}
+
+    \State Sample $(z_t,g) \sim \mathcal{D}$ via HER.
+    \State Sample $\text{rep}^{(i)} \sim \pi^H(\cdot \mid z_t, g)$ for $i=1,\dots,N$ and normalise.
+    \State Roll out $\Psi_k$ to obtain trajectories using Eq.~\eqref{eq:wgsp-rollout}.
+
+    \State Compute $J^{(i,m)}$ using Eq.~\eqref{eq:wgsp-J}.
+    \State Compute $w^{(i)}$ and $u^{(i,m)}$ using
+    Eqs.~\eqref{eq:wgsp-w}--\eqref{eq:wgsp-distil-u}.
+
+    \State Update $\pi^H$ using Eq.~\eqref{eq:wgsp-hl}.
+
+    \If{\texttt{use\_distil}}
+        \State Update $\pi^L$ using Eq.~\eqref{eq:wgsp-distil}.
+    \EndIf
+
+\Else
+    \State Update $\pi^H$ using HIQL loss in Eq.~\eqref{eq:hiql-hl}.
+\EndIf
+
+\State Soft-update target networks for $V$ and $\phi$.
+
+\end{algorithmic}
+\end{algorithm}
+
+\section{Ablation Design}
+\label{sec:wgsp:ablations}
+
+The ablation matrix in Table~\ref{tab:wgsp-grid} is designed so that
+each contribution can be isolated. Row~1 is the headline configuration;
+each subsequent row toggles a single design choice while keeping the
+others fixed. The grid is run with three seeds; reported numbers are
+the mean over $5\,\text{tasks}\times 50\,\text{episodes}\times 3\,\text{seeds}$.
+
+\begin{table}[t]
+\centering
+\caption{WGSP ablation grid. ``WGSP'' = HL-WGSP (\S\ref{sec:wgsp:hlwgsp});
+``distil'' = WGSP-distil (\S\ref{sec:wgsp:distil}); ``geom'' = SIGReg
+geometric residual ($\beta>0$); ``5D'' = LL outputs 5-D and uses the
+frozen $D_\theta$.}
+\label{tab:wgsp-grid}
+\begin{tabular}{rllllll}
+\toprule
+\# & HL update & LL update & Geom $\beta$ & Action factor & Variant & Tests\\
+\midrule
+1  & WGSP    & HIQL+distil & on  & 5D + $D_\theta$ & ---            & headline \\
+2  & WGSP    & HIQL+distil & on  & 25D direct      & ---            & dimensionality \\
+3  & WGSP    & HIQL+distil & off & 5D + $D_\theta$ & $\beta=0$      & SIGReg load \\
+4  & WGSP    & HIQL only   & on  & 5D + $D_\theta$ & no distil      & distil contribution \\
+5  & HIQL    & HIQL+distil & on  & 5D + $D_\theta$ & no WGSP        & distil w/o WGSP \\
+6  & HIQL    & HIQL only   & --- & 5D + $D_\theta$ & decoder only   & decoder confound \\
+7  & HIQL    & HIQL only   & --- & 25D direct      & vanilla HIQL   & baseline parity \\
+8  & WGSP*   & HIQL only   & on  & 5D + $D_\theta$ & geom-only ($V$ off) & LeWM-only baseline \\
+9  & WGSP    & HIQL+distil & on  & 5D + $D_\theta$ & $M=1$          & within-rep advantage \\
+10 & WGSP    & HIQL+distil & on  & 5D + $D_\theta$ & $\lambda_\text{anc}=1$ & anchored stability \\
+\midrule
+11 & WGSP    & HIQL+distil & on  & 5D + $D_\theta$ & $|V|{=}4$ heads + MOPO & V-extrapolation cost \\
+12 & CEM (eval) & HIQL only & on  & 5D + $D_\theta$ & HL $\leftarrow$ CEM & trained HL vs.\ search \\
+13 & WGSP    & HIQL+distil & on  & 5D + $D^\text{flow}_\theta$ & flow decoder & multimodal chunks \\
+14 & WGSP    & HIQL+distil$^\dagger$ & on & 5D + $D_\theta$ & $J_{LL}^{(i,m)}$ via \eqref{eq:wgsp-jll} & LL goal-leakage \\
+\bottomrule
+\end{tabular}
+\par\smallskip
+{\footnotesize $^\dagger$Row 14: HL update unchanged (goal-based $J^{(i,m)}$);
+LL distil uses $J_{LL}^{(i,m)}=-\|\phi(z_t,z_k)-\text{rep}\|_2$ in $u^{(i,m)}$.}
+\end{table}
+
+\paragraph{Hyperparameters held fixed.}
+$k=8$ (subgoal horizon and WGSP rollout horizon),
+$N=8$ (rep candidates), $M=4$ (rollouts per candidate; $M{=}1$ in
+row~9), batch size 256, $\alpha_H=\alpha_L=3$, $\gamma=0.99$,
+expectile $\tau=0.7$, $\beta=0.1$, $\lambda_\text{distil}\!\to\!1$
+linearly across phase~2, total steps $200{,}000$, warmup fraction
+$0.2$. Three seeds, OGBench cube-single, native 224$\times$224 LeWM.
+
+\section{Results}
+\label{sec:wgsp:results}
+
+\begin{table}[t]
+\centering
+\caption{WGSP ablation results on OGBench cube-single (mean overall
+success $\pm$ std over 3 seeds; 5 tasks $\times$ 50 episodes per seed).
+Numbers populated by \texttt{aggregate\_wgsp\_results.py} from the
+\texttt{eval\_wgsp/} directory after the sweep finishes.}
+\label{tab:wgsp-results}
+\begin{tabular}{rlcc}
+\toprule
+\# & Variant & Overall success \% & $\Delta$ vs row~1 \\
+\midrule
+1  & headline (WGSP + distil + decoder + geom) & --- & --- \\
+2  & no decoder (25D LL)              & --- & --- \\
+3  & $\beta=0$ (no geom)              & --- & --- \\
+4  & no distil                        & --- & --- \\
+5  & HIQL HL + distil                 & --- & --- \\
+6  & HIQL + decoder only              & --- & --- \\
+7  & vanilla HIQL (25D LL)            & --- & --- \\
+8  & geom-only ($V$ off)              & --- & --- \\
+9  & WGSP, $M=1$                      & --- & --- \\
+10 & WGSP + anchor ($\lambda_\text{anc}=1$) & --- & --- \\
+\midrule
+11 & V-ensemble ($|V|{=}4$) + MOPO penalty & --- & --- \\
+12 & CEM-over-reps (no trained HL)    & --- & --- \\
+13 & flow-matching $D^\text{flow}_\theta$ & --- & --- \\
+14 & LL distil scored by rep-reachability & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Audit A1: WM extrapolation.}
+Figure~\ref{fig:wm-extrapolation-audit} (produced by
+\texttt{analysis/wm\_extrapolation\_audit.py} on the row~1 checkpoint)
+shows two distributions: the dataset-NN $\ell_2$ distance of WGSP
+rollout endpoints $z_k^{(i,m)}$ (orange) and of behavior endpoints
+$z_{t+k}$ (blue) from matched anchors $z_t$. If the orange distribution
+is shifted right, the WM is queried in regions that the behavior policy
+never reaches, confirming the dynamics-coverage asymmetry from
+\S\ref{sec:wgsp:motivation}. The companion plot checks that $\|z_k\|$
+stays within $2\sigma$ of the dataset latent-norm distribution, verifying
+that WM rollouts remain on the SIGReg manifold.
+% \begin{figure}[t]
+%   \includegraphics[width=\linewidth]{figs/wm_extrapolation_audit.png}
+%   \caption{Audit A1 on the row~1 checkpoint.}
+%   \label{fig:wm-extrapolation-audit}
+% \end{figure}
+
+\paragraph{Reading the table.}
+The three findings of \S\ref{sec:wgsp:motivation} translate to specific
+gaps in Table~\ref{tab:wgsp-results}: finding~1 (BC-anchoring is an HL
+disease) corresponds to the gap between row~1 and row~5; finding~2
+(SIGReg load-bearing) to row~1 vs row~3 and to row~8's standalone
+performance; finding~3 (dimensionality confound) to row~1 vs row~2 and
+to row~6 vs row~7.
+
+Row~11 vs row~1 measures V-extrapolation cost (penalty on vs.\ off).
+Row~12 vs row~1 isolates the contribution of AWR training: if
+CEM-over-reps nearly matches the trained HL, the scoring mechanism is
+the main driver. Row~13 vs row~1 measures the multimodal-decoder gain.
+Row~14 vs row~1 measures the LL goal-leakage cost (does scoring the LL
+distil by rep-reachability, decoupling it from the ultimate goal $g$,
+materially improve performance?). If row~14 $\gg$ row~1 the headline
+should adopt $J_{LL}^{(i,m)}$ for the LL update; if row~14 $\approx$
+row~1 the goal-leakage warping is a non-issue at this scale and the
+simpler formulation in \eqref{eq:wgsp-distil} stands.
+
+\section{Discussion}
+\label{sec:wgsp:discussion}
+
+\paragraph{What WGSP \emph{does not} do.}
+We deliberately keep $V$ and the LL HIQL update on real data only.
+Synthetic transitions never feed the value function, so $V$ remains a
+faithful AWR target on the dataset distribution. The WM is invoked
+exclusively as a state-transport operator inside HL search; LL
+distillation reuses those rollouts but with within-rep weights derived
+from $V$. This separation of concerns---transport by WM, evaluation by
+$V$---is the structural reason WGSP avoids the mathematical
+incoherence of the imagination-engine baseline.
+
+\paragraph{Composition risk revisited.}
+The early concern that combining HL-WGSP with any LL augmentation would
+compound WM exploitation is mitigated because WGSP-distil reuses HL's
+rollouts rather than running a second model search. Compute is
+additive in $M$ rather than multiplicative across the hierarchy, and
+the ablation toggles isolate the two contributions cleanly.
+
+\paragraph{Beyond the cube.}
+WGSP is most natural in domains where (i) the dataset is narrow enough
+that HL inherits a non-trivial subgoal bias, (ii) the latent space is
+sufficiently isotropic for the geometric residual to be meaningful,
+and (iii) the action chunk is large enough that LL dimensionality is a
+real bottleneck. All three conditions are common in robotic
+manipulation with frame-skipped pretrained world models, suggesting
+WGSP is a portable design rather than a cube-specific trick. The
+ablation in row~3 is the single most important diagnostic for
+generalisability: if dropping the geometric term has little effect, the
+SIGReg story is over-stated and the method reduces to an instance of
+imagined-rollout AWR; if it is decisive, LeWM is genuinely
+load-bearing.
+
+\paragraph{V extrapolation.}
+The value function is trained only on real data, but at WGSP search
+time it is queried at synthetic endpoints $z_k^{(i,m)}$ that may lie
+off the data manifold. Row~11 quantifies this: we replace the twin $V$
+with a 4-head ensemble and subtract $\lambda_\text{MOPO}
+\cdot\mathrm{std}_V(z_k)$ from each endpoint score. Training also logs
+the ratio of mean ensemble disagreement at WGSP endpoints to mean
+disagreement on dataset states; a ratio $\gg 1$ would indicate that V
+is extrapolating and the geometric residual is carrying the scoring.
+This is the direct analogue of MOPO's~\citep{mopo} offline penalty,
+adapted to the WGSP scoring step rather than the LL training objective.
+
+\paragraph{Chunk decoder multimodality.}
+Conditional flow matching for action chunks~\citep{qchunking} is
+justified only if $p(c|z,\bar a)$ is genuinely multimodal---a
+deterministic MSE decoder would otherwise suffice. A nearest-neighbour
+conditional-variance audit on the cube dataset finds an
+intra-cluster-std/global-std ratio of ${\approx}\,0.55$ on the
+residual 20 action dimensions, above the $0.30$ trigger threshold.
+Row~13 therefore trains a flow-matching $D^\text{flow}_\theta$ (adapting
+the \texttt{LLBCFlow} architecture from \S\ref{chap:joint}) and
+evaluates whether the multimodal decoder translates to a WGSP
+performance gain. If row~13 $\gg$ row~1 the MSE decoder is the
+performance bottleneck; if row~13 $\approx$ row~1, the task-induced
+chunk distribution is effectively unimodal in practice.
+
+\paragraph{Limitations.}
+The method assumes a frozen, accurate world model and a value function
+that generalises modestly off the data manifold. Row~11 directly
+measures V-extrapolation cost; if the MOPO penalty helps substantially,
+V extrapolation is a real performance ceiling and should be addressed by
+further widening $V$'s training distribution (e.g.\ mixing synthetic
+endpoints into V's target computation). We also assume the chunk
+decoder $D_\theta$ is well-fit; row~13 tests whether a flow-matching
+decoder removes that assumption.
+
+% =====================================================================
+% Bibliography stubs — the real keys live in the global bib in main.tex.
+% These citations should resolve to: HIQL (Park et al. 2024), AWR (Peng
+% et al. 2019), IQL (Kostrikov et al. 2021), JEPA (LeCun 2022 / Assran
+% et al. 2023), SIGReg/LeJEPA (your reference), LeWM (your reference).
+% =====================================================================

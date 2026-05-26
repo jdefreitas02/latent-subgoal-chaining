@@ -1,0 +1,606 @@
+\chapter{Model-Predictive Control and MPC Distillation}
+\label{chap:mpc-distill}
+
+\section{Motivation: evaluate with the WM, do not train on it}
+\label{sec:mpc-motivation}
+
+Chapter~\ref{chap:offline-online} showed that every attempt to use the
+LeWM as a source of \emph{training} signal degrades the offline policy.
+Compounding latent error corrupts Bellman targets
+(\S\ref{sec:oo-exp1}), value-aware joint training teaches the WM to
+hallucinate high-$Q$ states (\S\ref{sec:oo-exp3}), uncertainty
+penalties either fail to discriminate or actively punish task-solving
+actions (\S\ref{sec:oo-exp45}), and analytic policy gradients through
+the WM are too noisy to optimise (\S\ref{sec:oo-exp8}). All four
+failure modes share a structural feature: they require the WM to play
+the role of an environment or a critic during training.
+
+The same chapter does \emph{not} undermine a much weaker claim: that the
+WM, applied for one or two steps starting from a real on-policy latent,
+gives a noisy-but-informative \emph{score} for the initial action chunk
+when that score is read out through the learned $Q$-function. We never
+have to trust the predicted next-state as ground truth; we only have to
+trust the ordering it induces over a small set of candidate action
+chunks. This chapter takes exactly that view. Training stays fully
+offline on real data, so the critic remains honest. At inference time
+we expand the action search using the WM as a rollout-and-score oracle.
+Because the inference-time procedure produces actions that
+systematically beat what the actor proposes on its own, we then close
+the loop by distilling those actions back into the policy during
+continued offline training---still without feeding any WM-generated
+transition to the critic.
+
+Formally, at latent state $z_t$ we select an action chunk
+\begin{equation}
+a_t^\star \;=\; \arg\max_{a\in\mathcal{A}_t(z_t)}\; J(a;\,z_t,\,f_\psi,\,Q_\theta),
+\label{eq:mpc-formal-problem}
+\end{equation}
+where $\mathcal{A}_t(z_t)$ is a small candidate set drawn from a
+learned proposal distribution and $J$ is a score function built from a
+short WM rollout and the learned $Q$. The remainder of the chapter
+specifies $\mathcal{A}_t$, $J$, and the optional refinement procedure
+that turns Eq.~\eqref{eq:mpc-formal-problem} into a usable test-time
+policy (\S\S\ref{sec:mpc-bon}--\ref{sec:mpc-fmq}); discusses two ways
+to distil the resulting $a^\star$ back into the actor
+(\S\S\ref{sec:mpc-offline-distill}--\ref{sec:mpc-interleaved}); and
+collects the headline results (\S\ref{sec:mpc-results}).
+
+\paragraph{Relation to classical model-based offline RL.}
+Methods such as MOPO~\cite{yu2020mopomodelbasedofflinepolicy} and
+COMBO~\cite{yu2021combo} use a learned dynamics model directly in the
+TD target, with an additive pessimism penalty derived from model
+uncertainty. Our position is empirical: even with the same uncertainty
+penalties tested in \S\ref{sec:oo-exp45}, that approach collapses on
+this benchmark. Inference-time use of the WM is by construction more
+forgiving---a wrong predicted next-state moves an action up or down a
+small ranked list of candidates rather than poisoning the Bellman
+target a critic is supervised against.
+
+\section{Best-of-$N$ MPC at inference}
+\label{sec:mpc-bon}
+
+The simplest scheme samples $N$ action chunks from the learned actor,
+rolls each forward $H$ steps in the WM with on-policy continuation
+actions, scores each rollout, and returns the first action chunk of the
+best candidate. This is the standard sampling-MPC template with two
+specialisations: the proposal distribution is the trained
+flow-matching actor of \S\ref{sec:hiql-flow}, not a hand-tuned
+Gaussian, and the score is computed in the latent space of the LeWM.
+
+\paragraph{Proposal sampling.} At decision time $t$ with current latent
+$z_t$, draw $N$ noise vectors $\{x_0^{(i)}\}_{i=1}^N \sim
+\mathcal{N}(0, I_{25})$ and integrate the BC-flow head of the actor
+$\pi_\theta$ with $S=10$ Euler steps to obtain $N$ candidate action
+chunks:
+\begin{equation}
+a_0^{(i)} \;=\; \mathrm{clip}\!\big(\Phi_\theta(z_t, x_0^{(i)}),\,-1,\,1\big),
+\qquad i = 1,\dots,N,
+\label{eq:mpc-proposal}
+\end{equation}
+where $\Phi_\theta$ denotes the flow integrator of
+Eq.~\eqref{eq:flow-euler-clean}.
+
+\paragraph{Rollout with continuation re-sampling.} Each candidate is
+rolled forward $H$ WM steps. After every WM step we re-sample the next
+action from the actor at the predicted state---an unbiased estimate of
+the continuation policy rather than a fixed open-loop plan:
+\begin{align}
+z_{h+1}^{(i)} &= f_\psi\!\big(z_h^{(i)},\,a_h^{(i)}\big), \nonumber\\
+a_{h+1}^{(i)} &= \mathrm{clip}\!\big(\Phi_\theta(z_{h+1}^{(i)},\,\tilde x_0^{(i,h)}),\,-1,\,1\big),
+\qquad \tilde x_0^{(i,h)}\sim\mathcal{N}(0,I_{25}),
+\label{eq:mpc-rollout}
+\end{align}
+for $h=0,\dots,H-1$ and starting from $z_0^{(i)}=z_t$.
+
+\paragraph{Scoring functions.} Three score functions are used in this
+chapter:
+\begin{align}
+J_{\text{Q-term}}(a^{(i)}) &= Q_\theta\!\big(z_H^{(i)},\,a_H^{(i)}\big),
+\label{eq:mpc-score-qterm}\\
+J_{\text{Q-all}}(a^{(i)})  &= \sum_{h=0}^{H-1}\gamma^h\,
+   Q_\theta\!\big(z_{h+1}^{(i)},\,a_{h+1}^{(i)}\big),
+\label{eq:mpc-score-qall}\\
+J_{\text{dense+Q}}(a^{(i)})&= \sum_{h=0}^{H-1}\gamma^h\,
+   \tilde r^{\text{dense}}\!\big(z_{h+1}^{(i)}\big)
+   \;+\;\gamma^H\,Q_\theta\!\big(z_H^{(i)},\,a_H^{(i)}\big),
+\label{eq:mpc-score-densepq}
+\end{align}
+with $\tilde r^{\text{dense}}(z) = -\|z-z_g\|_2 / s$ ($s=10$,
+cf.~\S\ref{sec:oo-setup}). When there is more than one critic head
+($\mathrm{num\_qs}=2$ in our agent), $Q_\theta$ above denotes the
+ensemble mean. The chosen action is then
+\begin{equation}
+a_t^\star \;=\; a_0^{(i^\star)},
+\qquad i^\star = \arg\max_{i}\; J\!\big(a^{(i)}\big),
+\label{eq:mpc-argmax}
+\end{equation}
+and the agent commits the $25$-dimensional chunk $a_t^\star$ to the
+real environment, dispatched as $5$ consecutive $5$-D sub-actions.
+
+The full BoN-MPC procedure is summarised as Algorithm~\ref{alg:mpc-bon}
+(corresponding to \texttt{eval\_mpc.py}, lines~$205$--$222$).
+
+\begin{algorithm}[t]
+\caption{Best-of-$N$ MPC ($K_{\text{grad}}=0$ branch of
+   \texttt{\_make\_mpc\_fn}, \texttt{eval\_mpc.py})}
+\label{alg:mpc-bon}
+\begin{algorithmic}[1]
+\Require current latent $z_t$, actor $\pi_\theta$, critic $Q_\theta$,
+         WM $f_\psi$, goal latent $z_g$, hyperparameters $N$, $H$,
+         $\gamma$, $s$, scoring $J$.
+\State Tile $z_t$ to a batch $z_{\text{batch}}\in\mathbb{R}^{N\times 192}$.
+\State Sample $\{x_0^{(i)}\}\sim\mathcal{N}(0,I_{25})$,
+       set $a_0^{(i)}\leftarrow\Phi_\theta(z_{\text{batch}},x_0^{(i)})$
+       (Eq.~\eqref{eq:mpc-proposal}).
+\State $z_t \leftarrow z_{\text{batch}}$, $a_t \leftarrow a_0$, $s_t \leftarrow 0$.
+\For{$h = 0,\dots,H-1$}
+   \State $z_{h+1}\leftarrow f_\psi(z_h, a_h)$.
+   \If{$J = J_{\text{Q-all}}$}
+      \State $a_{h+1}\sim\pi_\theta(\cdot\mid z_{h+1})$;
+             $s_t \mathrel{+}= \gamma^h Q_\theta(z_{h+1}, a_{h+1})$.
+   \Else
+      \If{$J = J_{\text{dense+Q}}$}
+         \State $s_t \mathrel{+}= \gamma^h\,\tilde r^{\text{dense}}(z_{h+1})$.
+      \EndIf
+      \State $a_{h+1}\sim\pi_\theta(\cdot\mid z_{h+1})$.
+   \EndIf
+\EndFor
+\If{$J \ne J_{\text{Q-all}}$} $s_t \mathrel{+}= Q_\theta(z_H, a_H)$. \EndIf
+\State $i^\star \leftarrow \arg\max_i s_t^{(i)}$.
+\State \Return $a_0^{(i^\star)}$.
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Headline result.} On the $81.6\%$ offline checkpoint
+\texttt{sd55445}, the best BoN-MPC configuration ($N=32$, $H=1$,
+$J_{\text{Q-term}}$) reaches $88.0\%$ real-env success---a $+6.4\%$
+absolute lift purely from inference-time search. The full sweep is in
+Table~\ref{tab:mpc-frozen} in \S\ref{sec:mpc-results}. Two
+observations: $H=1$ with $J_{\text{Q-term}}$ beats both dense reward
+shaping and longer horizons ($H=2,3$ at $K=0$ score $83$--$88\%$
+depending on choices), and a separate run with a VAML-finetuned WM
+\cite{farahmand2017value} performs no better than the standard FT WM,
+confirming that the WM accuracy is not the bottleneck.
+
+\section{Gradient-refined MPC}
+\label{sec:mpc-grad}
+
+BoN-MPC is restricted to the actions the proposal distribution actually
+samples. Because the WM rollout in \S\ref{sec:mpc-bon} is fully
+differentiable, we can refine the first chunk of the winning candidate
+by gradient ascent through the score itself.
+
+\paragraph{Grad-MPC update.} Define the differentiable scalarised score
+as in Eq.~\eqref{eq:mpc-score-qterm}--\eqref{eq:mpc-score-densepq} but
+treating the continuation noise samples
+$\{\tilde x_0^{(i,h)}\}$ as constants (so the gradient flows only
+through the initial chunk $a_0$ and the chained $f_\psi$ and $Q_\theta$
+calls). In code (\texttt{eval\_mpc.py}, lines~$153$--$181$) the
+continuation actions are wrapped in \texttt{jax.lax.stop\_gradient} so
+that the gradient does \emph{not} propagate through the actor's flow
+integrator. We then run $K$ raw gradient-ascent steps per proposal:
+\begin{equation}
+a_0 \;\leftarrow\; \mathrm{clip}\!\big(a_0 + \eta\,\nabla_{a_0} J(a_0;\,z_t),\;-1,\;1\big),
+\quad k = 1,\dots,K,
+\label{eq:mpc-grad}
+\end{equation}
+with $\eta = 0.01$. After the $K$ steps, fresh continuation noise is
+drawn and a final scoring pass selects the best refined proposal.
+
+\paragraph{Headline result.} With $H=2$, $K=5$, $N=32$,
+$J_{\text{Q-term}}$, Grad-MPC reaches $90.0\%$---a further $+2.0\%$
+over BoN-MPC and now within $2.8\%$ of the IMPALA baseline. See
+Algorithm~\ref{alg:mpc-grad} for the full procedure.
+
+\begin{algorithm}[t]
+\caption{Grad-MPC and FMQ
+   (\texttt{eval\_mpc.py}, lines~$135$--$202$). The two methods share
+   the proposal step and differ only in the inner update on $a_0$.}
+\label{alg:mpc-grad}
+\begin{algorithmic}[1]
+\Require $z_t$, $\pi_\theta$, $Q_\theta$, $f_\psi$, $z_g$,
+         scoring $J$; method-specific HPs $(K,\eta)$ for Grad-MPC
+         or $\eta$ for FMQ.
+\State Sample $\{x_0^{(i)}\}\sim\mathcal{N}(0,I_{25})$;
+       set $a_0^{(i)}\leftarrow\Phi_\theta(z_t, x_0^{(i)})$.
+\State Pre-sample continuation noises
+       $\{\tilde x_0^{(i,h)}\sim\mathcal{N}(0,I_{25})\}_{h=0}^{H-1}$;
+       these are constants in the gradient computation below.
+\If{Grad-MPC}
+   \For{$k = 1,\dots,K$}
+      \State $g\leftarrow\nabla_{a_0}\,J(a_0;z_t,\{\tilde x_0\})$
+             (BPTT through $H$ WM steps).
+      \State $a_0\leftarrow\mathrm{clip}(a_0 + \eta\,g,\,-1,1)$.
+   \EndFor
+\ElsIf{FMQ}
+   \State $g\leftarrow\nabla_{a_0}\,J(a_0;z_t,\{\tilde x_0\})$
+          (single BPTT pass).
+   \State $a_0\leftarrow\mathrm{clip}\big(a_0 + \eta\,g / \|g\|_2,\,-1,1\big)$.
+\EndIf
+\State Draw fresh continuation noises and re-score
+       $a_0^{(1)},\dots,a_0^{(N)}$ as in
+       Algorithm~\ref{alg:mpc-bon}.
+\State \Return $a_0^{(i^\star)}$ with
+       $i^\star=\arg\max_i\,s_t^{(i)}$.
+\end{algorithmic}
+\end{algorithm}
+
+\section{Flow-Matching $Q$ (FMQ): a single normalised step}
+\label{sec:mpc-fmq}
+
+Grad-MPC is sensitive to the step size $\eta$ and to the choice of
+$K$; large $K$ overshoots, small $K$ underuses the gradient. FMQ
+replaces the raw multi-step ascent with a single normalised step under
+a trust-region radius $\eta$:
+\begin{equation}
+a_0^\star \;=\; \mathrm{clip}\!\left(
+   a_0 \;+\; \eta\;\frac{\nabla_{a_0} J(a_0;\,z_t)}{\|\nabla_{a_0} J(a_0;\,z_t)\|_2},\;
+   -1,\;1\right).
+\label{eq:mpc-fmq}
+\end{equation}
+The gradient still flows through the full $H$-step WM rollout via BPTT.
+We pair FMQ with the multi-step scoring $J_{\text{Q-all}}$ rather than
+$J_{\text{Q-term}}$ so that the gradient sums coherent signals from
+$Q$ at every intermediate WM state, not just the terminal one.
+
+\paragraph{Sensitivity on the base policy.} Applied to the
+$81.6\%$ frozen base policy, FMQ reaches $90.0\%$ at $\eta=0.1$ with
+$J_{\text{Q-all}}$---the same peak as Grad-MPC ($K=5$). Performance
+collapses sharply above $\eta=0.1$: $\eta=0.3$ already drops to
+$57.2\%$ (Table~\ref{tab:mpc-fmq-basepolicy} in
+\S\ref{sec:mpc-results}). The base critic is well-calibrated only for
+actions in a narrow neighbourhood of what the BC-flow actor would
+sample; large normalised steps move actions outside that
+neighbourhood, the critic returns unreliable values, and the score
+ordering collapses. This sensitivity is the empirical motivation for
+\S\ref{sec:mpc-interleaved}: if we train the actor and critic with
+labels generated by FMQ, the critic learns to be reliable on
+FMQ-shaped actions.
+
+\section{Offline MPC distillation}
+\label{sec:mpc-offline-distill}
+
+The simplest way to amortise inference-time MPC into the policy is a
+two-phase pipeline: relabel the offline dataset with MPC-selected
+actions, then continue training the BC-flow actor on those relabels.
+This is the approach in \texttt{offline\_mpc\_distill.py}.
+
+\paragraph{Phase A — relabel.} For every latent observation
+$z\in\mathcal{Z}_{\text{off}}$ in the offline cache we run the
+Grad-MPC procedure of \S\ref{sec:mpc-grad} ($N=32$, $H=2$, $K=5$,
+$\eta=0.01$, $J_{\text{Q-term}}$) using the offline-trained actor and
+critic and the fully fine-tuned WM as the planner components, and
+record the resulting $25$-D chunk as $a^{\text{mpc}}(z)$. The output is
+a new dataset of $(z,\,a^{\text{mpc}}(z))$ pairs.
+
+\paragraph{Phase B — distil.} We continue training \emph{only} the
+BC-flow actor on the relabelled pairs, with the critic and one-step
+distillation heads frozen. The loss is the flow-matching BC loss of
+Eq.~\eqref{eq:oo-bc} with $a$ replaced by $a^{\text{mpc}}$:
+\begin{equation}
+\mathcal{L}_{\text{distil}}(\theta) \;=\;
+   \mathbb{E}_{z,\,t\sim U[0,1],\,x_0\sim\mathcal{N}(0,I)}\!\left[
+   \big\|u_\theta\!\big(z,\,x_t,\,t\big) \;-\; \big(a^{\text{mpc}}(z) - x_0\big)\big\|_2^2\right],
+\label{eq:mpc-distil-loss}
+\end{equation}
+with $x_t = (1-t)x_0 + t\,a^{\text{mpc}}(z)$. The optimiser is AdamW
+with learning rate $10^{-4}$, weight decay $10^{-4}$, batch size
+$256$, for $10^5$ gradient steps.
+
+\paragraph{Phase C — evaluate.} The resulting actor can be evaluated
+standalone (BoN $N=4$ under $Q_\theta$, no WM at test time) or used as
+the proposal distribution inside any of
+\S\S\ref{sec:mpc-bon}--\ref{sec:mpc-fmq} at test time.
+
+\paragraph{Findings and limitations.} Offline distillation lifts the
+\emph{standalone} success rate only modestly (to $\sim 81$--$84\%$,
+within the bounds of the offline baseline) but improves the MPC-eval
+score significantly. The bottleneck is the critic: it was trained on
+the unmodified offline action distribution and remains so. The next
+section addresses that by letting actor, critic, and MPC labels
+co-evolve during continued offline training.
+
+\section{Interleaved MPC distillation}
+\label{sec:mpc-interleaved}
+
+We now turn to the main method. Inside the standard offline FQL loop
+(\S\ref{sec:oo-setup}) we periodically regenerate MPC labels from the
+\emph{current} agent and inject those labels into each training batch.
+The critic and actor are both updated at every step; the actor sees
+MPC-shaped actions on a fraction of each batch and gradually learns to
+propose them; the critic sees the same actions and updates its
+$Q$-values to be reliable on them.
+
+\paragraph{MPC label buffer.} A fixed-size circular buffer
+$\mathcal{B}_{\text{mpc}}$ of $(z,\,a^{\text{mpc}}(z))$ pairs is
+refreshed every $T_{\text{relabel}}$ gradient steps after an initial
+warm-up of $T_{\text{warm}}$ steps. On each refresh we sample
+$|\mathcal{B}_{\text{mpc}}|$ states uniformly from the offline cache and
+relabel them with the current agent's MPC procedure
+(\texttt{train\_interleaved\_mpc.py}, lines~$112$--$219$). The label
+generator can be Grad-MPC (Eq.~\eqref{eq:mpc-grad}) or FMQ
+(Eq.~\eqref{eq:mpc-fmq}); both options are exposed.
+
+\paragraph{Mixed batch injection.} At each training step we draw a
+real-data minibatch $B$ from the offline replay and, if
+$\mathcal{B}_{\text{mpc}}$ is filled, replace the first $\lfloor pB\rfloor$
+rows with samples from the MPC buffer
+(\texttt{inject\_mpc\_into\_batch}, lines~$394$--$419$). The replaced
+rows carry the same $(z, a^{\text{mpc}}(z))$ values; observations and
+the first action slot are overwritten and the validity mask is reset to
+$1$. Importantly, the replacement happens to \emph{both} the actor and
+critic targets in the same batch: the critic minimises the standard
+TD residual of Eq.~\eqref{eq:oo-critic} on $(z, a^{\text{mpc}}, r, z')$,
+where $r$ is the offline-relabelled real reward and $z'$ the offline
+next-state stored alongside the action---the critic never sees a
+WM-imagined state, only the action label that MPC chose. The default
+mix ratio is $p = 0.3$.
+
+A ``separate'' mode is also implemented in which the MPC labels are
+used only in an additional actor-only gradient step performed every
+$50$ main steps, leaving the critic's batch composition untouched.
+Our experiments show that the mixed mode wins decisively
+(\S\ref{sec:mpc-results}); we conjecture this is because the critic
+must \emph{see} the MPC actions to assign them high $Q$, otherwise the
+actor is pulled toward labels the critic cannot endorse.
+
+\paragraph{AWR-filtered variant.} An optional advantage filter keeps
+only labels that the current critic prefers over the actor's own
+proposal. At relabel time we score both actions:
+\begin{align}
+\hat A(z) &= Q_\theta\!\big(z,\,a^{\text{mpc}}(z)\big) - Q_\theta\!\big(z,\,\pi_\theta(z)\big),
+\label{eq:mpc-awr-adv}\\
+w(z) &= \exp\!\Big(\mathrm{clip}\big(\hat A(z)/\beta,\,-10,\,5\big)\Big)\,\mathbb{1}\!\big[\hat A(z) > \tau_{\text{awr}}\big],
+\label{eq:mpc-awr-weight}
+\end{align}
+with temperature $\beta=1$ and threshold $\tau_{\text{awr}}=0$. The
+actor-only loss in this mode becomes
+$\sum_i w_i (u_\theta(\cdot) - (a_i^{\text{mpc}} - x_0))^2 / \sum_i w_i$.
+Empirically (Table~\ref{tab:mpc-interleaved}) AWR filtering does not
+beat plain mixed injection on this task; we report it for completeness
+and use the plain mixed variant as the default.
+
+The full procedure is summarised as Algorithm~\ref{alg:mpc-interleaved}.
+
+\begin{algorithm}[t]
+\caption{Interleaved MPC distillation
+   (\texttt{train\_interleaved\_mpc.py}, lines~$639$--$758$).}
+\label{alg:mpc-interleaved}
+\begin{algorithmic}[1]
+\Require offline dataset $\mathcal{D}_{\text{off}}$, agent
+         $(\pi_\theta,Q_\theta)$, frozen WM $f_\psi$, hyperparameters
+         $T_{\text{warm}}$, $T_{\text{relabel}}$,
+         $|\mathcal{B}_{\text{mpc}}|$, $p$, label generator
+         $\mathcal{M}\in\{\text{Grad-MPC},\,\text{FMQ}\}$.
+\State $\mathcal{B}_{\text{mpc}}\leftarrow\emptyset$.
+\For{$\mathrm{step} = 1,\dots,T_{\text{total}}$}
+   \If{$\mathrm{step} \ge T_{\text{warm}}$
+       \textbf{and} $\mathrm{step}\bmod T_{\text{relabel}} = 0$}
+      \State Sample $|\mathcal{B}_{\text{mpc}}|$ states from
+             $\mathcal{D}_{\text{off}}$.
+      \State For each $z$, set
+             $a^{\text{mpc}}(z)\leftarrow \mathcal{M}(z;\pi_\theta,Q_\theta,f_\psi)$
+             (Alg.~\ref{alg:mpc-grad}).
+      \State $\mathcal{B}_{\text{mpc}}\leftarrow\{(z,\,a^{\text{mpc}}(z))\}$;
+             reset actor-only optimiser state.
+   \EndIf
+   \State Sample minibatch $B$ from $\mathcal{D}_{\text{off}}$.
+   \If{$\mathcal{B}_{\text{mpc}}\ne\emptyset$}
+      \State Sample $\lfloor pB\rfloor$ pairs from
+             $\mathcal{B}_{\text{mpc}}$ and overwrite the first
+             $\lfloor pB\rfloor$ rows of $B$'s observations and actions.
+   \EndIf
+   \State Update $(\theta,Q_\theta)$ on $B$ with
+          $\mathcal{L}_{\text{critic}}+\mathcal{L}_{\text{actor}}$
+          (Eqs.~\eqref{eq:oo-critic}--\eqref{eq:oo-bc}).
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Grad-MPC labels vs FMQ labels.} The label generator
+$\mathcal{M}$ is a free choice. With Grad-MPC labels the procedure
+mirrors offline distillation but with a co-evolving critic; we refer to
+these runs as D1--D6 in Table~\ref{tab:mpc-interleaved}. The strongest
+configuration in this family (D4: $N=32$, $H=2$, $K=5$, mixed, $p=0.3$)
+reaches $92.4\%$ on MPC-eval---the first method in this thesis within
+$0.4\%$ of the $92.8\%$ IMPALA target. Replacing Grad-MPC labels with
+FMQ labels ($\eta_{\text{train}}=0.1$, $H=2$,
+$J_{\text{Q-all}}$) produces qualitatively cleaner actions for the
+critic to consume: a single normalised step lies closer to actions the
+actor can match, and the critic accordingly learns a $Q$ that is well
+calibrated for FMQ-shaped actions. The D7d run
+($\eta_{\text{train}}=0.1$, $T_{\text{relabel}}=50{,}000$, $p=0.3$,
+$|\mathcal{B}_{\text{mpc}}|=2{,}000$) reaches a standalone peak of
+$86.8\%$ at $400$k steps and---when evaluated with FMQ inference at the
+fine inference radius $\eta=0.02$---hits \textbf{$96.0\%$} (Table~\ref{tab:mpc-fmq-distilled}),
+a $+3.2\%$ absolute improvement over the IMPALA baseline.
+
+\section{Results}
+\label{sec:mpc-results}
+
+We collect the headline numbers here. The complete hyperparameter
+sweeps are in Appendix~\ref{app:oo-sweeps}.
+
+\begin{table}[h]
+\centering
+\caption{Frozen offline policy combined with WM-based inference
+   (Eqs.~\eqref{eq:mpc-proposal}--\eqref{eq:mpc-fmq}). All entries use
+   the $81.6\%$ baseline (\texttt{sd55445}); scoring \emph{Q-term} is
+   $J_{\text{Q-term}}$ and \emph{dense+Q} is $J_{\text{dense+Q}}$;
+   $250$ episodes on
+   \texttt{visual-cube-single-singletask-task1-v0}, $N=32$
+   throughout.}
+\label{tab:mpc-frozen}
+\begin{tabular}{l c c l r}
+\toprule
+Method & $H$ & $K$ & Scoring & SR (\%) \\
+\midrule
+BoN-MPC                 & 1 & 0 & dense+Q & 87.2 \\
+BoN-MPC                 & 1 & 0 & Q-term  & \textbf{88.0} \\
+BoN-MPC                 & 2 & 0 & Q-term  & 83.6 \\
+BoN-MPC                 & 3 & 0 & dense+Q & 81.6 \\
+\midrule
+Grad-MPC                & 1 & 5 & Q-term  & 88.8 \\
+Grad-MPC                & 2 & 5 & Q-term  & \textbf{90.0} \\
+Grad-MPC                & 3 & 5 & dense+Q & 88.8 \\
+\midrule
+BoN-MPC (VAML WM)       & 3 & 0 & Q-term  & 81.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{FMQ inference (Eq.~\eqref{eq:mpc-fmq}) applied to the
+   $81.6\%$ frozen base policy. Same agent and WM as
+   Table~\ref{tab:mpc-frozen}; $N=32$, $H$ as shown. Peak at
+   $\eta=0.1$ matches Grad-MPC ($K=5$); collapse above $\eta=0.1$
+   indicates the base critic is not calibrated for FMQ-shaped
+   actions.}
+\label{tab:mpc-fmq-basepolicy}
+\begin{tabular}{c l c r}
+\toprule
+$H$ & Scoring & $\eta$ & SR (\%) \\
+\midrule
+2 & Q-all  & 0.10 & \textbf{90.0} \\
+2 & Q-all  & 0.30 & 57.2 \\
+2 & Q-all  & 0.50 & 25.6 \\
+1 & Q-all  & 0.30 & 60.0 \\
+2 & Q-term & 0.30 & 58.8 \\
+1 & Q-term & 0.30 & 61.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Interleaved MPC distillation with Grad-MPC labels
+   (Alg.~\ref{alg:mpc-interleaved}, $\mathcal{M}=$ Grad-MPC, $K=5$).
+   $500{,}000$ offline steps, seed $42$, starting policy
+   $\texttt{sd55445}$ ($81.6\%$). \emph{Standalone} is the best
+   per-checkpoint success rate when the actor is used without the WM
+   (BoN $N=4$); \emph{MPC-eval} re-applies Grad-MPC ($N=32$, $H=2$,
+   $K=5$) on top of the final actor.}
+\label{tab:mpc-interleaved}
+\begin{tabular}{l l l c r r}
+\toprule
+Run & MPC config & Mode & $p$ & Peak SA (\%) & MPC-eval (\%) \\
+\midrule
+D1 & $N{=}8$, $H{=}1$, $K{=}3$  & sep   & 1.0 & 83.6 & 86.8 \\
+D2 & $N{=}8$, $H{=}1$, $K{=}3$  & mixed & 0.3 & 81.6 & 91.2 \\
+D3 & $N{=}32$, $H{=}2$, $K{=}5$ & sep   & 1.0 & 84.0 & 85.6 \\
+D4 & $N{=}32$, $H{=}2$, $K{=}5$ & mixed & 0.3 & 82.8 & \textbf{92.4} \\
+D5 & $N{=}32$, $H{=}2$, $K{=}5$ & awr   & 0.3 & 84.4 & 90.0 \\
+D6 & $N{=}32$, $H{=}2$, $K{=}5$ & mixed-awr & 0.3 & 84.4 & 91.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{FMQ-label interleaved distillation: relabeling interval
+   sweep. All runs use FMQ labels at $\eta_{\text{train}}=0.1$,
+   $H=2$, $N=32$, mixed injection at $p=0.3$. D4b reuses the D4
+   recipe (Grad-MPC labels, $K=5$) at a $25$k interval for
+   comparison. MPC-eval uses Grad-MPC ($N=32$, $H=2$, $K=5$,
+   $J_{\text{Q-term}}$).}
+\label{tab:mpc-relabel-sweep}
+\begin{tabular}{l l l r r r r r}
+\toprule
+& & & \multicolumn{5}{c}{SR at checkpoint (\%)} \\
+\cmidrule(lr){4-8}
+Run & Labels & Interval & 100k & 200k & 300k & 400k & 500k \\
+\midrule
+\multicolumn{8}{l}{\emph{Standalone (BoN $N=4$)}} \\
+D7c & FMQ      & 25k & 67.2 & \textbf{86.8} & 80.0 & 82.0 & 71.2 \\
+D7d & FMQ      & 50k & 68.4 & 80.8           & 68.0 & \textbf{86.8} & 74.0 \\
+\midrule
+\multicolumn{8}{l}{\emph{MPC-eval (Grad-MPC $K=5$, Q-term)}} \\
+D7c & FMQ      & 25k & 80.8 & 88.4 & 91.2 & 91.6 & 88.8 \\
+D7d & FMQ      & 50k & 79.2 & 88.8 & 79.2 & \textbf{93.2} & 90.4 \\
+D4b & Grad-MPC & 25k & 62.8 & 74.4 & 67.6 & 79.2 & --   \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Inference-time sweep on the D7d $400$k checkpoint. The
+   distilled critic is robust to small FMQ radii: SR stays above $94\%$
+   for $\eta\in[0.01,0.05]$ and reaches $96.0\%$ at $\eta\in\{0.02,
+   0.03\}$, a $+3.2\%$ lift over the IMPALA baseline. Compare with
+   Table~\ref{tab:mpc-fmq-basepolicy}, where the un-distilled critic
+   collapses at any $\eta > 0.1$.}
+\label{tab:mpc-fmq-distilled}
+\begin{tabular}{l l l r}
+\toprule
+Method & Scoring & Config & SR (\%) \\
+\midrule
+FMQ      & Q-all  & $\eta=0.01$ & 94.8 \\
+FMQ      & Q-all  & $\eta=0.02$ & \textbf{96.0} \\
+FMQ      & Q-all  & $\eta=0.03$ & \textbf{96.0} \\
+FMQ      & Q-all  & $\eta=0.05$ & 94.0 \\
+FMQ      & Q-all  & $\eta=0.10$ & 90.8 \\
+FMQ      & Q-all  & $\eta=0.20$ & 80.8 \\
+FMQ      & Q-term & $\eta=0.05$ & 93.6 \\
+\midrule
+Grad-MPC & Q-term & $K=5$       & 93.2 \\
+Grad-MPC & Q-term & $K=8$       & \textbf{96.0} \\
+Grad-MPC & Q-term & $K=10$      & 90.8 \\
+\midrule
+Standalone (BoN $N=4$) & -- & --   & 86.8 \\
+IMPALA baseline        & -- & --   & 92.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Headline progression.}
+\begin{enumerate}
+\item Offline baseline (\texttt{sd55445}): $81.6\%$.
+\item Frozen policy + BoN-MPC ($H=1$, $N=32$): $88.0\%$.
+\item Frozen policy + Grad-MPC ($H=2$, $K=5$): $90.0\%$.
+\item Interleaved Grad-MPC distillation (D4, mixed): $92.4\%$.
+\item Interleaved FMQ-label distillation + Grad-MPC eval (D7d $400$k):
+      $93.2\%$.
+\item \textbf{Interleaved FMQ-label distillation + FMQ inference}
+      (D7d $400$k, $\eta=0.02$): \textbf{$96.0\%$}.
+\end{enumerate}
+
+Further hyperparameter sweeps (FMQ label radius, relabeling interval,
+mix ratio, buffer size, actor learning rate, training duration) and the
+$\eta=0.02$ evaluation on best-of-each-run checkpoints are deferred to
+Appendix~\ref{app:oo-sweeps}.
+
+\section{Discussion}
+\label{sec:mpc-discussion}
+
+\paragraph{Why this works where WM-environment training failed.} The
+WM is used only at inference, only for short rollouts of $H\le 2$, and
+only as a source of \emph{rankings} between candidate actions. It is
+never the source of a Bellman target. The critic stays trained on real
+$(z,a,r,z')$ tuples from the offline buffer, so the four failure
+mechanisms of \S\ref{sec:oo-synthesis}---compounding error,
+$Q$-corruption, termination-threshold pathology, and the model-exploitation
+trap---never come into play.
+
+\paragraph{Training/inference symmetry under FMQ.}
+Table~\ref{tab:mpc-fmq-basepolicy} and Table~\ref{tab:mpc-fmq-distilled}
+form a clean before/after comparison. The base critic peaks under FMQ
+at $\eta\approx 0.1$ and collapses above; the FMQ-distilled critic peaks
+at $\eta\approx 0.02$--$0.03$ and stays above $94\%$ for the entire
+range $[0.01,0.05]$. This shift is empirical evidence that the
+$Q$-function calibrates to the action distribution it is supervised on:
+training the actor on FMQ-shaped actions implicitly trains the critic
+to assign reliable values to those same actions, which then permits
+much finer-grained inference-time refinement.
+
+\paragraph{Limitations and natural next steps.} Every experiment in
+this chapter is on a single OGBench task; we have not tested cross-task
+or cross-environment generalisation. There is no real online
+interaction at any point; distillation is offline throughout. The
+dominant compute cost is the periodic relabeling pass, which scales
+linearly in $N$, $H$, and the buffer size; we have not explored
+amortising this across tasks. Finally, the success of the
+inference-time procedure depends on the WM being accurate enough over
+$1$--$2$ steps; longer planning horizons in the WM remain blocked by
+the compounding error of \S\ref{sec:oo-exp1}.

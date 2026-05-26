@@ -1,0 +1,447 @@
+\chapter{Offline-to-Online with the Latent World Model}
+\label{chap:offline-online}
+
+\section{Motivation}
+\label{sec:oo-motivation}
+
+The HIQL pipeline of \S\ref{sec:hiql-lewm} and its WGSP extension
+(Chapter~\ref{ch:wgsp}) produce strong \emph{offline} agents in the LeWM
+latent space, but their final scores plateau short of the privileged-state
+baselines reported in OGBench \cite{ogbench_park2025}. On the
+\texttt{visual-cube-single-singletask-task1-v0} benchmark, our best frozen
+flow-matching policy reaches a $250$-episode success rate of $81.6\%$
+(seed \texttt{sd55445}), while the IMPALA \cite{espeholt2018impala}
+baseline reported by OGBench reaches $92.8\%$. A natural next step is
+\emph{offline-to-online} fine-tuning: continue training the policy with
+fresh interaction beyond the static offline dataset.
+
+In a physical setting, additional online interaction requires either a
+real robot or a high-fidelity simulator. We already have neither, but we
+\emph{do} have a learned latent dynamics model $f_\psi$
+(\S\ref{sec:lewm-bg}). The temptation is immediate: wrap the latent
+predictor as a Gymnasium environment, swap it in for the real
+\textsc{OGBench} env, and let the agent collect synthetic transitions in
+the latent space. This chapter documents the eight experiments we ran
+along that line, none of which beat the offline baseline. The synthesis
+in \S\ref{sec:oo-synthesis} characterises the four distinct ways the
+attempt fails, and motivates the conceptual pivot of
+Chapter~\ref{chap:mpc-distill}: keep the WM out of the training loop but
+use it at \emph{inference} time.
+
+\section{The latents are sufficient: a positive control}
+\label{sec:oo-b2}
+
+Before describing the failures, it is important to rule out the obvious
+``maybe the LeJEPA latents simply do not contain enough task information''
+hypothesis. We ran a sanity-check experiment, denoted \textbf{B2}, that
+isolates the encoder from the predictor.
+
+\paragraph{Setup.} We use the real OGBench environment
+\texttt{visual-cube-single-singletask-task1-v0} as the dynamics source
+but replace its raw $224{\times}224{\times}3$ pixel observations with the
+frozen LeJEPA encoder output. A thin \texttt{gymnasium.ObservationWrapper}
+(implemented as \texttt{JEPAObsWrapper} in
+\texttt{envs/jepa\_obs\_wrapper.py}) maps each pixel observation
+$o_t\in\mathbb{R}^{H\times W\times 3}$ to the $192$-dimensional latent
+$z_t = E_\xi(o_t)$, where $E_\xi$ is the same encoder that drives the
+WM (\S\ref{sec:lewm-bg}). The agent is the action-chunked Flow Q-Learning
+agent (\texttt{agents/acfql.py}, \S\ref{sec:hiql-flow}) trained with
+$5\times 10^5$ offline gradient steps on the JEPA-encoded play dataset
+followed by $5\times 10^5$ steps of \emph{real} online interaction
+collected by the policy and added to the replay buffer.
+
+\paragraph{Result.} The B2 agent reaches a final per-episode success rate
+of $1.00$ after the online phase (run \texttt{qc\_b2\_t1\_s0},
+\texttt{sd55223}, $10^6$ training steps).
+
+\paragraph{Implication.} The $192$-dimensional LeJEPA latents carry
+enough task-relevant information for an offline-to-online RL agent to
+solve the task perfectly when given access to true dynamics. Any
+subsequent failure of the WM-environment experiments must therefore be
+attributable to the \emph{predictor} $f_\psi$, not to the encoder
+$E_\xi$. We refer back to this control throughout the chapter.
+
+\section{Common setup for the WM-environment experiments}
+\label{sec:oo-setup}
+
+All experiments in \S\S\ref{sec:oo-exp1}--\ref{sec:oo-exp8} share the
+same agent, encoder, and offline data, and differ only in how the WM is
+used during the online phase. We collect the shared notation here.
+
+\paragraph{World-model environment.} We wrap the frozen LeWM predictor
+$f_\psi$ (cross-ref \S\ref{sec:lewm-bg}) as a Gymnasium env, denoted
+$\widetilde{\mathcal{E}}=(\mathcal{Z},\mathcal{A},f_\psi,\tilde r,\tilde T)$ and
+implemented in \texttt{envs/wm\_env.py}. State $z_t\in\mathbb{R}^{192}$
+is a latent; the action space is $\mathcal{A}=[-1,1]^{25}$, where each
+$25$-dimensional ``chunk'' is the row-major concatenation of $5$
+consecutive $5$-D end-effector commands (one WM step thus advances the
+latent by $5$ real env steps). Episodes run for at most $\tilde T = 40$
+WM steps ($\approx 200$ real env steps).
+
+\paragraph{Reward.} Two reward shapes are used throughout the chapter:
+\begin{align}
+\tilde r_t^{\text{sparse}} &= \mathbb{1}\!\left[\,\|z_t-z_g\|_2 < \tau_{\text{done}}\,\right], \\
+\tilde r_t^{\text{dense}}  &= -\frac{\|z_t-z_g\|_2}{s}, \qquad s=10.
+\end{align}
+where $z_g$ is the latent encoding of the goal image returned by
+\texttt{env.reset(options=\{render\_goal:True\})}, and $\tau_{\text{done}}$
+is a per-experiment hyperparameter discussed below. The same dense
+reward is used to \emph{relabel} the offline buffer whenever
+$\tilde r^{\text{dense}}$ is used online, so that the critic does not
+fit a mixture of two reward functions.
+
+\paragraph{Agent.} We use the action-chunked Flow Q-Learning (FQL) agent
+of \S\ref{sec:hiql-flow} in \texttt{distill-ddpg} mode. Its critic and
+actor losses (\texttt{agents/acfql.py}, lines~39--191) are
+\begin{align}
+\mathcal{L}_{\text{critic}} &= \mathbb{E}\!\left[\Big(Q_\theta(z,a) -
+   \big(r_T + \gamma^{H_{\text{chunk}}}\,m\,Q_{\bar\theta}(z',a')\big)\Big)^2\right],
+\label{eq:oo-critic}\\
+\mathcal{L}_{\text{BC}} &= \mathbb{E}\!\left[\big\|u_\theta(z, x_t, t) - (a - x_0)\big\|_2^2\right],
+\quad\text{cf.\ Eq.~\eqref{eq:flow-bc-clean}},
+\label{eq:oo-bc}
+\end{align}
+with $\gamma=0.99$, chunk length $H_{\text{chunk}}=5$, target-network
+Polyak rate $\tau=0.005$, and BC coefficient $\alpha=100$ on the
+one-step distillation head. We freeze nothing on the agent side; what
+varies between experiments is the source of $(z,a,r,z')$ during the
+online phase.
+
+\section{Experiment~1: plain WM-environment}
+\label{sec:oo-exp1}
+
+The simplest possible setup: replace the real env entirely with
+$\widetilde{\mathcal{E}}$, sparse reward, no anchoring. Each WM episode
+starts from a uniformly sampled latent in an initial-state pool drawn
+from the offline data and runs freely for up to $40$ WM steps with
+$\tau_{\text{done}}=14$. The agent (starting from a $61.6\%$ offline
+checkpoint trained with the unfinetuned LeJEPA WM) collects synthetic
+transitions $(z_t,a_t,\tilde r_t,z_{t+1})$ and updates with the standard
+FQL losses of Eqs.~\eqref{eq:oo-critic}--\eqref{eq:oo-bc}.
+
+\paragraph{Hypothesis.} Online transitions in the WM env should expand
+coverage beyond the offline play distribution, exactly as on-policy
+rollouts in the real env do.
+
+\paragraph{Result.} Real-env success rate drops to $20$--$30\%$ across
+three seeds. Note the contrast with B2 (\S\ref{sec:oo-b2}): the same
+agent, same encoder, and same offline dataset reach $100\%$ when paired
+with real dynamics and collapse to a quarter of the offline baseline
+when paired with WM dynamics.
+
+\paragraph{Failure mechanism.} The WM is a one-step predictor trained
+with a contrastive prediction loss
+(Eq.~\eqref{eq:pred-loss-clean}); per-step prediction errors of
+$\sim 8$--$9\%$ in cosine distance compound over $40$ steps so that
+late-episode latents drift well outside the offline support. The critic
+then fits Bellman targets at these drifted states, the actor minimises
+a Q-objective on the corrupted critic, and the resulting policy exploits
+hallucinated latent-space shortcuts that have no analogue in the real env.
+
+\section{Experiment~2: anchored restart rollouts}
+\label{sec:oo-exp2}
+
+To bound the compounding error of \S\ref{sec:oo-exp1} we restrict WM
+rollouts to short segments that are periodically re-grounded against the
+offline data. The mechanism is the \emph{anchored restart rollout}
+(``Variant B'' in the code, \texttt{envs/wm\_env.py}, lines~$163$--$201$).
+
+\paragraph{Mechanism.} Let
+$\mathcal{Z}_{\text{off}}\subset\mathbb{R}^{192}$ be the set of all
+latents in the offline cache (one per real env step). Every
+$L_b$ WM steps we query the nearest neighbour
+$\hat z = \arg\min_{z'\in\mathcal{Z}_{\text{off}}}\|z_t - z'\|_2$ (using
+a GPU-resident cosine search via FAISS, falling back to a torch
+matmul). We accept the anchor and snap the rollout state to it iff both
+of the following hold:
+\begin{equation}
+\frac{\langle z_t, \hat z\rangle}{\|z_t\|\,\|\hat z\|} \ge \tau_{\cos},
+\qquad
+\|z_t - \hat z\|_2 \le \tau_{L_2},
+\label{eq:oo-anchor-accept}
+\end{equation}
+with $\tau_{\cos} = 0.95$ and $\tau_{L_2} = 4.0$. If accepted, the
+current branch terminates with \texttt{truncated=True} and the next
+\texttt{reset()} starts from $\hat z$; otherwise the rollout is
+abandoned and a fresh latent is drawn from the initial-state pool. The
+transition tuple written to the replay buffer always uses the WM output
+as $z_{t+1}$ (no fake snap edge). Formally, the per-step dynamics with
+anchoring are
+\begin{equation}
+z_{t+1} \;=\; \Pi^{\epsilon}_{\mathcal{Z}_{\text{off}}}\!\Big(f_\psi(z_t,a_t)\Big),
+\quad
+\Pi^{\epsilon}_{\mathcal{Z}_{\text{off}}}(z) \;=\;
+\begin{cases}
+\hat z & \text{if Eq.~\eqref{eq:oo-anchor-accept} holds},\\
+z      & \text{otherwise,}
+\end{cases}
+\label{eq:oo-anchor-proj}
+\end{equation}
+applied only at end-of-branch boundaries (every $L_b=3$ steps).
+
+\paragraph{Results.} Three variants were run, all from the $61.6\%$
+base policy unless otherwise stated:
+\begin{itemize}
+\item Sparse reward, original LeJEPA WM, $\tau_{\text{done}}=10$:
+      $13$--$22\%$ across four seeds.
+\item Dense reward, partially fine-tuned WM
+      (\texttt{lejepa\_play\_ft}), $\tau_{\text{done}}=15$:
+      $8$--$54\%$ across four seeds (mean $\approx 31\%$, high variance).
+\item Dense reward, fully fine-tuned WM
+      (\texttt{lejepa\_play\_ft\_full}), $\tau_{\text{done}}=15$, from
+      the $81.6\%$ baseline: $15.2\%$.
+\end{itemize}
+
+\paragraph{Failure mechanism.} Anchoring successfully bounds the
+compounding error, but the fully fine-tuned WM introduces a new
+pathology: it compresses latent distances so that the typical
+distance-to-goal is $\sim 11$, which is \emph{below} the
+$\tau_{\text{done}}=15$ termination threshold. Every WM episode then
+terminates at step~$1$ with the success flag set, producing degenerate
+$1$-step training data throughout the entire online phase. The high
+variance of the partial-fine-tune dense-reward run is the same effect
+in milder form: the threshold and the WM's latent geometry interact in
+ways that swing the success-rate signal between near-zero (always
+``done'') and near-correct (sometimes done) depending on the seed.
+
+\section{Experiment~3: joint training of the world model and policy}
+\label{sec:oo-exp3}
+
+A more ambitious approach: rather than freeze the WM, optimise it jointly
+with the policy during the offline phase, so that the WM is encouraged
+to produce predictions that are useful for $Q$-learning rather than
+merely physically plausible.
+
+\paragraph{Joint loss.} During the offline phase the WM predictor
+$f_\psi$ has its own AdamW optimiser and receives gradient from a
+two-term loss (\texttt{agents/acfql.py}, lines~$193$--$242$):
+\begin{align}
+\mathcal{L}_{\text{WM}}(\psi) &= \alpha\,\mathcal{L}_{\text{pred}}(\psi) + \beta(t)\,\mathcal{L}_{\text{value}}(\psi),
+\label{eq:oo-joint}\\
+\mathcal{L}_{\text{pred}}(\psi) &= \mathbb{E}\!\left[\,
+   \frac{\|f_\psi(z,a) - z'\|_2^2}{\|z'\|_2^2 + \varepsilon}\right],
+\label{eq:oo-pred}\\
+\mathcal{L}_{\text{value}}(\psi) &=
+   \mathbb{E}\!\left[\Big(Q_{\bar\theta}(z,a) -
+      \big(r + \gamma\, m\, Q_{\bar\theta}(f_\psi(z,a), a')\big)\Big)^2\right],
+\quad a'\sim\pi_\theta\big(\cdot\,|\,\mathrm{sg}[f_\psi(z,a)]\big).
+\label{eq:oo-value}
+\end{align}
+Here $\mathrm{sg}[\cdot]$ stops the action-sampling gradient from
+flowing back into $\psi$, and $Q_{\bar\theta}$ is the target critic so
+that the WM does not chase a moving target during early training. The
+weight $\beta(t)$ ramps linearly from $0$ to a final value
+$\beta_{\max}=0.1$ over the first $\beta_{\text{ramp}}=50{,}000$
+gradient steps, giving the critic time to stabilise before the WM
+starts to listen to it. The coefficient on the prediction term is
+$\alpha=1$.
+
+The actor and critic losses themselves are unchanged from
+Eqs.~\eqref{eq:oo-critic}--\eqref{eq:oo-bc}. The joint update is then
+\begin{equation}
+\mathcal{L}_{\text{joint}}(\theta,\psi) \;=\;
+\mathcal{L}_{\text{critic}}(\theta) + \mathcal{L}_{\text{actor}}(\theta) + \mathcal{L}_{\text{WM}}(\psi),
+\end{equation}
+with $\theta$ and $\psi$ updated through two separate optimisers in the
+same gradient step.
+
+\paragraph{Setup and result.} Joint training is followed by an
+anchored, dense-reward, WM-env online phase using the resulting
+\emph{joint} WM (\texttt{jointtrained\_sd55488}) and the
+\emph{joint} policy ($79.6\%$ offline). Real-env success rate after the
+online phase: $9.6\%$.
+
+\paragraph{Diagnostic decomposition.} To localise the failure we ran two
+follow-up diagnostics, swapping each of the joint-trained components
+back to its base counterpart in the online phase:
+\begin{center}
+\begin{tabular}{lll r}
+\toprule
+Run & Policy used online & WM used online & SR (\%) \\
+\midrule
+\texttt{diag\_basepolicy\_jointwm}  & base ($81.6\%$) & joint WM &  $7.2$ \\
+\texttt{diag\_jointpolicy\_basewm}  & joint ($79.6\%$) & base WM & $30.0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The joint-trained WM destroys performance regardless of which policy it
+is paired with; the joint-trained policy performs comparably to the
+other failed runs when paired with the base WM. The locus of the failure
+is therefore $\psi$, not $\theta$.
+
+\paragraph{Failure mechanism.} The $\mathcal{L}_{\text{value}}$ term in
+Eq.~\eqref{eq:oo-value} measures the Bellman residual between the
+target critic at the \emph{real} next state and the target critic at the
+WM-\emph{predicted} next state. Minimising it with respect to $\psi$
+gives the WM a strong incentive to produce $z_{\text{pred}}$ that
+satisfy the Bellman equation under the current $Q_{\bar\theta}$,
+regardless of whether they correspond to plausible real dynamics. In
+the absence of any constraint forcing $f_\psi$ to remain a faithful
+simulator, the predictor learns to hallucinate high-value states---a
+classic instance of the model-exploitation failure mode of
+model-based RL.
+
+\section{Experiments~4--5: uncertainty-penalised rewards}
+\label{sec:oo-exp45}
+
+A standard remedy for model exploitation is to penalise predicted
+transitions by an estimate of model uncertainty, in the spirit of
+MOPO~\cite{yu2020mopomodelbasedofflinepolicy} and COMBO. We test two
+uncertainty estimators inside the WMEnv pipeline (anchored, dense
+reward, fully fine-tuned WM, $\tau_{\text{done}}=15$, base policy
+$81.6\%$). The penalised reward is
+\begin{equation}
+\tilde r'_t \;=\; \tilde r_t \;-\; \lambda\, u(z_{t+1}, a_t),
+\label{eq:oo-mopo-reward}
+\end{equation}
+with the two estimators below substituted for $u$.
+
+\paragraph{Ensemble disagreement.} Three independently seeded copies of
+the fully fine-tuned WM, $\{f_\psi^{(k)}\}_{k=1}^3$, are run in parallel.
+The per-step uncertainty is the L$_2$ norm of the per-element standard
+deviation of their predictions:
+\begin{equation}
+u_{\text{ens}}(z,a) \;=\; \Big\|\,\sigma_k\!\big[f_\psi^{(k)}(z,a)\big]\,\Big\|_2,
+\label{eq:oo-mopo-ens}
+\end{equation}
+with $\lambda = 0.6$. Result: $21.2\%$ success.
+
+\paragraph{Nearest-neighbour cosine distance.} A single WM, with
+uncertainty estimated as the cosine distance from each predicted latent
+to its nearest neighbour in the offline anchor pool
+$\mathcal{Z}_{\text{off}}$:
+\begin{equation}
+u_{\text{nn}}(z') \;=\; 1 \;-\; \max_{z\in\mathcal{Z}_{\text{off}}}\;
+   \frac{\langle z, z'\rangle}{\|z\|\,\|z'\|},
+\label{eq:oo-mopo-nn}
+\end{equation}
+with $\lambda = 0.07$. Result: $2.4\%$ success---worse than the unpenalised
+baseline.
+
+\paragraph{Failure mechanism.} Both penalties act as approximations of
+``how far this transition is from the offline support'', but the play
+dataset is dominated by undirected exploration of the workspace.
+Successful task-solving actions push the cube toward the goal and the
+latent toward less-visited regions of the dataset. The NN-distance
+penalty therefore discriminates \emph{against} precisely the actions we
+want the policy to take, inverting the action ranking under the
+$Q$-function. The ensemble penalty is less directly catastrophic
+because the three WMs share the same play-dataset bias, so disagreement
+is a uniform downward offset on rewards rather than a directional
+signal, but both runs additionally suffer from the degenerate $1$-step
+episodes of \S\ref{sec:oo-exp2}.
+
+\section{Experiment~6: differentiable WM rollouts}
+\label{sec:oo-exp8}
+
+Our final attempt avoids treating the WM as an environment at all.
+Instead, the frozen WM is used as a \emph{differentiable simulator} and
+an analytic policy-gradient term is added to the actor loss.
+
+\paragraph{Rollout loss.} The actor receives an additional term
+(\texttt{agents/acfql.py}, lines~$71$--$109$)
+\begin{equation}
+\mathcal{L}_{\text{roll}}(\theta) \;=\;
+   -\mathbb{E}_{z\sim\mathcal{D}}\!\left[\,\sum_{k=0}^{H-1}\gamma^k\,
+   \tilde r^{\text{dense}}\!\big(z_{t+k+1}\big)\right],
+\quad
+z_{t+k+1} = f_\psi\!\big(z_{t+k},\,\pi_\theta(z_{t+k})\big),
+\label{eq:oo-rollout-loss}
+\end{equation}
+with $H=3$. Because $f_\psi$ and the flow-matching actor $\pi_\theta$
+are both differentiable, the gradient flows from the dense reward back
+through three WM steps and through the actor's $10$-step Euler
+integration into the actor parameters. The total actor loss becomes
+$\mathcal{L}_{\text{actor}} + \lambda_{\text{roll}}\,\mathcal{L}_{\text{roll}}$.
+
+In contrast with \S\ref{sec:oo-exp3}, the WM is here \emph{frozen}: this
+mechanism changes the actor using the WM as a fixed simulator, not the
+WM using the actor as a source of value signal.
+
+\paragraph{Setup and result.} Two values of $\lambda_{\text{roll}}$ were
+tested, $0.1$ and $1.0$, both with anchoring on, dense reward, and the
+partially fine-tuned WM, starting from the $61.6\%$ base. Both runs
+collapse to $0.0\%$ real-env success.
+
+\paragraph{Failure mechanism.} The gradient through Eq.~\eqref{eq:oo-rollout-loss}
+chains the actor's $10$ flow integration steps and three WM steps. Each
+WM step introduces $\sim 8\%$ cosine error in the latent, and each flow
+step is a noisy estimate of the flow velocity; the combined gradient
+landscape no longer reflects the true return. At $\lambda_{\text{roll}}=1$
+the rollout term dominates the BC-flow loss and the actor abandons the
+behavioural distribution to chase WM rewards; at $\lambda_{\text{roll}}=0.1$
+the rollout gradient is too small relative to BC to influence the
+actor. Neither tuning works.
+
+\section{Synthesis}
+\label{sec:oo-synthesis}
+
+Table~\ref{tab:oo-summary} collects every WM-based offline-to-online
+attempt in the chapter. None beats its corresponding offline baseline.
+
+\begin{table}[h]
+\centering
+\caption{Summary of all WM-based offline-to-online attempts on
+   \texttt{visual-cube-single-singletask-task1-v0}. SR is the
+   real-env success rate over $250$ episodes. The B2 control row
+   (\S\ref{sec:oo-b2}) is included for reference: with the real env
+   in place of the WM, the same agent reaches $100\%$.}
+\label{tab:oo-summary}
+\begin{tabular}{l l c c}
+\toprule
+Experiment & Mechanism & Offline SR (\%) & Online SR (\%) \\
+\midrule
+B2 (real env, JEPA obs) & encoder-only control                       & 81.6 & \textbf{100.0} \\
+\midrule
+\S\ref{sec:oo-exp1} plain WM-env, sparse           & no anchoring                       & 61.6 & 20--30 \\
+\S\ref{sec:oo-exp2} anchored, sparse               & $L_b{=}3$, $\tau_{\cos}{=}0.95$    & 61.6 & 13--22 \\
+\S\ref{sec:oo-exp2} anchored, dense, partial FT WM & dense reward                       & 61.6 & 8--54  \\
+\S\ref{sec:oo-exp2} anchored, dense, full FT WM    & $1$-step degenerate episodes       & 81.6 & 15.2   \\
+\S\ref{sec:oo-exp3} joint training + anchored      & $\mathcal{L}_{\text{pred}}+\beta\mathcal{L}_{\text{value}}$ & 79.6 & 9.6    \\
+\quad diag: base policy + joint WM                 & isolate WM                         & 81.6 & 7.2    \\
+\quad diag: joint policy + base WM                 & isolate policy                     & 79.6 & 30.0   \\
+\S\ref{sec:oo-exp45} ensemble penalty              & $\lambda{=}0.6$, $3$ WMs            & 81.6 & 21.2   \\
+\S\ref{sec:oo-exp45} NN-distance penalty           & $\lambda{=}0.07$                    & 81.6 & 2.4    \\
+\S\ref{sec:oo-exp8} differentiable rollouts        & frozen WM, actor BPTT               & 61.6 & 0.0    \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Four failure mechanisms.} The B2 control rules out the
+encoder; every failure above is attributable to the WM
+\emph{predictor}, but through four distinct routes.
+\begin{enumerate}
+\item \emph{Compounding latent-prediction error.}
+      Per-step prediction error of $\sim 8\%$ in cosine distance compounds
+      over $\sim 40$-step rollouts. The drifted latents take the policy
+      and critic outside the offline support
+      (\S\ref{sec:oo-exp1},~\S\ref{sec:oo-exp2}).
+\item \emph{$Q$-function corruption.}
+      WM-only transitions feed Bellman targets that the critic fits;
+      since the WM transitions are systematically wrong, the resulting
+      $Q$ ranks real-env actions incorrectly. Every online run suffers
+      this, regardless of anchoring or pessimism.
+\item \emph{Termination-threshold pathology.}
+      Fine-tuned WMs compress latent distances. With a fixed
+      $\tau_{\text{done}}$, episodes terminate at step~$1$, producing
+      useless training signal (\S\ref{sec:oo-exp2},~\S\ref{sec:oo-exp45}).
+\item \emph{WM-as-optimisation-target trap.}
+      When the WM is updated against a critic-derived loss it learns to
+      hallucinate states that satisfy the Bellman equation rather than
+      states that correspond to real dynamics (\S\ref{sec:oo-exp3}).
+\end{enumerate}
+
+\paragraph{The asymmetry that motivates Chapter~\ref{chap:mpc-distill}.}
+The four mechanisms above all share a structural feature: they require
+the WM to be a \emph{source of supervision} for the policy or critic,
+either through TD targets, dense reward, or policy gradients. The WM is
+too inaccurate to play that role. But none of the failures challenges
+the weaker claim that the WM, applied for one or two steps starting
+from a real on-policy latent, gives a noisy but informative
+\emph{ranking} of candidate action chunks. We have not used the WM that
+way in any experiment in this chapter. Chapter~\ref{chap:mpc-distill}
+takes exactly that approach: we leave training fully offline on real
+data, so the critic stays honest, and use the WM only at inference time
+to expand the action search beyond what the actor would propose on its
+own.

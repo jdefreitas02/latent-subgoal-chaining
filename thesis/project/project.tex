@@ -1,0 +1,889 @@
+
+\chapter{Methodology}
+\label{chap:methodology}
+
+This chapter presents the algorithms that underpin our experimental study.
+We begin by formalising goal-conditioned reinforcement learning in a learned
+latent space (\S\ref{sec:problem}), followed by a description of the
+JEPA-style world model used to construct this representation
+(\S\ref{sec:lewm-bg}). 
+
+Building on this foundation, we introduce a sequence of reinforcement
+learning methods, each motivated by a concrete limitation of the previous
+approach. Rather than presenting these methods in isolation, we develop them
+incrementally, highlighting how each design decision addresses specific
+failures encountered in practice. The methods are therefore organised both
+chronologically and conceptually: curriculum SAC
+(\S\ref{sec:curr-sac}), HER-enhanced SAC
+(\S\ref{sec:her-sac}), hierarchical SAC with behavioural regularisation
+(\S\ref{sec:joint}), HIQL adapted to latent world models
+(\S\ref{sec:hiql-lewm}), and finally a flow-matching policy for
+high-dimensional action generation (\S\ref{sec:hiql-flow}).
+
+\medskip
+
+The progression of methods can be understood as a sequence of increasingly
+structured solutions to long-horizon, high-dimensional control in offline
+settings.
+
+\textbf{(i)~Latent World Model (LeWM).}
+We first decouple representation learning from control by training a
+JEPA-style world model (\S\ref{sec:lewm-bg}). The model consists of an
+encoder and predictor trained with a spectral isotropy regulariser,
+producing a latent space in which Euclidean distances are approximately
+Gaussian and isotropic. This geometric structure is crucial: it enables
+simple distance-based rewards and stabilises downstream learning.
+Once trained, the encoder and predictor are frozen, and all subsequent
+methods operate entirely within this latent space.
+
+\textbf{(ii)~Curriculum SAC.}
+Using the learned latent dynamics as a differentiable simulator, we next
+train a flat goal-conditioned policy with Soft Actor-Critic
+(\S\ref{sec:curr-sac}). To mitigate the difficulty of long-horizon tasks,
+we introduce a curriculum over goal distances, gradually increasing task
+complexity during training. Despite careful tuning—including action
+penalties, reward shaping, and stable initialisation—this approach
+struggles to scale. Without hindsight relabelling, the agent receives
+little to no informative signal when goals are distant, resulting in slow
+or unstable learning.
+
+\textbf{(iii)~HER + SAC.}
+To address this sparsity, we incorporate Hindsight Experience Replay
+(\S\ref{sec:her-sac}). By relabelling trajectories with goals that were
+actually achieved, every transition becomes a potential learning signal.
+We further introduce an episodic replay buffer, explicit sparse and dense
+reward formulations, and multiple goal-sampling strategies (curriculum,
+fixed-gap, and distance-based). This significantly improves data
+efficiency and broadens the effective training distribution. However,
+the policy remains flat, and performance degrades on tasks requiring
+multi-step planning.
+
+\textbf{(iv)~Hierarchical SAC with Behavioural Regularisation.}
+To better handle long-horizon reasoning, we introduce a hierarchical
+structure (\S\ref{sec:joint}). A high-level policy proposes intermediate
+waypoints, while a low-level SAC agent learns to reach them. The
+high-level policy is trained using distance-based
+advantage-weighted regression, and its behaviour is regularised using a
+behaviour-cloning loss derived from an offline expert cache. This
+stabilises early training and encourages realistic subgoal selection.
+However, the approach remains sensitive to compounding model errors:
+rollouts in the learned latent dynamics can drift over time, and the
+action-conditioned $Q$-function exhibits high variance, limiting
+reliability.
+
+\textbf{(v)~HIQL + LeWM.}
+To overcome the instability of online value learning in latent
+imagination, we reformulate the problem as offline reinforcement learning
+using Implicit Q-Learning (\S\ref{sec:hiql-lewm}). Instead of learning an
+action-conditioned value function $Q(z, g, a)$, we learn an action-free
+value function $V(z, \varphi(z,g))$ using expectile regression. A learned
+low-dimensional goal embedding $\varphi$ compresses the high-dimensional
+latent space, improving generalisation and stability. Crucially, this
+formulation avoids querying out-of-distribution actions, making it well
+suited to training on static datasets. World-model rollouts are only
+introduced after an initial warm-up phase to prevent early-stage
+divergence.
+
+\textbf{(vi)~Flow-Matching Policy.}
+Finally, we address a key limitation of standard actor-critic methods:
+the inability to represent complex, multimodal action distributions. We
+replace the unimodal Gaussian low-level policy with a conditional
+flow-matching model (\S\ref{sec:hiql-flow}), which learns a velocity field
+over actions and is trained via one-step distillation. This allows the
+policy to represent diverse manipulation strategies and produce coherent
+action sequences in high-dimensional spaces, without requiring explicit
+likelihood computation.
+
+\medskip
+
+Taken together, these components form a unified framework that combines
+latent world modelling, hierarchical abstraction, offline value learning,
+and expressive policy representations. The resulting system is designed to
+address the core challenges of long-horizon, high-dimensional,
+goal-conditioned control in offline settings.
+
+% ---------------------------------------------------------------------
+\section{Problem Formulation}
+\label{sec:problem}
+
+We consider goal-reaching as a goal-conditioned Markov decision process
+(GCMDP) $\mathcal{M}_g = (\mathcal{S}, \mathcal{A}, \mathcal{G}, p, r, \gamma)$,
+where $\mathcal{S}$ denotes the observation space, $\mathcal{A} = \mathbb{R}^{d_a}$
+is a continuous action space, $\mathcal{G} \subseteq \mathcal{S}$ is the set of
+valid goals, $p(s' \mid s,a)$ defines the (unknown) environment dynamics,
+$r(s,a,g)$ is a goal-conditioned reward function, and $\gamma \in [0,1)$ is the
+discount factor. The objective is to learn a policy $\pi(a \mid s, g)$ that
+maximises expected return for arbitrary goals $g$.
+
+In our setting, observations are high-dimensional RGB images
+($224 \times 224$), making direct learning in $\mathcal{S}$ both
+computationally inefficient and statistically challenging. To address this,
+we introduce a learned latent representation $\mathcal{Z} = \mathbb{R}^{d_z}$
+with $d_z = 192$, obtained via an encoder $E_\xi : \mathcal{S} \to \mathcal{Z}$.
+This induces a latent goal-conditioned MDP:
+\begin{equation}
+\widehat{\mathcal{M}}_g
+= (\mathcal{Z}, \mathcal{A}, \mathcal{Z}, \hat{p}, \hat{r}, \gamma),
+\end{equation}
+where both states and goals are represented in the same latent space.
+
+The latent dynamics are modelled by an action-conditioned predictor
+\begin{equation}
+\hat{p}(z' \mid z, a) \approx f_\psi(z, a),
+\end{equation}
+which deterministically predicts the next latent state. Together, the encoder
+and predictor $(E_\xi, f_\psi)$ constitute the world model described in
+\S\ref{sec:lewm-bg}. Once trained, this model is frozen and used as a
+differentiable simulator for all downstream reinforcement learning methods.
+
+Operating in latent space provides two key advantages. First, it removes the
+need to model high-dimensional pixel observations, focusing instead on
+task-relevant features. Second, as discussed in \S\ref{sec:lewm-bg}, the latent
+space is structured such that Euclidean distances are meaningful, enabling the
+use of simple distance-based reward functions for goal-reaching.
+
+\medskip
+
+\noindent
+We use the following notation throughout the remainder of this chapter:
+\medskip
+
+\noindent
+\begin{tabular}{ll}
+$z, z' \in \mathcal{Z}$ & latent states \\
+$g \in \mathcal{Z}$ & goal embedding (latent goal) \\
+$a \in \mathcal{A}$ & action \\
+$\pi(a \mid z, g)$ & goal-conditioned policy \\
+$Q_\theta(z, g, a)$ & action-value function (critic) \\
+$V_\phi(z, g)$ & state-value function \\
+$f_\psi(z, a)$ & latent dynamics predictor \\
+$E_\xi(s) \to z$ & encoder mapping observations to latent space (frozen) \\
+\end{tabular}
+
+\section{The Learned World Model}
+\label{sec:lewm-bg}
+
+This work builds upon an existing latent world model, \emph{LeWorldModel}
+(LeWM), which we adopt as a fixed representation and dynamics module
+throughout our experiments. We do not contribute to the design or training
+of this model; rather, we use an open-source implementation trained on
+expert trajectories from \textsc{OGBench}. This section briefly summarises
+the key components of LeWM and highlights the properties that are critical
+for downstream control.
+
+LeWM follows a Joint-Embedding Predictive Architecture (JEPA)
+paradigm, in which the model is trained to predict future latent
+representations rather than reconstruct observations at the pixel level.
+Given a sequence of observations, the model learns a compact latent space
+and a predictor that captures environment dynamics directly in this space.
+
+\paragraph{Architecture.}
+The model consists of two components: an encoder $E_\xi$ and a predictor
+$f_\psi$. The encoder is a Vision Transformer (ViT-Tiny) that maps each
+input frame $s_t$ to a latent representation
+\[
+z_t = E_\xi(s_t) \in \mathbb{R}^{d_z}, \quad d_z = 192.
+\]
+Actions are embedded into the same latent dimension and provided as
+conditioning inputs to the predictor.
+
+The dynamics model $f_\psi$ is implemented as a multi-layer Transformer,
+which takes a short history of latent states and actions and predicts the
+next latent state. Conditioning on actions is achieved via adaptive
+normalisation (AdaLN), allowing the model to modulate its predictions based
+on control inputs.
+
+\paragraph{Predictive objective.}
+The model is trained to minimise a mean-squared prediction error in latent
+space. Given a context window of past states and actions, the predictor
+outputs a one-step prediction:
+\begin{equation}
+\mathcal{L}_{\mathrm{pred}}
+= \mathbb{E}_{\tau \sim \mathcal{D}} \left[
+\big\| f_\psi(z_{t-c:t-1}, a_{t-c:t-1}) - z_t \big\|_2^2
+\right],
+\label{eq:pred-loss-clean}
+\end{equation}
+where $z_t = E_\xi(s_t)$. This objective encourages the latent space to
+capture the minimal information required for predicting future dynamics.
+
+\paragraph{Preventing representation collapse.}
+A key challenge in JEPA-style models is representation collapse, where all
+inputs are mapped to a constant vector. LeWM addresses this using a
+\emph{spectral isotropy regulariser} (SIGReg), which encourages the latent
+distribution to match an isotropic Gaussian.
+
+Rather than directly constraining the covariance, SIGReg matches the
+empirical characteristic function of the latent distribution to that of a
+standard normal along random projection directions. This promotes both
+diversity and isotropy in the learned representation, preventing degenerate
+solutions while avoiding the need for architectural tricks such as
+stop-gradients or target networks.
+
+The overall training objective is:
+\begin{equation}
+\mathcal{L}_{\mathrm{LeWM}}
+= \mathcal{L}_{\mathrm{pred}} + \lambda_{\mathrm{sig}} \,
+\mathcal{L}_{\mathrm{SIGReg}}.
+\label{eq:lewm-total-clean}
+\end{equation}
+
+\paragraph{Usage in this work.}
+After training, both the encoder $E_\xi$ and predictor $f_\psi$ are frozen
+and used as a differentiable simulator in latent space. All reinforcement
+learning methods described in the remainder of this chapter operate solely
+on latent states $z \in \mathcal{Z}$ and predicted transitions
+$\hat{z}_{t+1} = f_\psi(z_t, a_t)$.
+
+\paragraph{Implications for control.}
+Two properties of LeWM are particularly important for our setting.
+
+\emph{First}, the predictor $f_\psi$ enables fast and differentiable
+rollouts in latent space, allowing policies to be trained without
+expensive interaction with the underlying simulator.
+
+\emph{Second}, the combination of latent prediction and isotropy
+regularisation induces a structured geometry in $\mathcal{Z}$. In
+particular, Euclidean distances $\|z - g\|_2$ provide a meaningful and
+approximately isotropic measure of similarity between states. This
+property is central to our formulation of goal-conditioned rewards, where
+distance in latent space serves as a dense proxy for task progress.
+
+In all subsequent methods, we define rewards of the form
+$r = -\|z_{\text{next}} - z_{\text{goal}}\|_2$,
+which is justified by the geometric properties of the latent space.
+
+% ---------------------------------------------------------------------
+\section{Curriculum Soft Actor-Critic (SAC) in Latent Space}
+\label{sec:curr-sac}
+
+We begin with the simplest learning setup that leverages the learned
+world model: a flat, goal-conditioned Soft Actor-Critic (SAC) agent
+trained entirely in latent space. The goal of this stage is not to
+achieve state-of-the-art performance, but to establish a baseline and
+identify the core challenges of learning from self-generated data in a
+long-horizon setting.
+
+The agent interacts only with the latent dynamics model $f_\psi$,
+treating it as a differentiable simulator. No expert data or hindsight
+relabeling is used at this stage. Instead, the policy is trained from
+scratch using trajectories generated by rolling out the current policy,
+with a curriculum over goal difficulty to stabilise learning.
+
+\paragraph{Policy and value networks.}
+Both the actor and critic are parameterised as multilayer perceptrons
+with two hidden layers of width $256$ and layer normalisation. The actor
+outputs a Gaussian policy with diagonal covariance, followed by a
+$\tanh$ squashing function to enforce bounded actions:
+\begin{equation}
+a = s_{\max}\,\tanh\!\big(\mu_\phi(z,g) + \sigma_\phi(z,g)\odot\epsilon\big),
+\qquad \epsilon \sim \mathcal{N}(0,I),
+\end{equation}
+where $s_{\max}$ controls the action scale. The corresponding log-probability
+accounts for the squashing transformation:
+\begin{equation}
+\log\pi_\phi(a \mid z,g)
+= \log\mathcal{N}(\tilde a;\,\mu_\phi,\sigma_\phi^2)
+- \sum_{i=1}^{d_a} \log\!\big(s_{\max}(1-\tanh^2 \tilde a_i) + \varepsilon\big).
+\end{equation}
+
+Careful initialisation is required for stability. In particular, output
+layers are initialised with small weights and the initial policy
+variance is kept low, ensuring that early rollouts remain within the
+support of the learned dynamics model. The critic consists of twin
+Q-functions $\{Q_{\theta_1}, Q_{\theta_2}\}$, following standard SAC
+practice to reduce overestimation bias.
+
+\paragraph{Latent environment and reward.}
+The environment is defined directly in latent space using the learned
+predictor. Given a current state $z_t$ and action $a_t$, the next state
+is obtained as $\hat{z}_{t+1} = f_\psi(z_t, a_t)$. 
+
+We define a dense, goal-conditioned reward based on Euclidean distance:
+\begin{equation}
+r_t = -\|z_{t+1} - g\|_2 - \lambda_a \|a_t\|_2,
+\end{equation}
+where the first term encourages progress toward the goal and the second
+term regularises the magnitude of actions. Episodes terminate when the
+agent reaches a neighbourhood of the goal:
+\begin{equation}
+d_t = \mathbb{1}\!\big[\|z_t - g\|_2 < \delta\big].
+\end{equation}
+The threshold $\delta$ is chosen based on the typical scale of latent
+prediction error, ensuring that termination corresponds to meaningful
+goal achievement.
+
+\paragraph{Optimisation.}
+Training follows the standard SAC objective. The critic is trained using
+a soft Bellman backup:
+\begin{equation}
+\widehat{Q}_t = r_t + \gamma (1 - d_t)
+\Big(\min_{i=1,2} Q_{\bar{\theta}_i}(z', g, a') - \alpha \log \pi_\phi(a' \mid z', g)\Big),
+\end{equation}
+and minimises the squared error to this target. The actor is updated by
+maximising expected Q-values while encouraging entropy:
+\begin{equation}
+\mathcal{L}_\pi = \mathbb{E}\!\left[\alpha \log \pi_\phi(a \mid z,g)
+- \min_{i=1,2} Q_{\theta_i}(z,g,a)\right].
+\end{equation}
+The temperature parameter $\alpha$ is learned to match a target entropy,
+balancing exploration and exploitation.
+
+\paragraph{Curriculum over goal difficulty.}
+A key challenge in goal-conditioned learning is that distant goals
+provide little useful signal early in training. To address this, we
+introduce a curriculum over goal distances. At stage $k$, goals are
+sampled from states that are $G_k$ steps ahead in expert trajectories,
+and rollouts are limited to a matching horizon $T_{\max,k}$:
+\begin{equation}
+G_k \in \{1,2,4,8,16,24,32,40\}, \qquad T_{\max,k} = G_k.
+\end{equation}
+The agent progresses to the next stage once its success rate exceeds a
+threshold, gradually increasing task difficulty.
+
+\paragraph{Limitations.}
+This approach relies entirely on on-policy data generated by the agent
+itself. While the dense latent reward provides some guidance, it does not
+fully resolve the challenge of long-horizon credit assignment. As the
+goal distance increases, the agent rarely encounters successful
+trajectories, and learning becomes unstable. In practice, performance
+plateaus after a small number of curriculum stages.
+
+This limitation highlights a fundamental issue: without additional data
+reuse, the agent cannot efficiently learn from its failures. In the next
+section, we address this by introducing hindsight goal relabeling, which
+transforms every trajectory into a useful learning signal.
+
+% ---------------------------------------------------------------------
+\section{HER+SAC: Hindsight Relabelling and Reward Design}
+\label{sec:her-sac}
+
+The failure mode identified in \S\ref{sec:curr-sac} arises from a lack of
+informative learning signal: the agent rarely reaches distant goals, and
+therefore receives little feedback on how to improve. This limitation is
+not specific to SAC, but reflects a broader issue in goal-conditioned
+reinforcement learning—namely, that sparse success signals make
+long-horizon learning intractable without additional data reuse.
+
+To address this, we extend the baseline with Hindsight Experience Replay
+(HER), transforming failed trajectories into useful supervision. In
+addition, we introduce an episodic replay buffer and explicitly study two
+reward formulations (sparse and dense), along with different strategies
+for sampling training tasks.
+
+\paragraph{Episodic replay buffer.}
+Unlike the flat replay buffer used previously, we store complete
+trajectories:
+\begin{equation*}
+\mathcal{B} = \big\{(z_{0:T_{\mathrm{ep}}},\,a_{0:T_{\mathrm{ep}}-1},\,z'_{0:T_{\mathrm{ep}}-1},\,g_{\mathrm{orig}})\big\}.
+\end{equation*}
+This structure is essential for HER, as it allows efficient sampling of
+future states from within the same episode. In practice, episodes are
+stored in pre-allocated GPU tensors for fast indexing and batch
+construction.
+
+\paragraph{Hindsight goal relabelling.}
+For each sampled transition $(z_t, a_t, z'_t, g_{\mathrm{orig}})$, we
+construct a relabelled goal by selecting a future state from the same
+trajectory:
+\begin{equation}
+g_{\mathrm{rel}} =
+\begin{cases}
+z_{t+\Delta}, \quad \Delta \sim \mathrm{Unif}\{1, \dots, T_{\mathrm{ep}} - t - 1\}, & \text{with probability } p_{\mathrm{HER}}, \\
+g_{\mathrm{orig}}, & \text{otherwise}.
+\end{cases}
+\label{eq:her-relabel-clean}
+\end{equation}
+Intuitively, this treats every visited state as a potential goal,
+allowing the agent to learn from what it \emph{did} achieve, rather than
+only what it intended to achieve. In our experiments, we use
+$p_{\mathrm{HER}} = 0.8$.
+
+\paragraph{Reward formulations.}
+Given a relabelled goal $g_{\mathrm{rel}}$, rewards are recomputed
+on-the-fly. We consider two distinct reward settings, evaluated in
+separate experiments.
+
+\textbf{Sparse reward.} The agent receives a reward only upon reaching
+the goal:
+\begin{equation}
+r_t =
+\mathbb{1}\!\big[\|z_{t+1} - g_{\mathrm{rel}}\|_2 < \delta\big] - 1
+- \lambda_a \|a_t\|_2.
+\label{eq:her-sparse-clean}
+\end{equation}
+This corresponds to a standard goal-reaching objective, where the agent
+is penalised until success. The threshold $\delta$ matches the latent
+termination condition defined earlier.
+
+\textbf{Dense reward.} In a separate set of experiments, we instead use a
+potential-based shaping reward:
+\begin{equation}
+r_t =
+\mathrm{clip}\!\left(
+\frac{\|z_t - g_{\mathrm{rel}}\|_2 - \|z_{t+1} - g_{\mathrm{rel}}\|_2}{\kappa},
+-2,\,2
+\right)
+- \lambda_a \|a_t\|_2.
+\label{eq:her-dense-clean}
+\end{equation}
+This reward measures progress toward the goal and can be interpreted as a
+clipped difference of a potential function
+$\Phi(z,g) = -\|z - g\|_2$. The scaling factor $\kappa$ controls the
+magnitude of rewards and prevents individual transitions from producing
+outliers.
+
+These two reward formulations serve different purposes: the sparse
+reward tests whether HER alone is sufficient to overcome credit
+assignment, while the dense reward evaluates whether additional shaping
+further improves learning efficiency.
+
+\paragraph{Task sampling strategies.}
+In addition to relabelling goals within trajectories, we vary how initial
+state–goal pairs $(z_0, g)$ are constructed. We consider three sampling
+strategies:
+
+\begin{align}
+\text{(curriculum)}\quad & (z_0, g) = (z_t,\, z_{t + G_k}), \quad G_k \uparrow,
+\\
+\text{(fixed-gap)}\quad & (z_0, g) = (z_t,\, z_{t + G}),
+\\
+\text{(pure-distance)}\quad & (z_0, g) = (z_t,\, z_{T_{\mathrm{ep}}-1}).
+\end{align}
+
+The curriculum strategy mirrors \S\ref{sec:curr-sac}, gradually
+increasing goal difficulty. The fixed-gap setting removes this
+adaptivity, while the pure-distance setting represents the most
+challenging case, requiring the agent to reach the final state of a
+trajectory. In this regime, HER implicitly provides intermediate
+subgoals through relabelling, effectively inducing a curriculum from the
+data.
+
+\paragraph{Optimisation.}
+The underlying learning algorithm remains unchanged: we optimise the
+standard SAC objectives (Eqs.~\eqref{eq:sac-q}--\eqref{eq:sac-alpha}),
+with rewards defined by either Eq.~\eqref{eq:her-sparse-clean} or
+Eq.~\eqref{eq:her-dense-clean}. 
+
+In practice, the dense reward leads to lower-variance updates and thus
+requires fewer gradient steps per iteration, while the sparse reward
+relies more heavily on HER to provide sufficient training signal.
+
+\paragraph{Discussion.}
+HER fundamentally changes the learning paradigm from purely on-policy
+trial-and-error to off-policy data reuse. By extracting supervision from
+every trajectory, it significantly improves sample efficiency and enables
+learning on tasks that were previously infeasible.
+
+However, while HER alleviates reward sparsity, it does not address the
+core challenge of long-horizon reasoning. The policy remains flat, and as
+task complexity increases, performance is still limited by the inability
+to decompose problems into intermediate steps. This motivates the
+introduction of hierarchical structure in the following section.
+
+% ---------------------------------------------------------------------
+\section{Hierarchical SAC with Expert-Guided Stabilisation}
+\label{sec:joint}
+
+While hindsight relabelling significantly improves sample efficiency, it
+does not resolve a more fundamental limitation: the policy remains
+\emph{flat}. As task horizons increase, the agent must reason over long
+sequences of actions, and the action-conditioned value function
+$Q(z,g,a)$ becomes increasingly difficult to estimate accurately from
+world-model rollouts alone. In particular, distant goals induce high
+variance in both value estimates and policy updates, leading to unstable
+training.
+
+To address this, we introduce a hierarchical structure that decomposes
+long-horizon tasks into shorter, more tractable subproblems. In addition,
+we incorporate offline expert data as a stabilising signal during
+training.
+
+\paragraph{Hierarchical decomposition.}
+We factor the policy into two levels:
+\begin{equation}
+\pi^{\mathrm{HL}}(z_{\mathrm{sub}} \mid z, g_{\mathrm{ult}}),
+\qquad
+\pi^{\mathrm{LL}}(a \mid z, z_{\mathrm{sub}}),
+\end{equation}
+where $g_{\mathrm{ult}}$ is the ultimate goal and
+$z_{\mathrm{sub}} \in \mathcal{Z}$ is a latent subgoal predicted by the
+high-level policy. Intuitively, the high-level actor proposes an
+intermediate waypoint, and the low-level actor is trained to reach this
+subgoal using primitive actions.
+
+The high-level policy operates at a lower temporal resolution, predicting
+subgoals approximately $G$ steps into the future, while the low-level
+policy executes at every timestep.
+
+\paragraph{Low-level policy learning.}
+The low-level policy is trained using SAC, as in
+\S\ref{sec:curr-sac}, but with the subgoal $z_{\mathrm{sub}}$ replacing
+the global goal. To stabilise training, we augment the actor objective
+with a behaviour cloning (BC) term derived from an offline expert
+dataset $\mathcal{D}_{\mathrm{exp}}$:
+\begin{equation}
+\mathcal{L}_\pi^{\mathrm{LL}} =
+\mathbb{E}\!\left[\alpha \log \pi^{\mathrm{LL}}(a \mid z, z_{\mathrm{sub}})
+- \min_{i=1,2} Q_{\theta_i}(z, z_{\mathrm{sub}}, a)\right]
++ \beta_{\mathrm{bc}}\,
+\mathbb{E}_{(z,g,a^*) \sim \mathcal{D}_{\mathrm{exp}}}
+\!\left[\|\pi^{\mathrm{LL}}(z,g) - a^*\|_2^2\right].
+\end{equation}
+This regularisation anchors the policy to the support of expert actions,
+reducing the likelihood of generating out-of-distribution actions that
+would lead to compounding errors in the world model.
+
+\paragraph{Reward design.}
+Rewards are defined as in \S\ref{sec:her-sac}, but with the goal replaced
+by the current subgoal $z_{\mathrm{sub}}$. In the dense reward setting,
+we disable hindsight relabelling, as trivial relabelling (e.g.,
+$g_{\mathrm{rel}} = z_{t+1}$) would artificially maximise the shaping
+reward and introduce degenerate learning signals.
+
+\paragraph{High-level policy learning.}
+The high-level policy is trained using advantage-weighted regression
+(AWR), with a distance-based notion of advantage. For transitions sampled
+from trajectories, we define:
+\begin{equation}
+A_t^{\mathrm{HL}} =
+\|z_t - g_{\mathrm{ult}}\|_2 - \|z_{t+G} - g_{\mathrm{ult}}\|_2,
+\end{equation}
+which measures the improvement in goal proximity over $G$ steps. This is
+converted into a weight:
+\begin{equation}
+w_t = \min\!\big(\exp(\beta_{\mathrm{HL}} A_t^{\mathrm{HL}}),\, w_{\max}\big),
+\end{equation}
+and the high-level objective becomes:
+\begin{equation}
+\mathcal{L}_{\mathrm{HL}} =
+\mathbb{E}\!\left[
+w_t \,\big\|\pi^{\mathrm{HL}}(z_t, g_{\mathrm{ult}}) - z_{t+G}\big\|_2^2
+\right].
+\end{equation}
+This encourages the high-level policy to predict subgoals that are both
+reachable and make meaningful progress toward the ultimate goal.
+
+\paragraph{Expert data integration.}
+To further improve stability, we mix transitions from the expert dataset
+$\mathcal{D}_{\mathrm{exp}}$ with those generated by the agent. Each
+training batch contains a fraction of expert transitions, controlled by
+a mixing parameter. This provides a strong initial training signal and
+helps prevent early collapse of the policy.
+
+At one extreme, using only expert data reduces to pure imitation
+learning; at the other, relying solely on self-generated data recovers
+the HER+SAC setting. In practice, an intermediate mixture yields the best
+performance.
+
+\paragraph{Optional latent projection.}
+In some experiments, we project latent states to a lower-dimensional
+space before feeding them to the reinforcement learning components. This
+reduces variance in value estimation and sharpens the distance-based
+signals used by the high-level policy, while leaving the world model
+itself unchanged.
+
+\paragraph{Limitations.}
+This hierarchical formulation substantially improves performance on
+longer-horizon tasks by decomposing them into manageable subproblems.
+However, training remains fundamentally on-policy and reliant on
+world-model rollouts. As a result, it is still sensitive to model errors
+and requires careful balancing between exploration, imitation, and
+stability.
+
+These challenges motivate the transition to a fully offline formulation,
+introduced in the next section, which avoids direct reliance on
+action-conditioned value estimation altogether.
+
+% ---------------------------------------------------------------------
+\section{HIQL in the LeWM Latent Space}
+\label{sec:hiql-lewm}
+
+The hierarchical SAC formulation in \S\ref{sec:joint} alleviates
+long-horizon planning by introducing temporal abstraction, but it still
+relies on an action-conditioned critic $Q(z,g,a)$. In practice, this
+remains a major source of instability: estimating $Q$ requires reasoning
+over both state and action spaces, and small errors in the world model
+compound when evaluating out-of-distribution actions.
+
+To address this, we move to an \emph{offline} formulation based on
+Implicit Q-Learning (IQL), and adopt its hierarchical extension (HIQL)
+in the LeWM latent space. The key idea is to \emph{eliminate explicit
+dependence on actions in the value function}, replacing $Q(z,g,a)$ with
+an action-free value function $V(z, \varphi(z,g))$. This removes the need
+to evaluate unseen actions and significantly improves stability.
+
+\paragraph{Model components.}
+The world model $(E_\xi, f_\psi)$ remains fixed. The trainable
+components are:
+\begin{equation}
+\varphi_\eta(z,g) \in \mathbb{R}^{d_r}, \qquad d_r = 10,
+\qquad \|\varphi_\eta(z,g)\|_2 = \sqrt{d_r},
+\end{equation}
+\begin{equation}
+V_{\phi_1}, V_{\phi_2} : \mathcal{Z} \times \mathbb{R}^{d_r} \to \mathbb{R},
+\qquad
+\pi^{\mathrm{HL}}(\varphi \mid z,g), \quad
+\pi^{\mathrm{LL}}(a \mid z,\varphi).
+\end{equation}
+
+Here, $\varphi_\eta(z,g)$ is a learned low-dimensional representation of
+the goal, which compresses the high-dimensional latent space into a more
+manageable form. This is particularly important because the LeWM latent
+space ($d_z=192$) is significantly overparameterised for value learning.
+Projecting onto a $10$-dimensional sphere enforces a structured and
+bounded representation, improving generalisation and stability.
+
+\paragraph{Value learning via expectile regression.}
+Instead of learning a $Q$-function, HIQL learns a value function that
+implicitly captures the maximum over actions. Given a subgoal
+$z_{\mathrm{sub}} = z_{t+k}$ sampled from the dataset, we define a dense
+reward:
+\[
+\hat r_t = -\|z_{t+1} - z_{\mathrm{sub}}\|_2,
+\]
+consistent with the latent geometry induced by LeWM.
+
+We construct target values:
+\begin{align}
+q_i &= \hat r_t + \gamma\,V_{\bar\phi_i}\!\big(z_{t+1},\,\bar\varphi(z_{t+1}, z_{\mathrm{sub}})\big),
+\end{align}
+and define an advantage-like quantity:
+\begin{align}
+A_t = \frac{1}{2}\sum_i q_i - \frac{1}{2}\sum_i V_{\bar\phi_i}\!\big(z_t,\,\bar\varphi(z_t, z_{\mathrm{sub}})\big).
+\end{align}
+
+The value function is trained using \emph{expectile regression}:
+\begin{align}
+\ell_\tau(u) &= \big|\tau - \mathbb{1}[u < 0]\big|\,u^2, \qquad \tau = 0.7, \\
+\mathcal{L}_V &= \mathbb{E}\!\left[\sum_{i=1}^{2}
+\ell_\tau\!\Big(q_i - V_{\phi_i}\!\big(z_t, \varphi_\eta(z_t, z_{\mathrm{sub}})\big)\Big)\right].
+\end{align}
+
+Intuitively, expectile regression biases the value function toward the
+\emph{upper tail} of the observed returns. This serves as a stable proxy
+for the $\max_a Q(z,g,a)$ operator in classical Q-learning, without ever
+evaluating actions explicitly. As a result, the method avoids
+overestimation errors on out-of-distribution actions—a key failure mode
+in offline RL.
+
+\paragraph{Policy learning via advantage-weighted regression.}
+Both the low-level and high-level policies are trained using
+advantage-weighted regression (AWR), which encourages imitation of
+actions and subgoals that lead to high-value outcomes.
+
+For the low-level policy:
+\begin{align}
+A^{\mathrm{LL}}_t &=
+\frac{1}{2}\sum_i \Big[
+V_{\phi_i}\!\big(z_{t+1}, \varphi(z_{t+1}, z_{\mathrm{sub}})\big)
+- V_{\phi_i}\!\big(z_t, \varphi(z_t, z_{\mathrm{sub}})\big)
+\Big], \\
+\mathcal{L}_{\pi^{\mathrm{LL}}} &=
+-\mathbb{E}\!\left[
+\min\big(\exp(\alpha_{\mathrm{LL}} A^{\mathrm{LL}}_t), 100\big)
+\log \pi^{\mathrm{LL}}\!\big(a_t \mid z_t, \varphi(z_t, z_{\mathrm{sub}})\big)
+\right].
+\end{align}
+
+For the high-level policy:
+\begin{align}
+A^{\mathrm{HL}}_t &=
+\frac{1}{2}\sum_i \Big[
+V_{\phi_i}\!\big(z_{t+k}, \varphi(z_{t+k}, g_{\mathrm{ult}})\big)
+- V_{\phi_i}\!\big(z_t, \varphi(z_t, g_{\mathrm{ult}})\big)
+\Big], \\
+\mathcal{L}_{\pi^{\mathrm{HL}}} &=
+-\mathbb{E}\!\left[
+\min\big(\exp(\alpha_{\mathrm{HL}} A^{\mathrm{HL}}_t), 100\big)
+\log \pi^{\mathrm{HL}}\!\big(\varphi(z_t, z_{\mathrm{sub}}) \mid z_t, g_{\mathrm{ult}}\big)
+\right].
+\end{align}
+
+The key idea is that both policies learn by \emph{reweighting behaviour}
+according to value improvement: transitions that lead to greater progress
+toward the goal are exponentially upweighted.
+
+\paragraph{Offline training with optional imagination.}
+HIQL is fundamentally an offline method, trained on fixed datasets of
+transitions. However, to leverage the learned world model, we introduce a
+two-phase training procedure:
+\begin{align}
+\textbf{Phase 1 (offline warm-up):} &\quad \text{train only on real data}, \\
+\textbf{Phase 2 (augmentation):} &\quad \text{mix real and synthetic data}.
+\end{align}
+
+Synthetic transitions are generated by rolling out the low-level policy
+through the latent dynamics model $f_\psi$. Subgoals are still sampled
+from real trajectories, ensuring that the imagined data remains grounded
+in the dataset distribution.
+
+\paragraph{Stability mechanisms.}
+To stabilise training, we maintain target networks for both the value
+function and goal representation:
+\[
+\bar\phi \leftarrow (1 - \tau)\bar\phi + \tau \phi, \qquad
+\bar\eta \leftarrow (1 - \tau)\bar\eta + \tau \eta,
+\]
+with $\tau = 0.005$.
+
+\paragraph{Discussion.}
+By removing the action-conditioned critic and adopting an offline
+learning paradigm, HIQL eliminates the primary source of instability
+observed in earlier methods. The combination of expectile regression and
+advantage-weighted regression enables stable learning from static data,
+while still supporting hierarchical reasoning.
+
+However, the low-level policy remains a unimodal Gaussian, which limits
+its ability to represent complex, multimodal action distributions
+commonly encountered in manipulation tasks. This limitation motivates the
+final extension presented in the next section.
+
+% ---------------------------------------------------------------------
+\section{Flow-Matching Low-Level Policy}
+\label{sec:hiql-flow}
+
+The HIQL formulation in \S\ref{sec:hiql-lewm} removes instability arising
+from action-conditioned value estimation, but the low-level policy
+remains a unimodal Gaussian. This assumption is restrictive in
+manipulation tasks, where multiple distinct actions may be equally valid
+in the same state (e.g., approaching an object from different
+directions). As a result, the Gaussian policy tends to average over
+modes, producing suboptimal or physically implausible actions.
+
+To address this limitation, we replace the Gaussian low-level actor with
+a \emph{flow-matching policy} that can represent complex, multimodal
+action distributions. The policy consists of two components: (i) a
+conditional velocity field trained via behaviour cloning, and (ii) a
+distilled one-step policy trained using advantage-weighted regression.
+All other components (value function, high-level policy, goal
+representation, and training procedure) remain unchanged.
+
+\paragraph{Conditional flow matching.}
+We model the action distribution implicitly as a continuous
+transformation from Gaussian noise to expert actions. Specifically, we
+define a velocity field $u_\theta$ that describes how a sample evolves
+over time from an initial noise distribution to a target action.
+
+Following the flow-matching formulation, we sample
+\[
+x_0 \sim \mathcal{N}(0,I), \qquad x_1 = a^*, \qquad t \sim \mathrm{Unif}[0,1],
+\]
+and construct an interpolation:
+\[
+x_t = (1 - t)\,x_0 + t\,x_1.
+\]
+The velocity field is trained to predict the direction from noise to the
+target action:
+\begin{equation}
+\mathcal{L}_{\mathrm{BC}}(\theta)
+= \mathbb{E}\!\left[
+\big\| u_\theta(z, \varphi, x_t, t) - (x_1 - x_0) \big\|_2^2
+\right].
+\label{eq:flow-bc-clean}
+\end{equation}
+
+Intuitively, this learns a continuous vector field that transports a
+simple Gaussian distribution into the complex, multimodal distribution
+of expert actions, conditioned on the current state and goal.
+
+\paragraph{Action generation via integration.}
+To generate an action, we simulate this flow starting from Gaussian
+noise. Using a simple Euler integration scheme with $S$ steps:
+\begin{equation}
+x_{i+1} = x_i + \frac{1}{S}\,u_\theta(z, \varphi, x_i, i/S),
+\qquad x_0 = \epsilon \sim \mathcal{N}(0,I),
+\end{equation}
+and the final action is:
+\begin{equation}
+\hat{a}_{\mathrm{flow}} = \mathrm{clip}(x_S, -s_{\max}, s_{\max}).
+\label{eq:flow-euler-clean}
+\end{equation}
+
+This procedure allows the policy to generate diverse actions depending
+on the initial noise sample, naturally capturing multimodal behaviour.
+
+\paragraph{Advantage-weighted distillation.}
+While the flow model is expressive, iterative integration is
+computationally expensive at inference time. To address this, we train a
+second network $\mu_\psi$ to approximate the output of the flow in a
+single forward pass.
+
+This network takes a noise sample $\epsilon$ and predicts an action
+directly. It is trained using advantage-weighted regression to imitate
+the flow output:
+\begin{equation}
+\mathcal{L}_{\mathrm{dist}}(\psi)
+= \mathbb{E}\!\left[
+\min\big(\exp(\alpha_{\mathrm{LL}} A^{\mathrm{LL}}_t), 100\big)
+\|\mu_\psi(z, \varphi, \epsilon) - \hat{a}_{\mathrm{flow}}\|_2^2
+\right].
+\label{eq:flow-dist-clean}
+\end{equation}
+
+The advantage weights ensure that the distilled policy focuses on
+high-value behaviours, effectively selecting the most useful modes of
+the action distribution.
+
+\paragraph{Training objective.}
+The two components are trained jointly:
+\begin{equation}
+\mathcal{L}^{\mathrm{LL}}_{\mathrm{flow}}
+= \mathcal{L}_{\mathrm{BC}}(\theta)
++ \mathcal{L}_{\mathrm{dist}}(\psi).
+\label{eq:flow-total-clean}
+\end{equation}
+
+The behaviour cloning loss uses all available expert transitions and
+learns the full action distribution, while the distillation loss shapes
+the final policy toward high-advantage regions.
+
+\paragraph{Inference and practical considerations.}
+At evaluation time, the agent uses only the distilled policy
+$\mu_\psi$, requiring a single forward pass. This makes inference as
+efficient as the Gaussian actor used in \S\ref{sec:hiql-lewm}, while
+retaining the ability to model multimodal action distributions.
+
+\paragraph{Discussion.}
+This formulation resolves a key limitation of previous methods: the
+inability of unimodal policies to represent diverse manipulation
+strategies. By combining expressive generative modelling with
+advantage-weighted distillation, the policy can capture multiple valid
+behaviours while remaining efficient at deployment.
+
+This completes the progression of methods in this chapter, culminating
+in a stable, hierarchical, and expressive framework for offline
+goal-conditioned control in learned latent spaces.
+
+% ---------------------------------------------------------------------
+\section{Implementation Notes}
+\label{sec:impl}
+
+\paragraph{Hardware.} All experiments are performed on a single A100
+NVIDIA GPU. The replay buffers are GPU-resident; for the largest
+configuration (\S\ref{sec:curr-sac}) the flat buffer occupies
+approximately $1.5$\,GB.
+
+\paragraph{Optimisers.} Adam with learning rate $3\!\times\!10^{-4}$
+for all RL networks (actor, critic/value, temperature, goal-rep,
+flow), and AdamW with learning rate $5\!\times\!10^{-5}$ for the
+world model. Gradient clipping at $1.0$ is applied to every loss.
+
+\paragraph{Target networks.} Polyak averaging with $\tau = 0.005$ is
+applied to all critics, values and the HIQL goal-rep
+$\varphi$. Target updates are performed once per gradient step.
+
+\paragraph{Batching and parallelism.} All RL methods use a batch size
+of $256$ and $40$ gradient updates per outer iteration (reduced to
+$20$ in the dense reward setting of \S\S\ref{sec:her-sac}--\ref{sec:joint}).
+World-model roll-outs are vectorised across $50$ parallel
+environments.
+
+\paragraph{Constants.} $\gamma = 0.99$ throughout. The done-threshold
+$\delta_d = 2.0$ and the dense-reward scale $\kappa = 1.6$ are
+calibrated from the median single-step predictor drift in the LeWM
+latent space; the corresponding diagnostic is reported in
+\S\ref{chap:experiments}. \todo{confirm $\delta_d$ and $\kappa$
+match the values used in final runs.}
+
+
