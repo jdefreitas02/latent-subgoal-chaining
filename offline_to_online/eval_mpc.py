@@ -254,6 +254,8 @@ def main():
                        "~/stable_wm_data/ogbench/visual-cube-single-play-v0_224"),
                    help="HDF5 play dataset path")
     p.add_argument("--task_id", type=int, default=1)
+    p.add_argument("--env_family", default="cube-single",
+                   help="OGBench env family: 'cube-single' or 'cube-double' (default: cube-single)")
     p.add_argument("--n_episodes", type=int, default=250)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda")
@@ -313,6 +315,7 @@ def main():
         max_episode_steps=40,
         wm_device=args.device,
         img_size=224,
+        env_family=args.env_family,
     )
 
     ex_obs = train_dataset["observations"][:1]

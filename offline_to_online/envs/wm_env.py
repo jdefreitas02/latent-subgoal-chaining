@@ -311,6 +311,7 @@ def make_wm_env_and_dataset(
     max_episode_steps=40,
     wm_device="cuda",
     img_size=224,
+    env_family="cube-single",  # e.g. "cube-single" or "cube-double"
     # --- Variant B anchoring (off by default) ---
     branch_length: int = 0,
     anchor_threshold_cos: float = 0.95,
@@ -361,7 +362,7 @@ def make_wm_env_and_dataset(
     # for JEPA). reward_task_id is baked in via env registration, so rewards are
     # consistently [-1, 0] both offline (relabeled) and online (env native).
     real_env = _gym.make(
-        f"visual-cube-single-singletask-task{task_id}-v0",
+        f"visual-{env_family}-singletask-task{task_id}-v0",
         width=224, height=224,
     )
     real_env = EpisodeMonitor(real_env, filter_regexes=['.*privileged.*', '.*proprio.*'])
@@ -413,9 +414,15 @@ def make_wm_env_and_dataset(
     # Build offline chunk-granularity dataset.
     # Note: done_threshold is NOT used here -- offline rewards come from
     # OGBench's task-relabeled signal. Threshold is only for WMEnv (online).
+    # hdf5_dataset_path may omit the .h5 extension (HDF5Dataset handles both forms)
+    _hdf5_for_rewards = (hdf5_dataset_path
+                         if hdf5_dataset_path.endswith(".h5")
+                         else hdf5_dataset_path + ".h5")
     train_dataset_dict = build_for_E(
         all_latents=all_latents,
         task_id=task_id,
+        env_family=env_family,
+        hdf5_path=_hdf5_for_rewards,
     )
 
     # Dense-reward relabel: replace OGBench's sparse signal with -||z' - z_goal||/scale.

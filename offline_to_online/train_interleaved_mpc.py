@@ -491,7 +491,9 @@ def main():
                        "~/stable_wm_data/ogbench/visual-cube-single-play-v0_224"),
                    help="HDF5 play dataset path (no .h5 extension)")
     p.add_argument("--task_id", type=int, default=1,
-                   help="OGBench cube-single task id (1..5)")
+                   help="OGBench task id (1..5)")
+    p.add_argument("--env_family", default="cube-single",
+                   help="OGBench env family: 'cube-single' or 'cube-double' (default: cube-single)")
     p.add_argument("--wm_device", default="cuda",
                    help="Device for JEPA PyTorch model")
     # Training
@@ -563,6 +565,7 @@ def main():
         max_episode_steps=40,
         wm_device=args.wm_device,
         img_size=224,
+        env_family=args.env_family,
     )
     from utils.datasets import Dataset
     train_dataset = Dataset.create(**train_dataset_dict)

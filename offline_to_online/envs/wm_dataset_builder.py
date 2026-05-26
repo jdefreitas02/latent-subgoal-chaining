@@ -29,7 +29,7 @@ def _episodes_to_numpy(all_latents):
     return out
 
 
-def _load_ogbench_singletask_dataset(task_id, hdf5_path=None):
+def _load_ogbench_singletask_dataset(task_id, hdf5_path=None, env_family="cube-single"):
     """Return (actions, rewards, terminals, masks, episode_lens) from the
     visual 224x224 HDF5 dataset with task-specific reward relabeling.
 
@@ -61,7 +61,7 @@ def _load_ogbench_singletask_dataset(task_id, hdf5_path=None):
         terminals[offset + length - 1] = 1.0
 
     # Use ogbench relabeling with a state env to get task-specific rewards/masks
-    env_name = f"cube-single-singletask-task{task_id}-v0"
+    env_name = f"{env_family}-singletask-task{task_id}-v0"
     env = gymnasium.make(env_name)
     ds = {"actions": actions, "qpos": qpos, "terminals": terminals}
     ogbench.relabel_utils.relabel_dataset(env_name, env, ds)
@@ -106,12 +106,13 @@ def _align_latent_cache_to_episodes(all_latents, episode_lens):
     return latents
 
 
-def build_for_B2(all_latents, task_id, action_clip_eps=1e-5):
+def build_for_B2(all_latents, task_id, action_clip_eps=1e-5,
+                 env_family="cube-single"):
     """Per-real-step transitions: 192-D JEPA latent obs + 5-D action +
     OGBench's task-relabeled reward signal. The done threshold is NOT used here.
     """
     actions, rewards, terminals, masks, episode_lens = \
-        _load_ogbench_singletask_dataset(task_id)
+        _load_ogbench_singletask_dataset(task_id, env_family=env_family)
 
     latents = _align_latent_cache_to_episodes(all_latents, episode_lens)
 
@@ -163,7 +164,8 @@ def build_for_B2(all_latents, task_id, action_clip_eps=1e-5):
     )
 
 
-def build_for_E(all_latents, task_id, stride=5, action_clip_eps=1e-5):
+def build_for_E(all_latents, task_id, stride=5, action_clip_eps=1e-5,
+                env_family="cube-single", hdf5_path=None):
     """Stride-5 chunk-granularity transitions for E.
 
     Each transition: (z[5k], chunk_25, z[5(k+1)], r_chunk, term).
@@ -173,7 +175,8 @@ def build_for_E(all_latents, task_id, stride=5, action_clip_eps=1e-5):
     Done threshold is NOT used here.
     """
     actions, rewards, terminals, masks, episode_lens = \
-        _load_ogbench_singletask_dataset(task_id)
+        _load_ogbench_singletask_dataset(task_id, hdf5_path=hdf5_path,
+                                         env_family=env_family)
 
     latents = _align_latent_cache_to_episodes(all_latents, episode_lens)
     actions_per_ep = _split_by_episode(actions, episode_lens)
