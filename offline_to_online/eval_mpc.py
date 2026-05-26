@@ -61,7 +61,8 @@ def _load_wm(ckpt_path):
 # ---------------------------------------------------------------------------
 
 def _make_mpc_fn(agent, wm_model, wm_params, z_goal, N, H, gamma,
-                 dense_scale, K_grad, lr, q_only=False, q_every_step=False):
+                 dense_scale, K_grad, lr, q_only=False, q_every_step=False,
+                 fmq=False, fmq_eta=0.3):
     """Return a jitted function with the same signature as agent.sample_actions.
 
     Args:
@@ -80,6 +81,11 @@ def _make_mpc_fn(agent, wm_model, wm_params, z_goal, N, H, gamma,
         q_every_step: If True, score = Σ_{h=0}^{H-1} γ^h * Q(z_{h+1}, a_{h+1}).
             Uses Q at every WM step (not just terminal). Supersedes q_only when True.
             For H=1 this is identical to q_only=True.
+        fmq: If True, replace K_grad loop with a single FMQ normalized gradient step
+            (Theorem 3.2, Ziakas et al. 2026). Gradient still flows through the WM
+            BPTT rollout; only the update rule changes (normalized, single step).
+            Typically used with q_every_step=True for the full BPTT signal.
+        fmq_eta: Trust-region radius η for FMQ step (default 0.3).
 
     Returns:
         fn(observations, rng) -> (25,) best action chunk.
@@ -126,8 +132,8 @@ def _make_mpc_fn(agent, wm_model, wm_params, z_goal, N, H, gamma,
             total_score = total_score + q_term  # no gamma^H discount when q_only (cleaner)
         return total_score, z_t, a_t
 
-    if K_grad > 0:
-        # Pre-declare: gradient ascent variant (Exp 3)
+    if K_grad > 0 or fmq:
+        # Gradient-based variant: either Grad-MPC (K_grad > 0) or FMQ (fmq=True)
         @jax.jit
         def mpc_fn(observations, rng):
             z_0 = observations  # (192,)
@@ -175,9 +181,18 @@ def _make_mpc_fn(agent, wm_model, wm_params, z_goal, N, H, gamma,
                 return total.sum()
 
             grad_fn = jax.grad(score_for_grad)
-            for _ in range(K_grad):
-                grads = grad_fn(a_first)
-                a_first = jnp.clip(a_first + lr * grads, -1.0, 1.0)
+            if fmq:
+                # FMQ trust-region: one normalized gradient step (Theorem 3.2)
+                # Gradient flows through the full H-step WM BPTT rollout.
+                # a* = a + η · ∇J / ||∇J||₂   where J = Σ_t γ^t Q(z_t, a_t)
+                grads = grad_fn(a_first)                                     # (N, 25)
+                grads = grads / (jnp.linalg.norm(grads, axis=-1, keepdims=True) + 1e-8)
+                a_first = jnp.clip(a_first + fmq_eta * grads, -1.0, 1.0)
+            else:
+                # Grad-MPC: K raw gradient ascent steps
+                for _ in range(K_grad):
+                    grads = grad_fn(a_first)
+                    a_first = jnp.clip(a_first + lr * grads, -1.0, 1.0)
 
             # Final scoring pass (fresh continuation samples after grad refinement)
             rng, score_rng = jax.random.split(rng)
@@ -257,6 +272,14 @@ def main():
                    help="Score = Σ γ^h * Q(z_{h+1}, a_{h+1}) for h=0..H-1. "
                         "Uses Q at every WM step, not just terminal. "
                         "For H=1 this is identical to --mpc_q_only. Supersedes --mpc_q_only.")
+    # FMQ trust-region
+    p.add_argument("--mpc_fmq", action="store_true",
+                   help="FMQ: replace Grad-MPC K_grad loop with one normalized gradient step "
+                        "through WM BPTT (Theorem 3.2, Ziakas et al. 2026). "
+                        "Use with --mpc_q_every_step for the full BPTT signal.")
+    p.add_argument("--fmq_eta", type=float, default=0.3,
+                   help="FMQ trust-region radius η — step size in normalized Q-gradient "
+                        "direction (default: 0.3)")
     # Output
     p.add_argument("--out_json", default=None,
                    help="Optional path to write metrics JSON (defaults to next to policy_ckpt)")
@@ -271,7 +294,8 @@ def main():
             "Pass the original JEPA ckpt dir via --jepa_ckpt for pixel encoding."
         )
 
-    print(f"=== MPC Eval: N={args.mpc_n}, H={args.mpc_h}, K_grad={args.mpc_k_grad}", flush=True)
+    grad_mode = f"FMQ η={args.fmq_eta}" if args.mpc_fmq else f"Grad-MPC K={args.mpc_k_grad}"
+    print(f"=== MPC Eval: N={args.mpc_n}, H={args.mpc_h}, {grad_mode}", flush=True)
     print(f"    policy_ckpt: {args.policy_ckpt}", flush=True)
     print(f"    wm_ckpt:     {args.wm_ckpt}", flush=True)
     print(f"    jepa_ckpt:   {jepa_ckpt}", flush=True)
@@ -340,6 +364,8 @@ def main():
         lr=args.mpc_lr,
         q_only=args.mpc_q_only,
         q_every_step=args.mpc_q_every_step,
+        fmq=args.mpc_fmq,
+        fmq_eta=args.fmq_eta,
     )
 
     # Warm-up JIT compile before eval timing
@@ -380,7 +406,9 @@ def main():
             tag += "_qes"
         elif args.mpc_q_only:
             tag += "_qonly"
-        if args.mpc_k_grad > 0:
+        if args.mpc_fmq:
+            tag += f"_fmq{args.fmq_eta}"
+        elif args.mpc_k_grad > 0:
             tag += f"_k{args.mpc_k_grad}"
         args.out_json = os.path.join(ckpt_dir, f"mpc_eval_{tag}.json")
 
@@ -392,6 +420,8 @@ def main():
             "mpc_lr": args.mpc_lr,
             "mpc_q_only": args.mpc_q_only,
             "mpc_q_every_step": args.mpc_q_every_step,
+            "mpc_fmq": args.mpc_fmq,
+            "fmq_eta": args.fmq_eta,
             "policy_ckpt": args.policy_ckpt,
             "wm_ckpt": args.wm_ckpt,
             "metrics": {k: float(v) for k, v in metrics.items()},
