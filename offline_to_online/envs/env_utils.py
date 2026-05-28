@@ -102,12 +102,51 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
 
     if 'singletask' in env_name:
         # OGBench.
-        env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name)
-        eval_env = ogbench.make_env_and_datasets(env_name, env_only=True)
+        # For multi-cube families (cube-double, cube-triple, cube-quadruple),
+        # ogbench.make_env_and_datasets strips the cube-count word ('double',
+        # 'triple', etc.) thinking it's a dataset-type qualifier, producing the
+        # wrong env name (e.g. 'visual-cube-singletask-task1-v0' instead of
+        # 'visual-cube-double-singletask-task1-v0'). Fix by calling lower-level
+        # ogbench functions directly with the correct names.
+        _MULTI_CUBE_FAMILIES = ('cube-double', 'cube-triple', 'cube-quadruple')
+        if any(mc in env_name for mc in _MULTI_CUBE_FAMILIES):
+            import os as _os, numpy as _np, gymnasium as _gym
+            _splits = env_name.split('-')
+            _pos = _splits.index('singletask')
+            # Multi-cube play datasets include 'play' in their name
+            # (e.g. visual-cube-double-play-v0), unlike cube-single which
+            # omits it (visual-cube-single-v0). Insert 'play' before 'v0'.
+            # e.g. visual-cube-double-singletask-task1-v0
+            #   -> visual-cube-double-play-v0
+            _dataset_name = '-'.join(_splits[:_pos] + ['play'] + _splits[-1:])
+            # Use already-downloaded copy from STABLEWM_HOME if available.
+            _stablewm = _os.path.expanduser('~/stable_wm_data/ogbench')
+            _local_path = _os.path.join(_stablewm, f'{_dataset_name}.npz')
+            if _os.path.exists(_local_path):
+                _dataset_dir = _stablewm
+            else:
+                _dataset_dir = _os.path.expanduser('~/.ogbench/data')
+                ogbench.download_datasets([_dataset_name], _dataset_dir)
+            _train_path = _os.path.join(_dataset_dir, f'{_dataset_name}.npz')
+            _val_path   = _os.path.join(_dataset_dir, f'{_dataset_name}-val.npz')
+            env      = _gym.make(env_name)
+            eval_env = _gym.make(env_name)
+            _train_raw = ogbench.load_dataset(_train_path, ob_dtype=_np.uint8, add_info=True)
+            _val_raw   = ogbench.load_dataset(_val_path,   ob_dtype=_np.uint8, add_info=True)
+            ogbench.relabel_utils.relabel_dataset(env_name, env, _train_raw)
+            ogbench.relabel_utils.relabel_dataset(env_name, env, _val_raw)
+            for _k in ('qpos', 'qvel', 'button_states'):
+                _train_raw.pop(_k, None)
+                _val_raw.pop(_k, None)
+            train_dataset = Dataset.create(**_train_raw)
+            val_dataset   = Dataset.create(**_val_raw)
+        else:
+            env, _train_raw, _val_raw = ogbench.make_env_and_datasets(env_name)
+            eval_env = ogbench.make_env_and_datasets(env_name, env_only=True)
+            train_dataset = Dataset.create(**_train_raw)
+            val_dataset   = Dataset.create(**_val_raw)
         env = EpisodeMonitor(env, filter_regexes=['.*privileged.*', '.*proprio.*'])
         eval_env = EpisodeMonitor(eval_env, filter_regexes=['.*privileged.*', '.*proprio.*'])
-        train_dataset = Dataset.create(**train_dataset)
-        val_dataset = Dataset.create(**val_dataset)
     elif 'antmaze' in env_name and ('diverse' in env_name or 'play' in env_name or 'umaze' in env_name):
         # D4RL AntMaze.
         from envs import d4rl_utils

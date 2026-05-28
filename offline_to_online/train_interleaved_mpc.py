@@ -60,45 +60,67 @@ class MPCLabelBuffer:
 
     Optionally stores pre-computed advantages so mixed_awr injection is a cheap
     numpy swap rather than re-scoring every training step.
+
+    Optionally stores WM-consistent next observations and rewards so the Q
+    receives a consistent Bellman target (z, a_mpc, r_wm, z'_wm) rather than
+    the mismatched offline (r, z') from an unrelated transition.
     """
 
     def __init__(self, max_size: int):
         self.max_size = max_size
-        self.obs = None   # (max_size, 192)
-        self.acts = None  # (max_size, 25)
+        self.obs = None       # (max_size, 192)
+        self.acts = None      # (max_size, 25)
         self.advantages = None  # (max_size,) or None
+        self.next_obs = None  # (max_size, 192) WM-predicted z' or None
+        self.rewards = None   # (max_size,)     WM-computed r  or None
         self.size = 0
 
     def add(self, obs: np.ndarray, acts: np.ndarray,
-            advantages: np.ndarray = None):
-        """Replace buffer contents entirely with new (obs, acts) arrays."""
+            advantages: np.ndarray = None,
+            next_obs: np.ndarray = None,
+            rewards: np.ndarray = None):
+        """Replace buffer contents entirely with new arrays."""
         assert obs.shape[0] == acts.shape[0], "obs/acts must have same leading dim"
         self.obs = obs.astype(np.float32)
         self.acts = acts.astype(np.float32)
         self.advantages = advantages.astype(np.float32) if advantages is not None else None
+        self.next_obs = next_obs.astype(np.float32) if next_obs is not None else None
+        self.rewards = rewards.astype(np.float32) if rewards is not None else None
         self.size = obs.shape[0]
 
+    def has_wm_targets(self) -> bool:
+        return self.next_obs is not None and self.rewards is not None
+
     def sample(self, n: int):
-        """Sample n pairs uniformly at random."""
+        """Sample n pairs uniformly at random.
+
+        Returns:
+            (obs, acts, next_obs, rewards) — next_obs/rewards are None if not stored.
+        """
         assert self.size > 0, "Buffer is empty"
         idxs = np.random.randint(0, self.size, size=n)
-        return self.obs[idxs], self.acts[idxs]
+        next_obs = self.next_obs[idxs] if self.next_obs is not None else None
+        rewards  = self.rewards[idxs]  if self.rewards  is not None else None
+        return self.obs[idxs], self.acts[idxs], next_obs, rewards
 
     def sample_top_advantage(self, n: int, threshold: float = 0.0):
         """Return up to n pairs with highest pre-computed advantage above threshold.
 
         Pairs are already sorted descending by advantage (set during add()).
-        Returns (obs, acts, n_returned, mean_advantage_of_returned).
+        Returns (obs, acts, next_obs, rewards, n_returned, mean_advantage_of_returned).
+        next_obs/rewards are None if not stored.
         """
         assert self.size > 0, "Buffer is empty"
         assert self.advantages is not None, "No advantages stored — call add() with advantages"
         passing = np.where(self.advantages > threshold)[0]
         n_take = min(len(passing), n)
         if n_take == 0:
-            return None, None, 0, float(self.advantages.mean())
+            return None, None, None, None, 0, float(self.advantages.mean())
         # Buffer is pre-sorted descending — take the first n_take passing indices
         chosen = passing[:n_take]
-        return (self.obs[chosen], self.acts[chosen],
+        next_obs = self.next_obs[chosen] if self.next_obs is not None else None
+        rewards  = self.rewards[chosen]  if self.rewards  is not None else None
+        return (self.obs[chosen], self.acts[chosen], next_obs, rewards,
                 n_take, float(self.advantages[chosen].mean()))
 
     def is_ready(self, min_size: int = 1) -> bool:
@@ -112,7 +134,8 @@ class MPCLabelBuffer:
 def run_mpc_relabeling(agent, wm_model, wm_params, z_goal, obs_all,
                        mpc_config_dict, n_states, seed, verbose=True,
                        compute_advantages=False, awr_threshold=0.0,
-                       fmq=False, fmq_eta=0.1):
+                       fmq=False, fmq_eta=0.1,
+                       wm_consistent_targets=False, done_threshold=2.0):
     """Sample n_states latents, run MPC on each, return filled MPCLabelBuffer.
 
     Args:
@@ -131,8 +154,14 @@ def run_mpc_relabeling(agent, wm_model, wm_params, z_goal, obs_all,
         awr_threshold: Advantage threshold reported in verbose output (informational).
         fmq: If True, use FMQ trust-region update instead of K Grad-MPC steps.
         fmq_eta: FMQ trust-region radius η (default 0.1).
+        wm_consistent_targets: If True, run one WM forward step per label to produce
+            a consistent (z, a_mpc, r_wm, z'_wm) tuple. The next observation z'_wm =
+            WM(z, a_mpc) and reward r_wm = 1{||z'_wm - z_goal|| < done_threshold}.
+            These replace the mismatched offline (r, z') during Q-training.
+        done_threshold: L2 distance in latent space below which the goal is reached
+            (default 2.0, matching make_wm_env_and_dataset).
     Returns:
-        MPCLabelBuffer filled with (z, a_mpc) pairs, advantages if requested.
+        MPCLabelBuffer filled with (z, a_mpc) pairs, plus WM targets if requested.
     """
     cfg = mpc_config_dict
     t0 = time.time()
@@ -211,8 +240,44 @@ def run_mpc_relabeling(agent, wm_model, wm_params, z_goal, obs_all,
         a_mpc    = a_mpc[sort_idx]
         advantages = advantages[sort_idx]
 
+    # ------------------------------------------------------------------
+    # Optionally compute WM-consistent next states and rewards
+    # ------------------------------------------------------------------
+    next_obs_wm = None
+    rewards_wm = None
+    if wm_consistent_targets:
+        if verbose:
+            print(f"  [relabel] Computing WM-consistent next states "
+                  f"(batch size={n_states}, chunk=256)...", flush=True)
+        t_wm = time.time()
+        chunk_size = 256
+        z_prime_chunks = []
+        # JIT-compile a vectorised 1-step WM forward on first chunk
+        @jax.jit
+        def _wm_step_batch(z_b, a_b):
+            # z_b: (B, 192), a_b: (B, 25) → z': (B, 192)
+            return wm_model.apply(wm_params, z_b[:, None, :], a_b[:, None, :])[:, -1, :]
+
+        for i in range(0, n_states, chunk_size):
+            z_chunk = jnp.asarray(states[i:i + chunk_size])
+            a_chunk = jnp.asarray(a_mpc[i:i + chunk_size])
+            z_prime_chunk = _wm_step_batch(z_chunk, a_chunk).block_until_ready()
+            z_prime_chunks.append(np.asarray(z_prime_chunk))
+
+        next_obs_wm = np.concatenate(z_prime_chunks, axis=0)  # (n_states, 192)
+        # Sparse goal-reaching reward: 1 if within done_threshold in latent L2
+        z_goal_np = np.asarray(z_goal)
+        dists = np.linalg.norm(next_obs_wm - z_goal_np[None, :], axis=-1)  # (n_states,)
+        rewards_wm = (dists < done_threshold).astype(np.float32)
+        if verbose:
+            pct_rewarded = rewards_wm.mean() * 100
+            print(f"  [relabel] WM targets done in {time.time()-t_wm:.1f}s  "
+                  f"rewarded={pct_rewarded:.1f}%  "
+                  f"dist mean={dists.mean():.3f} min={dists.min():.3f}", flush=True)
+
     buf = MPCLabelBuffer(max_size=n_states)
-    buf.add(states, a_mpc, advantages=advantages)
+    buf.add(states, a_mpc, advantages=advantages,
+            next_obs=next_obs_wm, rewards=rewards_wm)
     if verbose:
         print(f"  [relabel] done: {n_states} labels in {time.time()-t0:.0f}s  "
               f"a_mpc stats: mean={a_mpc.mean():.3f} std={a_mpc.std():.3f}", flush=True)
@@ -293,7 +358,7 @@ def actor_only_update_step(agent, mpc_buffer, batch_size, actor_tx, actor_opt_st
     """
     actor_params = agent.network.params["modules_actor_bc_flow"]
 
-    z_b, a_b = mpc_buffer.sample(batch_size)
+    z_b, a_b, _, _ = mpc_buffer.sample(batch_size)  # next_obs/rewards unused in actor update
     z_b = jnp.asarray(z_b)       # (B, 192)
     a_b = jnp.asarray(a_b)       # (B, 25)
 
@@ -347,7 +412,7 @@ def actor_only_update_step_awr(agent, mpc_buffer, batch_size, actor_tx, actor_op
     """
     actor_params = agent.network.params["modules_actor_bc_flow"]
 
-    z_b, a_mpc_b = mpc_buffer.sample(batch_size)
+    z_b, a_mpc_b, _, _ = mpc_buffer.sample(batch_size)  # next_obs/rewards unused in actor update
     z_b_jax    = jnp.asarray(z_b)       # (B, 192)
     a_mpc_jax  = jnp.asarray(a_mpc_b)   # (B, 25)
 
@@ -398,6 +463,10 @@ def inject_mpc_into_batch(batch, mpc_buffer, mix_ratio: float, rng: np.random.Ge
     Replaces first n_mpc rows' actions with MPC-labeled ones.
     Observations are also replaced so the actor_loss BC targets match.
 
+    If the buffer contains WM-consistent targets (next_obs, rewards), these
+    replace the corresponding offline fields so the Q receives a consistent
+    Bellman target: Q(z, a_mpc) ← r_wm + γ·V(WM(z, a_mpc)).
+
     Args:
         batch: Dict from sample_sequence (modified in place).
         mpc_buffer: MPCLabelBuffer with (z, a_mpc) pairs.
@@ -408,7 +477,7 @@ def inject_mpc_into_batch(batch, mpc_buffer, mix_ratio: float, rng: np.random.Ge
     """
     B = batch["observations"].shape[0]
     n_mpc = max(1, int(B * mix_ratio))
-    z_mpc, a_mpc = mpc_buffer.sample(n_mpc)     # (n_mpc, 192), (n_mpc, 25)
+    z_mpc, a_mpc, next_obs_mpc, rewards_mpc = mpc_buffer.sample(n_mpc)
 
     # Replace observations and first-sequence-slot actions
     batch["observations"][:n_mpc] = z_mpc
@@ -416,6 +485,16 @@ def inject_mpc_into_batch(batch, mpc_buffer, mix_ratio: float, rng: np.random.Ge
     batch["actions"][:n_mpc, 0, :] = a_mpc
     # Also keep valid mask consistent (MPC-labeled entries are always valid)
     batch["valid"][:n_mpc] = 1.0
+
+    # If WM-consistent targets available, replace next_obs and rewards too.
+    # Reshape to match batch dims (e.g. next_obs may be (B,1,192) with seq dim).
+    if next_obs_mpc is not None:
+        batch["next_observations"][:n_mpc] = next_obs_mpc.reshape(
+            n_mpc, *batch["next_observations"].shape[1:])
+    if rewards_mpc is not None:
+        batch["rewards"][:n_mpc] = rewards_mpc.reshape(
+            n_mpc, *batch["rewards"].shape[1:])
+
     return batch
 
 
@@ -441,9 +520,8 @@ def inject_mpc_into_batch_awr(batch, mpc_buffer, mix_ratio: float,
     B = batch["observations"].shape[0]
     n_mpc_target = max(1, int(B * mix_ratio))
 
-    z_inject, a_inject, n_inject, mean_adv = mpc_buffer.sample_top_advantage(
-        n_mpc_target, threshold=awr_threshold
-    )
+    z_inject, a_inject, next_obs_inject, rewards_inject, n_inject, mean_adv = \
+        mpc_buffer.sample_top_advantage(n_mpc_target, threshold=awr_threshold)
 
     if n_inject == 0:
         return batch, 0, mean_adv
@@ -451,6 +529,14 @@ def inject_mpc_into_batch_awr(batch, mpc_buffer, mix_ratio: float,
     batch["observations"][:n_inject] = z_inject
     batch["actions"][:n_inject, 0, :] = a_inject
     batch["valid"][:n_inject] = 1.0
+
+    if next_obs_inject is not None:
+        batch["next_observations"][:n_inject] = next_obs_inject.reshape(
+            n_inject, *batch["next_observations"].shape[1:])
+    if rewards_inject is not None:
+        batch["rewards"][:n_inject] = rewards_inject.reshape(
+            n_inject, *batch["rewards"].shape[1:])
+
     return batch, n_inject, mean_adv
 
 
@@ -546,6 +632,13 @@ def main():
                         "instead of K Grad-MPC gradient steps for label generation.")
     p.add_argument("--fmq_eta", type=float, default=0.1,
                    help="FMQ trust-region radius η (default: 0.1, best from Phase 1 eval)")
+    # WM-consistent Bellman target flag
+    p.add_argument("--wm_consistent_targets", action="store_true",
+                   help="Replace offline (r, z') in MPC-injected batch rows with "
+                        "WM-predicted (r_wm, z'_wm=WM(z,a_mpc)). Gives the Q a "
+                        "consistent Bellman target, reducing critic loss spikes "
+                        "after relabeling. Cost: one extra WM forward pass per "
+                        "relabeling event.")
     args = p.parse_args()
 
     np.random.seed(args.seed)
@@ -634,6 +727,8 @@ def main():
         print(f"    label_gen=FMQ  fmq_eta={args.fmq_eta}  (replaces Grad-MPC K={mpc_cfg['K_grad']})", flush=True)
     else:
         print(f"    label_gen=GradMPC  K={mpc_cfg['K_grad']}  lr={mpc_cfg['lr']}", flush=True)
+    if args.wm_consistent_targets:
+        print(f"    wm_consistent_targets=True  (Q target: r_wm+γV(WM(z,a_mpc)))", flush=True)
     t_start = time.time()
 
     for step in range(1, args.offline_steps + 1):
@@ -656,6 +751,7 @@ def main():
                 awr_threshold=args.awr_threshold,
                 fmq=args.mpc_fmq,
                 fmq_eta=args.fmq_eta,
+                wm_consistent_targets=args.wm_consistent_targets,
             )
             # Re-init actor optimizer so its momentum doesn't fight MPC labels
             actor_opt_state = actor_tx.init(
