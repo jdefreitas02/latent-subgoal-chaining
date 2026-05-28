@@ -511,11 +511,13 @@ def train_loop(env, actor, critic, critic_target,
                 for p in critic.parameters():
                     p.requires_grad = True
 
-                # Update Alpha
+                # Update Alpha — clamp so α never drops below 0.01
                 alpha_loss = -(log_alpha * (log_pi + target_entropy).detach()).mean()
                 alpha_optimizer.zero_grad()
                 alpha_loss.backward()
                 alpha_optimizer.step()
+                with torch.no_grad():
+                    log_alpha.clamp_(min=-4.6)   # exp(-4.6) ≈ 0.01
 
                 # Soft Update Target Networks
                 for target_param, param in zip(critic_target.parameters(), critic.parameters()):
@@ -726,10 +728,11 @@ if __name__ == "__main__":
             jepa_model = _load_jepa_from_ckpt(ckpt_path, device)
             done_threshold = 2.887
         else:
-            # Default: use the swm AutoCostModel (224x224 model resolved via STABLEWM_HOME)
-            with initialize(version_base=None, config_path="../config"):
-                cfg = compose(config_name="eval/cube", overrides=["+policy=cube/lejepa"])
-            jepa_model = swm.policy.AutoCostModel(cfg.policy)
+            # Default: use the swm AutoCostModel (224x224 model resolved via STABLEWM_HOME).
+            # AutoCostModel expects the base name (e.g. "lejepa"), appends "_object.ckpt"
+            # internally — pass the directory-level path, not lejepa_weights.ckpt.
+            auto_path = os.path.join(stablewm_home, "cube", "lejepa")
+            jepa_model = swm.policy.AutoCostModel(auto_path)
             jepa_model = jepa_model.to(device)
             jepa_model.eval()
             for param in jepa_model.parameters():
@@ -781,8 +784,10 @@ if __name__ == "__main__":
 
     target_entropy = -float(actor.mean_linear.out_features)
 
-    # Start alpha at ~0.13 instead of 1.0 so Q-values matter immediately
-    log_alpha = torch.tensor([-2.0], requires_grad=True, device=device)
+    # Start alpha at 1.0 (log_alpha=0) matching SB3 default — prevents
+    # premature collapse under HER's inflated early Q-values (proven to
+    # cause α → 0.003 within 330 iters when starting at -2.0).
+    log_alpha = torch.tensor([0.0], requires_grad=True, device=device)
     alpha_optimizer = torch.optim.Adam([log_alpha], lr=3e-4)
 
     train_loop(
