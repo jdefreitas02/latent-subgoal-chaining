@@ -235,6 +235,13 @@ which encourages the policy to imitate actions with high advantage.
 
 By avoiding explicit queries of out-of-distribution actions, IQL achieves stable and effective learning in the offline setting. This makes it particularly well-suited for integration with goal-conditioned and data-augmented frameworks, where robustness to dataset limitations is critical.
 
+\subsection{Offline-to-Online Reinforcement Learning}
+\label{sec:offline-online-bg}
+
+While offline RL extracts a useful initialisation from a fixed dataset, the resulting policy is in general suboptimal: it can only do as well as the data and the conservatism inherent in offline algorithms allow. \emph{Offline-to-online} RL is a two-phase recipe that uses the offline policy as a starting point for further improvement via interaction with the environment, typically by continuing to update the same actor and critic on a growing buffer that combines the original dataset with newly collected transitions \cite{nair2020awac, kostrikov2021offlinereinforcementlearningimplicit}.
+
+The main difficulty is \emph{distribution shift} between the two phases. Offline algorithms learn under a conservative prior --- behaviour-cloning regularisation, action-value clipping, or pessimism penalties --- that prevents the policy from straying too far from the data. When this prior is relaxed in the online phase, the critic's Q-values become unreliable on the new states the agent visits, and naive fine-tuning can destabilise or collapse the offline policy entirely. Cal-QL \cite{nakamoto2023calql} addresses this by explicitly calibrating Q-values during pretraining so the offline critic is well behaved as an online initialiser; AWAC \cite{nair2020awac} retains the offline behaviour-regularisation term throughout the online phase. In this thesis, Chapters \ref{chap:offline-online}--\ref{chap:mpc-distill} take a different route: rather than continue to interact with the environment, we use a learned world model in place of additional real interaction.
+
 \section{Hierarchical Reinforcement Learning}
 
 \subsection{The Curse of Long-Horizon Planning}
@@ -361,9 +368,97 @@ r = -\| z_{\text{next}} - z_{\text{subgoal}} \|_2
 \]
 encourages the agent to minimise distance in a space where geometry aligns with environment dynamics. This ``geometric consistency'' forms the critical link between latent world modelling and downstream reinforcement learning, enabling dense and informative reward signals even in environments with sparse or undefined external rewards.
 
+\subsection{Model Predictive Control with Learned World Models}
+\label{sec:mpc-bg}
+
+A learned world model is, in principle, two things at once: a generative environment in which the policy can collect imaginary experience, and an oracle the policy can query at decision time to look ahead. Chapter~\ref{chap:offline-online} concerns the first use; this thesis ultimately settles on the second, so we sketch the standard formulation here.
+
+\emph{Model Predictive Control} (MPC) replaces a learned policy entirely by an online optimisation problem solved at each decision step. Given the current state $z_t$, a candidate action sequence $\mathbf{a}_{t:t+H}$ is rolled out for $H$ steps through the learned dynamics $f_\psi$, and the resulting trajectory is scored by a learned value or reward. The first action of the best sequence is executed; at the next step, the procedure is repeated from the new state. Formally,
+\begin{equation}
+    \mathbf{a}^{\star}_{t:t+H} \;=\; \arg\max_{\mathbf{a}_{t:t+H}} \; J\!\big(z_t,\, \mathbf{a}_{t:t+H};\, f_\psi,\, Q_\theta\big),
+    \quad \text{execute } a^{\star}_t,\; \text{replan at } t+1.
+    \label{eq:mpc-objective-bg}
+\end{equation}
+What varies between MPC variants is how the candidate set is constructed and how the score $J$ is computed. The Cross-Entropy Method \cite{rubinstein1997cem} maintains a Gaussian distribution over action sequences, samples from it, and refits to the elite subset; Model Predictive Path Integral control \cite{williams2017mppi} performs a similar fitting under a sampling-based importance-weighted update. More recent work integrates a learned value function into the score so that the planning horizon $H$ can stay short (TD-MPC \cite{hansen2022tdmpc}, TD-MPC2 \cite{hansen2024tdmpc2}), and uses backpropagation through the learned model to refine the candidate by gradient ascent rather than re-sampling --- a variant we will call \emph{Grad-MPC} in Chapter~\ref{chap:mpc-distill}.
+
+The LeWM architecture introduced in \S\ref{sec:lewm-bg} already supports a CEM-style planner at evaluation time, in which action chunks are sampled from a Gaussian and scored by the latent-distance reward~\cite{maes2026leworldmodelstableendtoendjointembedding}. This is the most direct prior use of the same world model we work with in this thesis. Chapter~\ref{chap:mpc-distill} extends that template in two ways: it replaces the Gaussian sampler with a trained behaviour-cloning flow proposal, and it folds the optimal trust-region update of Eq.~\eqref{eq:fmq-target-bg} into the planner, recovering FMQ as a one-step refinement of MPC.
+
+A central practical point about MPC with learned world models is that the model only has to be predictive over the planning horizon, not over the entire episode. As long as $H$ stays small relative to the horizon over which $f_\psi$ accumulates significant error, an MPC controller can extract useful behaviour from a model that would be useless if rolled out for hundreds of steps. This is the central pivot of Chapter~\ref{chap:mpc-distill}: we use the world model at inference time over $H\le 2$ steps, never as a source of TD targets for the critic.
 
 \section{Action Spaces and Generation}
-TODO: fill in with q-chunking, flow policies etc.
+\label{sec:action-spaces-bg}
+
+The HIQL low-level policy of \S\ref{sec:hiql-flow} introduced a flow-matching actor that maps Gaussian noise to a single primitive action conditioned on the current latent and subgoal. The remaining methodological pieces of this thesis --- the offline-to-online experiments in Chapter~\ref{chap:offline-online} and the MPC-distillation pipeline in Chapter~\ref{chap:mpc-distill} --- build on three further ideas about how actions are represented and how value is propagated through them. We collect them here so that the later chapters can refer back rather than reintroduce the machinery.
+
+\subsection{Action Chunking and Q-Chunking}
+\label{sec:qchunking-bg}
+
+When the offline data is collected by a non-Markovian or scripted behaviour --- as is typical of human teleoperators, scripted experts, or play-style exploration policies --- a single-step actor that conditions only on the current state has difficulty modelling the data. Each individual primitive action looks ambiguous, because the rest of the demonstrator's plan is hidden in their internal state. \emph{Action chunking}, popularised in imitation learning, sidesteps this difficulty by training the actor to predict a short sequence of $h$ consecutive primitive actions ---  an \emph{action chunk} --- in a single forward pass \cite{li2025reinforcement}. The chunk is executed open-loop, and the actor is queried again only at the end.
+
+Action chunking also reshapes the learning problem on the critic side. Q-Chunking \cite{li2025reinforcement} promotes the chunk to a first-class action and trains a chunk-level value function $Q_\theta(z_t, \mathbf{a}_{t:t+h})$ whose Bellman target uses an $h$-step return:
+\begin{equation}
+    Q_\theta(z_t, \mathbf{a}_{t:t+h}) \;\leftarrow\; \sum_{k=0}^{h-1} \gamma^{k}\, r_{t+k} \;+\; \gamma^{h}\, Q_{\bar\theta}\!\left(z_{t+h},\, \mathbf{a}_{t+h:t+2h}\right),
+    \quad \mathbf{a}_{t+h:t+2h} \sim \pi(\,\cdot\mid z_{t+h}).
+    \label{eq:qchunking-target}
+\end{equation}
+Crucially, because the Q-function takes the entire chunk as its action, this $h$-step backup is unbiased in the same sense as one-step TD --- the bias that would otherwise affect classical $n$-step returns when the data is off-policy disappears, because the Q-function is conditioned on the exact action sequence whose return appears in the target \cite{li2025reinforcement}. The chunk-level Q therefore enjoys an $h$-times faster value propagation than the primitive-action version without the usual bias trade-off.
+
+This combination --- a flow-matching actor producing $h$-step chunks and an chunked Q-function trained with the $h$-step Bellman target of Eq.~\eqref{eq:qchunking-target} --- is the agent we use throughout Chapters~\ref{chap:offline-online}--\ref{chap:mpc-distill}. The same paper also introduces a behaviour-regularised variant, QC-FQL, which is the closest published antecedent to our specific implementation choice and which we cover next.
+
+\subsection{Flow Q-Learning (FQL)}
+\label{sec:fql-bg}
+
+Flow Q-Learning \cite{park2025flow} formalises the offline-RL recipe that pairs a flow-matching BC policy with a TD-learned critic for offline RL. It has three components.
+
+\paragraph{Behaviour-cloning flow.} A velocity field $u_\xi(z, x_t, t)$ is trained with the standard conditional flow-matching loss against straight-line interpolants:
+\begin{equation}
+    \mathcal{L}_{\text{BC}}(\xi) \;=\; \mathbb{E}_{z, \mathbf{a}, x_0, t}\!\left[\,\big\|u_\xi(z, x_t, t) - (\mathbf{a} - x_0)\big\|_2^2\,\right],
+    \quad x_t = (1-t)x_0 + t\,\mathbf{a},\; x_0\sim \mathcal{N}(0,I),\; t\sim\mathcal{U}[0,1].
+    \label{eq:bc-flow-bg}
+\end{equation}
+A new action chunk is generated by Euler-integrating this field from $x_0\sim\mathcal{N}(0,I)$ to $t=1$. This is the same flow policy introduced in \S\ref{sec:hiql-flow}; FQL's contribution is in how it is used inside an offline RL loop.
+
+\paragraph{One-step distilled actor.} For inference efficiency, FQL distils the multi-step flow into a noise-conditioned one-step actor $\mu_\psi(z, x_0)$ that produces a chunk in a single forward pass. The distillation loss is a 2-Wasserstein upper bound penalising the squared distance between the one-step actor's output and the flow's ODE solution:
+\begin{equation}
+    \mathcal{L}_{\text{distil}}(\psi) \;=\; \alpha\, \mathbb{E}_{z, x_0}\!\left[\,\|\mu_\psi(z, x_0) - \Phi_\xi(z, x_0)\|_2^2\,\right]\; -\; \mathbb{E}_{z, x_0}\!\big[\,Q_\theta(z, \mu_\psi(z, x_0))\,\big],
+    \label{eq:fql-actor}
+\end{equation}
+where $\Phi_\xi$ denotes the Euler integration of $u_\xi$ from $x_0$ to $t=1$, $\alpha$ controls the strength of the behaviour-cloning regulariser, and the second term is the standard deterministic policy-gradient term that pulls the actor toward high-$Q$ actions.
+
+\paragraph{Critic.} The critic is trained with the chunked Bellman target of Eq.~\eqref{eq:qchunking-target}, with the one-step actor providing the bootstrap action at the next state:
+\begin{equation}
+    \mathcal{L}_{\text{critic}}(\theta) \;=\; \mathbb{E}\!\left[\,\Big(Q_\theta(z, \mathbf{a}) - \big(r + \gamma^{h}\, Q_{\bar\theta}(z', \mu_\psi(z', x_0'))\big)\Big)^2\,\right].
+    \label{eq:fql-critic}
+\end{equation}
+In practice, two critics are trained as an ensemble and aggregated by mean to suppress overestimation, in line with TD3-style clipped double Q-learning \cite{lillicrap2019continuouscontroldeepreinforcement}.
+
+The FQL recipe is what we use as the inner agent throughout Chapters~\ref{chap:offline-online}--\ref{chap:mpc-distill}, with $h=5$ chunked actions. Our extensions consist of (i) wrapping it in a WM environment (Chapter~\ref{chap:offline-online}) and (ii) modifying its actor-side training signal via MPC-distillation (Chapter~\ref{chap:mpc-distill}); the critic loss in Eq.~\eqref{eq:fql-critic} and the BC-flow loss in Eq.~\eqref{eq:bc-flow-bg} remain unchanged.
+
+\subsection{Flow Map Policies and Q-Guidance}
+\label{sec:fmq-bg}
+
+The flow-matching policy in Eq.~\eqref{eq:bc-flow-bg} is parametrised by an instantaneous velocity $u_\xi(z, x_t, t)$ that has to be integrated over many small Euler steps to produce an action. A \emph{flow map} replaces this instantaneous field with a two-time average velocity $u_{r,t}(z, x_r)$ that transports $x_r$ at time $r$ to $x_t$ at time $t$ in a single jump:
+\begin{equation}
+    X_{r,t}(x_r \mid z) \;=\; x_r + (t - r)\, u_{r,t}(z, x_r).
+    \label{eq:flow-map-bg}
+\end{equation}
+The instantaneous flow of \S\ref{sec:hiql-flow} is recovered as the diagonal limit $u_{t,t} = v_t$, and a one-step generator that maps noise directly to an action is the boundary case $X_{0,1}(x_0)$ with $r=0, t=1$. Mean-flow policies \cite{ziakas2026aligning} are exactly this construction: they amortise multi-step Euler integration into one forward pass while keeping the same expressive flow-matching policy class.
+
+Ziakas et al.\ \cite{ziakas2026aligning} formulate online adaptation of such a one-step flow-map policy as a trust-region optimisation problem: given a frozen reference flow-map policy $u^{\mathrm{ref}}_{r,1}$ producing $a_1 = a_r + (1-r)\,u^{\mathrm{ref}}_{r,1}(a_r\mid z)$, find the velocity perturbation that maximises a first-order expansion of the critic $Q_\phi$ around $a_1$, subject to a Euclidean trust-region constraint of radius $\eta$:
+\begin{equation}
+    \max_{u_{r,1}}\; Q_\phi\!\big(z,\, a_r + (1-r)\, u_{r,1}(a_r\mid z)\big)
+    \quad\text{s.t.}\quad
+    \big\|u_{r,1} - u^{\mathrm{ref}}_{r,1}\big\|_2 \le \eta.
+    \label{eq:fmq-objective-bg}
+\end{equation}
+The closed-form optimum is given by their Theorem~3.2:
+\begin{equation}
+    \boxed{\;u^{\,*}_{r,1}(a_r\mid z) \;=\; u^{\mathrm{ref}}_{r,1}(a_r\mid z) \;+\; \eta\,\frac{\nabla_a Q_\phi(z, a_1)}{\big\|\nabla_a Q_\phi(z, a_1)\big\|_2}\;.}
+    \label{eq:fmq-target-bg}
+\end{equation}
+This is \emph{optimal} in the strict sense that, among all perturbations of the reference velocity within the $\eta$-ball, Eq.~\eqref{eq:fmq-target-bg} maximises the local linear approximation of $Q_\phi$; the proof, by direct application of the KKT conditions to Eq.~\eqref{eq:fmq-objective-bg}, is given in \cite{ziakas2026aligning}.
+
+Setting $u^{\mathrm{ref}}_{r,1}$ equal to the frozen offline flow-map velocity converts Eq.~\eqref{eq:fmq-target-bg} into a self-bootstrapped learning target: the online actor regresses against the optimal trust-region displacement of its own offline initialisation. The resulting algorithm, \emph{Flow Map Q-Guidance} (FMQ), is what we use in Chapter~\ref{chap:mpc-distill} to generate online-adaptation labels for the MPC distillation pipeline. The same paper also introduces an inference-time refinement, \emph{Q-Guided Beam Search} (QGBS), which combines stochastic renoising with beam search over the $Q$-gradient trust region; we use only the FMQ training-time update in this work.
 
 \section{Experimental Environment and Benchmarks}
 
@@ -394,6 +489,11 @@ OGBench addresses this limitation by constructing datasets and evaluation protoc
 This formulation places a strong emphasis on generalisation and compositional reasoning, as the agent must infer how to reach novel goals by recombining previously observed transitions. Importantly, the dataset structure aligns closely with hindsight relabeling strategies, enabling direct integration with methods such as HER.
 
 In our implementation, we leverage the HGCDataset structure provided by OGBench, which is specifically designed for goal-conditioned learning. This allows seamless incorporation of hindsight goal relabeling and ensures consistency between training and evaluation protocols, forming a direct bridge between the offline dataset and the hierarchical, latent-space methods developed in this work.
+
+\subsection{Approximate Nearest-Neighbour Search}
+\label{sec:faiss-bg}
+
+Several methods in Chapter~\ref{chap:offline-online} rely on a fast nearest-neighbour query against the offline latent pool $\mathcal{Z}_{\text{off}}$, either to project an out-of-distribution prediction back onto the support or to estimate distance-based uncertainty. With $|\mathcal{Z}_{\text{off}}|$ on the order of $10^5$ latents at 192 dimensions, an exact brute-force search at every WM step would be prohibitive. We use FAISS \cite{johnson2017faiss}, a GPU-resident library for billion-scale similarity search that maintains an indexed pool and answers cosine-similarity queries in microseconds. The cost is a one-time index build of the offline pool; subsequent NN queries are effectively free at the rate the WM rollout runs.
 
 \section{Related Work}
 

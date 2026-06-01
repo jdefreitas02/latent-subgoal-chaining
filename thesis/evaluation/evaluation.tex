@@ -38,11 +38,22 @@ simulator and a task counts as solved when the cube ends within
 $4$\,cm of the target (\textsc{OGBench}'s native success criterion).
 This is our headline metric and the one reported in all main tables.
 
-\paragraph{Latent goal-reaching.} An in-distribution sanity check in
-which goals are sampled from training data and the agent must drive
-the latent state to within $\delta$ of the goal embedding in
-$\mathcal{Z}$. Used during training and for the diagnostics of
-\S\ref{sec:exp-diag}.
+\paragraph{Latent goal-reaching (latent-reach rate).} An
+in-distribution sanity check in which goals are sampled from training
+data and the agent must drive the latent state to within $\delta_d$ of
+the goal embedding in $\mathcal{Z}$. During SAC+HER training the agent
+never touches MuJoCo: transitions are produced entirely by the LeWM
+predictor inside \texttt{LatentEnv}, the environment is teleported to a
+cached start latent, and a ``success'' is logged when
+$\|z_t - z^\star\|_2 < \delta_d$. The done-threshold is
+$\delta_d{=}2.887$ for the $64{\times}64$ sweep and $\delta_d{=}2.0$ for
+the legacy $224{\times}224$ stack. The ``\texttt{Success\_Rate}'' column
+of every \texttt{training\_metrics.csv} is the running mean of this
+Boolean over the last $2{,}000$ attempts. \emph{This latent-reach rate
+measures only whether the actor can drive the predictor to a target
+latent; it says nothing about whether the cube task is solved, and must
+never be compared head-to-head with the native-OGBench rate below.}
+Used during training and for the diagnostics of \S\ref{sec:exp-diag}.
 
 \paragraph{CEM/MPC planning.} As an alternative to learning a policy,
 we replace the actor with a cross-entropy-method planner that
@@ -66,6 +77,31 @@ action norm logged at every step (\S\ref{sec:exp-diag}).
 % ---------------------------------------------------------------------
 \section{World Model Quality}
 \label{sec:exp-wm}
+
+\subsection{Pre-training Convergence}
+\label{sec:exp-wm-pretrain}
+The LeJEPA world model is pre-trained on the OGBench cube data
+($224{\times}224$ images) with PyTorch Lightning. The objective combines
+the JEPA latent-prediction loss with the spectral isotropy regulariser
+(Eq.~\eqref{eq:sigreg}).
+
+\begin{table}[h]
+\centering
+\caption{LeJEPA pre-training. \texttt{fit/loss} is the total objective,
+\texttt{pred\_loss} the latent prediction loss, and \texttt{sigreg\_loss}
+the $\sigma$-regulariser on the encoder covariance. Values are the last
+logged step in \texttt{lightning\_logs/version\_*/metrics.csv};
+\texttt{version\_0} was truncated before a validation epoch was written.}
+\label{tab:lewm-pretraining}
+\begin{tabular}{lrrrr}
+\toprule
+Run & Epochs & Final fit/loss & Val pred\_loss & Val sigreg\_loss \\
+\midrule
+\texttt{version\_0} & 10 (in-progress) & 0.0927 & --      & --    \\
+\texttt{version\_1} & 19 (completed)   & --     & 0.00252 & 1.352 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Predictor Drift vs Horizon}
 \label{sec:exp-wm-drift}
@@ -124,10 +160,30 @@ used to set $\delta_d$ and $\kappa$.}
 \end{figure}
 
 \subsection{Resolution Study}
-\todo{verify: paste numbers from \texttt{run\_resolution\_experiment.sh}
-output (\texttt{resolution\_experiment.py}) comparing $64{\times}64$
-and $224{\times}224$ LeWM models on (a) predictor drift and (b)
-downstream HIQL+LeWM success.}
+\label{sec:exp-wm-resolution}
+We test whether the $64{\times}64$ checkpoints can be safely compared
+against the $224{\times}224$ LeJEPA model by measuring latent agreement
+between native $224{\times}224$ cube images and $64{\to}224$ up-sampled
+versions ($n{=}128$ images from \texttt{ogbench/cube\_single\_expert}).
+The baseline cosine similarity on \emph{different} images is
+$-0.009 \pm 0.050$, so the high agreement below indicates the encoder is
+largely resolution-robust.
+
+\begin{table}[h]
+\centering
+\caption{Latent agreement between native $224{\times}224$ and
+$64{\to}224$ up-sampled cube images. Source:
+\texttt{resolution\_experiment.o2546715}.}
+\label{tab:resolution}
+\begin{tabular}{lcccc}
+\toprule
+Comparison & $\overline{\cos}$ & cos std & $\overline{L_2}$ & $L_2$ std \\
+\midrule
+224 vs 64$\to$224 bilinear & 0.9900 & 0.0106 & 1.781 & 0.832 \\
+224 vs 64$\to$224 bicubic  & 0.9939 & 0.0060 & 1.404 & 0.618 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % ---------------------------------------------------------------------
 \section{Curriculum SAC (\S\ref{sec:curr-sac})}
@@ -159,16 +215,17 @@ Eqs.~\eqref{eq:her-sparse}--\eqref{eq:her-dense}.
 
 \begin{table}[h]
 \centering
-\caption{HER+SAC (\S\ref{sec:her-sac}) on OGBench cube-single.
-Task-sampling mode $\times$ reward type. Numbers in italics are to be
-filled from
-\texttt{old\_checkpoints\_and\_outputs/eval\_native\_checkpoints\_her\_*}.}
+\caption{HER+SAC (\S\ref{sec:her-sac}) on OGBench cube-single,
+\textbf{native task success (\%)}. Task-sampling mode $\times$ reward
+type. All WM-rollout variants (flat and curriculum-proxy) score $0\%$
+natively despite high latent-reach (Table~\ref{tab:sac-train-sr}); dense
+cells not yet re-run natively are marked.}
 \label{tab:her-sac}
 \begin{tabular}{lcc}
 \toprule
 mode & sparse & dense \\
 \midrule
-curriculum & \todo{verify} & \todo{verify} \\
+curriculum & 0.0 & \todo{verify} \\
 fixed-gap ($G=5$) & 0.0 & \todo{verify} \\
 pure-distance & 0.0 & \todo{verify} \\
 \bottomrule
@@ -176,8 +233,160 @@ pure-distance & 0.0 & \todo{verify} \\
 \end{table}
 
 \subsection{Sparse vs Dense Reward}
-\todo{verify: discuss trade-off — sparse reward is uniformative but
-unbiased; dense reward is denser but introduces a clip-induced bias.}
+The sparse reward (Eq.~\eqref{eq:her-sparse}) is uninformative but
+unbiased: it gives no gradient until a relabelled goal is actually
+reached, but when it does fire the signal is exact. The dense potential
+reward (Eq.~\eqref{eq:her-dense}) supplies a gradient at every step, but
+the clip on the per-step potential introduces a bias toward
+short-horizon goal reduction and can reward latent motion that does not
+correspond to real cube motion. In the native-OGBench tables below the
+dense variant is consistently the stronger of the two
+(Tables~\ref{tab:her-sac},~\ref{tab:joint-gap}), but neither approaches
+the state-observation upper bound (Table~\ref{tab:headline}).
+
+\subsection{Latent-Reach During Training (\texorpdfstring{$64{\times}64$}{64x64} Sweep)}
+\label{sec:exp-her-latentreach}
+Before turning to native-task transfer we report the
+\emph{latent-reach rate} (\S\ref{sec:exp-setup}) at the end of training
+for the $64{\times}64$ SAC+HER sweep. Recall this is an in-distribution
+sanity metric --- the fraction of teleported latent rollouts whose
+predictor-rolled state reached within $\delta_d{=}2.887$ of the latent
+target --- and is \emph{not} the cube task.
+
+\begin{table}[h]
+\centering
+\caption{End-of-training latent-reach rate for the $64{\times}64$
+SAC+HER sweep (mean over the last 30 logged iterations; $2{,}000$-attempt
+window). $50$k iterations, $256$ parallel envs, sparse reward,
+future-goal HER. Because $T_{\max}$ equals the gap, smaller gaps give
+fewer actions to reach a farther-ahead latent and are therefore harder
+\emph{at training time}. Source:
+\texttt{checkpoints\_her\_*/training\_metrics.csv}.}
+\label{tab:sac-train-sr}
+\begin{tabular}{lcccc}
+\toprule
+& \multicolumn{4}{c}{Reward shape (gap = latent subgoal horizon, WM steps)} \\
+\cmidrule(lr){2-5}
+BC weight $\alpha$ & Pure-dist.\ ($T_{\max}{=}40$) & Gap = 2 & Gap = 10 & Gap = 20 \\
+\midrule
+0.0 & 99.7\,$^{\dagger}$ & 45.8 & 61.4 & 99.0 \\
+0.1 & \phantom{0}0.1\,$^{\ddagger}$ & --   & --   & --   \\
+0.5 & 99.4               & 51.6 & 96.4 & 99.2 \\
+1.0 & 99.8\,$^{\dagger}$ & 50.5 & 96.2 & 99.0 \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}\small
+$^{\dagger}$Stopped at walltime after the rate had plateaued.\quad
+$^{\ddagger}$Diverged (actor loss $\approx-5.9\!\times\!10^{5}$, critic
+loss $\approx 2.5\!\times\!10^{10}$). A separate gap=5, $\alpha{=}0.5$ run
+reaches $87.4\%$ latent-reach.
+\end{table}
+
+\subsection{Real-Task Transfer of the \texorpdfstring{$64{\times}64$}{64x64} Policies}
+\label{sec:exp-her-realtask}
+The same checkpoints, evaluated in the full MuJoCo simulator
+(\texttt{eval\_actor.py}) with an in-trajectory goal $25$ steps ahead,
+collapse from $>\!87\%$ latent-reach to the low-to-mid range below; under
+the harder native five-task suite they fall further still (to
+$\sim\!0$--$2\%$, consistent with Tables~\ref{tab:her-sac}
+and~\ref{tab:headline}).
+
+\begin{table}[h]
+\centering
+\caption{Real-task (full MuJoCo) evaluation of two $64{\times}64$
+SAC+HER checkpoints; flat policy, 50 rollouts of
+\texttt{visual-cube-single-v0}, \texttt{goal\_offset\_steps}${=}25$,
+OGBench block-pose success criterion. Source:
+\texttt{eval\_results\_*/results.txt}.}
+\label{tab:single-task-eval}
+\begin{tabular}{lcc}
+\toprule
+Checkpoint & Real-task success (\%) & Eval time (s) \\
+\midrule
+\texttt{her\_fixed\_gap\_5\_sparse\_bc0.5}  & 28.0 & 1624 \\
+\texttt{her\_pure\_distance\_sparse\_bc0.5} & 22.0 & 1445 \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}\small
+The contrast with Table~\ref{tab:sac-train-sr} (both $>87\%$ latent-reach)
+is the central observation of this chapter: high latent-reach does not
+translate into solving the cube task.
+\end{table}
+
+\subsection{Legacy \texorpdfstring{$224{\times}224$}{224x224} Stack (latent-reach)}
+\label{sec:exp-her-legacy}
+For completeness we include the earlier $224{\times}224$ LHRL runs. These
+numbers are \emph{latent-reach rates} (in-distribution,
+$\delta_d{=}2.0$), not native-task success, and should be read alongside
+Table~\ref{tab:sac-train-sr} rather than the native tables.
+
+\begin{table}[h]
+\centering
+\caption{Final latent-reach rate for the legacy $224{\times}224$ LHRL
+runs ($25$k iterations, single-frame \texttt{LatentEnv}). ``LeWM'' is
+\texttt{sac\_baseline.py} (cache goals, no relabelling); ``HER'' is the
+\texttt{VectorizedEpisodicHERBuffer} future-goal variant. HER starves at
+small gaps because the tight $T_{\max}{=}K$ budget rarely yields a true
+reach for relabelling to lock onto. Source:
+\texttt{latent\_hindsight\_rl/logs/}.}
+\label{tab:lhrl-train}
+\begin{tabular}{lcc}
+\toprule
+Mode & LeWM latent-reach (\%) & HER latent-reach (\%) \\
+\midrule
+Pure distance         & 99.2 & 96.8 \\
+Fixed gap = 2         & 55.6 &  4.5 \\
+Fixed gap = 8         & 39.4 &  6.2 \\
+Fixed gap = 24        & 63.6 & 81.9 \\
+Curriculum (1$\to$40) & 50.2 &  1.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Legacy LHRL behavioural-cloning sweep (HER + sparse, $50$k
+iterations), latent-reach rate. BC regularisation does not move the
+gap=5 rate: the bottleneck is the action budget, not action realism.
+Source: \texttt{latent\_hindsight\_rl/logs/her\_*\_bc*.o*}.}
+\label{tab:lhrl-bc}
+\begin{tabular}{lcccc}
+\toprule
+Mode & $\alpha{=}0$ & $\alpha{=}0.1$ & $\alpha{=}0.5$ & $\alpha{=}1.0$ \\
+\midrule
+Pure-distance & 98.5 & 99.5 & 99.7 & 99.5 \\
+Fixed gap = 5 & 20.3 & 21.3 & 17.6 & 16.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Legacy LHRL ``evaluation'' campaign and high-level decoder
+study. \emph{Caveat:} these older runs are believed to report
+in-distribution latent-reachability rather than native five-task success
+and are retained only for the relative comparison between modes /
+decoders. Sources:
+\texttt{latent\_hindsight\_rl/eval\_results\_old/*/results.txt}.}
+\label{tab:lhrl-eval}
+\begin{tabular}{lcc}
+\toprule
+Mode & LeWM (\%) & HER (\%) \\
+\midrule
+Pure distance         & 54.0 & 70.0 \\
+Fixed gap = 2         & 54.0 & 44.0 \\
+Fixed gap = 8         & 62.0 & 36.0 \\
+Fixed gap = 24        & 58.0 & 60.0 \\
+Curriculum (1$\to$40) & 56.0 & 44.0 \\
+\midrule
+\multicolumn{3}{l}{\emph{High-level decoder (gap=24 sparse-HER):}} \\
+MLP (2 runs)       & \multicolumn{2}{c}{48.0 / 48.0} \\
+Diffusion (2 runs) & \multicolumn{2}{c}{40.0 / 38.0} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % ---------------------------------------------------------------------
 \section{Joint Hierarchical SAC (\S\ref{sec:joint})}
@@ -192,30 +401,105 @@ predicted waypoint $z_{\mathrm{sub}}$.
 \begin{table}[h]
 \centering
 \caption{Joint hierarchical SAC (\S\ref{sec:joint}) on OGBench
-cube-single. Success rate (\%) as a function of high-level gap $G$
-and reward type. The performance cliff at $G\!\geq\!2$ motivates the
-move to HIQL in \S\ref{sec:exp-hiql}.}
+cube-single, \textbf{native five-task success rate (\%)}, freshly
+re-evaluated ($5$ tasks $\times$ $50$ episodes, AWR high-level actor
+$\beta{=}3$). The performance cliff at $G\!\geq\!5$ motivates the move to
+HIQL in \S\ref{sec:exp-hiql}.}
 \label{tab:joint-gap}
 \begin{tabular}{lcc}
 \toprule
 $G$ & sparse & dense \\
 \midrule
-1 & 0.8 & 2.4 \\
-2 & 0.0 & 0.0 \\
-5 & 0.0 & 0.0 \\
+1  & 0.4 & 3.6 \\
+2  & 1.6 & 3.6 \\
+5  & 0.0 & 0.0 \\
 10 & 0.0 & 0.0 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The cliff at $G \geq 2$ is consistent with the predictor-drift curve
-of Fig.~\ref{fig:drift}: at $G \geq 2$ the high-level waypoint
-$z_{\mathrm{sub}}$ lies $G\cdot 5 \geq 10$ frames into the future,
-where the LeWM error has grown beyond the done-threshold $\delta_d$.
+The best native results ($3.6\%$ at $G\!\in\!\{1,2\}$, dense reward)
+remain an order of magnitude below the state-observation upper bound,
+but the cliff at $G\!\geq\!5$ is sharp and consistent with the
+predictor-drift curve of Fig.~\ref{fig:drift}: a waypoint $G\!=\!2$ steps
+ahead lies $G\cdot 5 = 10$ frames into the future and is still
+reachable, whereas at $G\!\geq\!5$ ($\geq\!25$ frames) the LeWM error has
+grown well beyond the done-threshold $\delta_d$ and the high-level
+advantage signal $A_t = \|z_t - g\|_2 - \|z_{t+G} - g\|_2$ becomes
+meaningless. Dense reward dominates sparse throughout.
 
-\subsection{Effect of \texttt{cache\_ratio}}
-\todo{verify: report success rate as a function of \texttt{cache\_ratio}
-$\in\{0, 0.5, 0.75, 0.8, 0.9, 1.0\}$. Source: \texttt{logs/eval\_gap*\_cr*.out}.}
+\subsection{High-Level Subgoal Pre-training}
+\label{sec:exp-joint-hl}
+The high-level actor can optionally be warm-started from a supervised
+MLP that regresses $(z_{\mathrm{curr}}, z_{\mathrm{goal}})$ to the latent
+$K$ world-model steps ahead. The MSE floor grows with $K$ because
+farther-ahead latents are intrinsically harder to predict --- the same
+horizon effect seen in the predictor-drift curve.
+
+\begin{table}[h]
+\centering
+\caption{Supervised high-level subgoal MLP ($50$ epochs, latent-space
+MSE). Source: \texttt{hl\_ogb\_gap*.o*}.}
+\label{tab:hl-mlp-train}
+\begin{tabular}{lrrr}
+\toprule
+Run & Best val loss & Final train loss & Final val loss \\
+\midrule
+\texttt{gap2}  & 0.0922 & 0.0906 & 0.0922 \\
+\texttt{gap5}  & 0.2196 & 0.2158 & 0.2196 \\
+\texttt{gap10} & 0.3551 & 0.3491 & 0.3554 \\
+\texttt{gap20} & 0.5104 & 0.4979 & 0.5109 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Effect of \texttt{cache\_ratio} and AWR Temperature}
+\label{sec:exp-joint-cache}
+Mixing offline expert transitions into each SAC batch
+(\texttt{cache\_ratio}) together with a sharper AWR temperature
+($\beta$) gives the largest single-task gains we observed in the
+hierarchical setting. At $G{=}2$ with $\beta{=}20$, raising
+\texttt{cache\_ratio} from $0$ to $0.5$ lifts native success from $1.2\%$
+to $3.6\%$, driven almost entirely by task~1 (horizontal), which reaches
+$18\%$ in isolation; the remaining tasks stay at $0\%$, indicating the
+expert mix biases the policy toward the easiest trajectory rather than
+broadly improving competence. Configurations with
+$\texttt{cache\_ratio}\!\geq\!0.8$ were only run under the latent-reach
+protocol (where they scored $0\%$) and are not native-confirmed.
+
+\begin{table}[h]
+\centering
+\caption{Native success (\%) at $G{=}2$, sparse reward, $\beta{=}20$, as
+a function of \texttt{cache\_ratio}.}
+\label{tab:joint-cache}
+\begin{tabular}{lcc}
+\toprule
+\texttt{cache\_ratio} & overall & task1 (horiz.) \\
+\midrule
+0.0 & 1.2 & \phantom{0}4.0 \\
+0.5 & 3.6 & 18.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{State-Observation Hierarchical Control}
+\label{sec:exp-joint-state}
+To isolate the effect of the JEPA encoder from the hierarchical
+algorithm itself, we re-implemented the full two-level architecture
+(AWR high-level + SAC low-level) directly on the $28$-D state
+observation, with the high-level proposing an intermediate cube position
+(\texttt{train\_joint\_state.py}). Despite removing the encoder
+bottleneck entirely, both $G{=}5$ and $G{=}10$ variants score $0.0\%$ on
+all five native tasks. The failure mode is distinct from the flat state
+baseline (which solves three tasks, Table~\ref{tab:headline}): the
+high-level proposes poorly-calibrated subgoals early in training, giving
+the low-level a noisier effective goal than the direct physical goal,
+which triggers premature entropy collapse ($\alpha\!\to\!0.01$ floor
+within a few hundred iterations). This indicates the hierarchical
+decomposition \emph{itself} is fragile without a reliable high-level
+policy, independently of representation quality, and that a warm-started
+high-level (\S\ref{sec:exp-joint-hl}) is a prerequisite rather than an
+optional refinement.
 
 \subsection{Cost Regularisation Sweep}
 \todo{verify: report success rate as a function of the action-cost
@@ -323,15 +607,23 @@ modes for the same latent state.
 \toprule
 Method & Latent space & Success (\%) \\
 \midrule
+SAC+HER (state obs., \emph{upper bound}) & $28$-D state & \textbf{19.6} \\
+\midrule
 Curriculum SAC (\S\ref{sec:curr-sac}) & $192$-D LeWM & \todo{verify} \\
 HER+SAC (\S\ref{sec:her-sac}, best mode) & $192$-D LeWM & 0.0 \\
-Joint hier.\ SAC (\S\ref{sec:joint}, $G{=}1$, dense) & $192$-D LeWM & 2.4 \\
+Joint hier.\ SAC (\S\ref{sec:joint}, $G{\in}\{1,2\}$, dense) & $192$-D LeWM & 3.6 \\
 HIQL baseline (no WM, $k{=}5$, $d_r{=}10$) & $224{\times}224$ raw & \textbf{37.6} \\
 HIQL+LeWM (\S\ref{sec:hiql-lewm}, $k{=}2$, $\rho_{\mathrm{wu}}{=}1$) & $192$-D LeWM & 20.8 \\
 HIQL+LeWM+Flow (\S\ref{sec:hiql-flow}) & $192$-D LeWM & \todo{verify} \\
-CEM/MPC with LeWM (\S\ref{sec:exp-cem}, 224) & $192$-D LeWM & 0.0 \\
+CEM/MPC with LeWM (\S\ref{sec:exp-cem}, 224) & $192$-D LeWM & 0.0$^{\ast}$ \\
 \bottomrule
 \end{tabular}
+
+\vspace{2pt}\small
+$^{\ast}$Native task success. The same planner reaches $72.0\%$ on the
+in-distribution latent-reach metric (\S\ref{sec:exp-cem}); the two must
+not be conflated. The state-observation SAC+HER row is a non-LeWM upper
+bound included for calibration only.
 \end{table}
 
 % ---------------------------------------------------------------------
@@ -340,10 +632,40 @@ CEM/MPC with LeWM (\S\ref{sec:exp-cem}, 224) & $192$-D LeWM & 0.0 \\
 
 We replace the learned policy with a CEM planner that optimises
 action sequences against LeWM rollouts (settings in
-\S\ref{sec:exp-setup}). On OGBench cube-single this approach scores
-$0.0\%$, confirming that the predictor drift documented in
-Fig.~\ref{fig:drift} is large enough that pure model-based planning
-without a learned policy is not viable at our horizons.
+\S\ref{sec:exp-setup}). The two evaluation regimes diverge sharply for
+this planner: it reaches $72.0\%$ on the in-distribution
+\emph{latent-reach} metric (it is, after all, directly optimising latent
+distance to the goal embedding) yet solves $0.0\%$ of the native cube
+task. This is the cleanest single demonstration of the central finding
+of this chapter --- excellent latent goal-reaching does not imply task
+success, because the predictor drift documented in Fig.~\ref{fig:drift}
+means a latent trajectory that ends at the goal embedding need not
+correspond to a physical trajectory that places the cube.
+
+\begin{table}[h]
+\centering
+\caption{CEM planning directly in the $224{\times}224$ LeJEPA latent
+space on \texttt{swm/OGBCube-v0} (\texttt{terminate\_at\_goal}, $50$
+episodes). The latent-reach rate is high but native task success is
+zero. Source:
+\texttt{results\_cube\_eval\_2026-03-28\_13-53/ogb\_cube\_results.txt}.}
+\label{tab:cem-baseline}
+\begin{tabular}{lc}
+\toprule
+Setting & Value \\
+\midrule
+Plan / receding horizon      & 5 / 5 \\
+Action block                 & 5 \\
+CEM samples $\times$ iters   & $300 \times 30$ \\
+CEM elite (top-$k$)          & 30 \\
+Episodes                     & 50 \\
+\midrule
+Latent-reach rate            & 72.0\% \\
+\textbf{Native task success} & \textbf{0.0\%} \\
+Eval wall-time               & 654\,s \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % ---------------------------------------------------------------------
 \section{Diagnostics and Failure Mode Analysis}
@@ -375,25 +697,50 @@ positioning step.
 \section{Discussion}
 \label{sec:exp-discuss}
 
+The single most important finding of this chapter is the gulf between
+the two evaluation regimes of \S\ref{sec:exp-setup}. Every method that
+optimises latent distance --- SAC+HER ($>\!87\%$ latent-reach,
+Table~\ref{tab:sac-train-sr}), the CEM planner ($72\%$ latent-reach,
+Table~\ref{tab:cem-baseline}), and the legacy $224$ stack ($>\!95\%$,
+Table~\ref{tab:lhrl-train}) --- can drive the predictor to a target
+embedding almost perfectly, yet the same policies solve at most a few
+percent of the native cube task, and the CEM planner solves none. High
+latent-reach is necessary but nowhere near sufficient: a latent
+trajectory that terminates at the goal embedding need not correspond to
+a physical trajectory that places the cube, precisely because of the
+predictor drift in Fig.~\ref{fig:drift}. Any latent-reach number in this
+chapter should therefore be read as a training diagnostic, never as a
+task result.
+
 The progression from \S\ref{sec:exp-curr-sac} to
 \S\ref{sec:exp-flow} maps cleanly onto the algorithmic progression of
 Chapter~\ref{chap:methodology}. Curriculum SAC fails for lack of a
 learning signal on long-horizon tasks; HER+SAC adds the signal but
-still underperforms; the hierarchical joint variant collapses
-whenever the high-level gap exceeds the predictor's horizon of
-fidelity (Fig.~\ref{fig:drift}); HIQL+LeWM is the first method to
-break double-digit success, and is best when imagination is
-\emph{disabled} ($\rho_{\mathrm{wu}}=1$, Table~\ref{tab:hiql-lewm-sweep});
-the flow-matching variant
+still scores $0\%$ natively; the hierarchical joint variant reaches a
+modest $3.6\%$ at short gaps but collapses once the high-level gap
+exceeds the predictor's horizon of fidelity ($G\!\geq\!5$,
+Table~\ref{tab:joint-gap}); HIQL+LeWM is the first method to break
+double-digit success, and is best when imagination is \emph{disabled}
+($\rho_{\mathrm{wu}}=1$, Table~\ref{tab:hiql-lewm-sweep}); the
+flow-matching variant
 \todo{verify: confirm whether it improves on the Gaussian actor or
 not.}
 
-The single most informative diagnostic is the predictor-drift curve
-in Fig.~\ref{fig:drift}: every method whose effective horizon exceeds
-$\sim\!10$ raw frames falls off a cliff. This frames the principal
-direction for future work as improving long-horizon predictor
-fidelity, either by (i) larger or longer-trained world models, (ii)
-a contrastive auxiliary objective on top of the JEPA loss in
-Eq.~\eqref{eq:pred-loss}, or (iii) abandoning closed-form roll-outs
-in favour of a hybrid offline+real-data training regime in which the
-world model is consulted only on short horizons.
+A second, independent fragility is exposed by the state-observation
+hierarchical control of \S\ref{sec:exp-joint-state}: even with the
+encoder removed entirely, the two-level architecture scores $0\%$
+because an unreliable high-level gives the low-level a noisier goal than
+a flat policy would, triggering entropy collapse. The hierarchy thus
+requires a warm-started high-level (Table~\ref{tab:hl-mlp-train}) as a
+prerequisite, not an add-on.
+
+The most informative diagnostic remains the predictor-drift curve in
+Fig.~\ref{fig:drift}: methods whose effective horizon exceeds roughly
+$10$--$25$ raw frames fall off a cliff, matching the joint-SAC gap
+boundary between $G{=}2$ ($10$ frames, $3.6\%$) and $G{=}5$ ($25$
+frames, $0\%$). This frames the principal direction for future work as
+improving long-horizon predictor fidelity, either by (i) larger or
+longer-trained world models, (ii) a contrastive auxiliary objective on
+top of the JEPA loss in Eq.~\eqref{eq:pred-loss}, or (iii) abandoning
+closed-form roll-outs in favour of a hybrid offline+real-data training
+regime in which the world model is consulted only on short horizons.
