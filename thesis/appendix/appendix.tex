@@ -1,30 +1,59 @@
 \appendix
-\chapter{First Appendix}
+\chapter{Implementation Notes}
+\label{app:impl}
 
-\section{Offline-to-Online Hyperparameter Sweeps}
+\paragraph{Hardware.} All experiments are performed on a single NVIDIA
+A100 GPU. The replay buffers are GPU-resident; for the largest
+configuration the flat buffer occupies approximately $1.5\,$GB.
+
+\paragraph{Optimisers.} Adam with learning rate $3\!\times\!10^{-4}$
+for all RL networks (actor, critic/value, temperature, goal-rep, flow),
+and AdamW with learning rate $5\!\times\!10^{-5}$ for the world model.
+Gradient clipping at $1.0$ is applied to every loss.
+
+\paragraph{Target networks.} Polyak averaging with $\tau = 0.005$ is
+applied to all critics, values, and the HIQL goal-rep $\varphi$. Target
+updates are performed once per gradient step.
+
+\paragraph{Batching and parallelism.} All RL methods use a batch size
+of $256$ and $40$ gradient updates per outer iteration (reduced to $20$
+in the dense reward setting). World-model roll-outs are vectorised
+across $50$ parallel environments.
+
+\paragraph{Constants.} $\gamma = 0.99$ throughout. The done-threshold
+$\delta_d = 2.0$ and the dense-reward scale $\kappa = 1.6$ are
+calibrated from the median single-step predictor drift in the LeWM
+latent space, reported in \S\ref{sec:wm-drift}.
+
+\chapter{Offline-to-Online Hyperparameter Sweeps}
 \label{app:oo-sweeps}
 
 The tables below collect the full hyperparameter sweeps referenced in
-Chapter~\ref{chap:mpc-distill}. All entries use the same environment
+Chapter~\ref{chap:online-with-wm}. All entries use the same environment
 (\texttt{visual-cube-single-singletask-task1-v0}, $250$ episodes per
-evaluation) and the same offline policy starting point
-(\texttt{sd55445}, $81.6\%$).
+evaluation) and the same offline policy starting point (\texttt{sd55445},
+$81.6\%$). Runs are named by their dominant configuration deviation
+from the headline \emph{FMQ-distil, slow-relabel} run.
 
 \begin{table}[h]
 \centering
-\caption{FMQ-label early variants at the $10$k relabelling interval. The high-frequency relabelling causes oscillation: the mixed-injection variant reaches $90.0\%$ standalone at $200$k but the checkpoint was not saved, and the final-checkpoint MPC-eval matches the headline Grad-MPC distillation result.}
+\caption{FMQ-label early variants at the $10$k relabelling interval.
+   The high-frequency relabelling causes oscillation: the
+   \emph{fast-relabel, mixed} run reaches $90.0\%$ standalone at $200$k
+   but the checkpoint was not saved, and the final-checkpoint MPC-eval
+   matches the headline Grad-MPC distillation result.}
 \label{tab:app-fmq-early}
 \begin{tabular}{l l r l}
 \toprule
-Variant & Mode & Final SA (\%) & MPC-eval (\%) \\
+Run & Mode & Final SA (\%) & MPC-eval (\%) \\
 \midrule
-FMQ-distil 10k, mixed     & mixed     & 72.8 & 92.4 (Grad-MPC $K{=}5$); 86.8 (FMQ $\eta{=}0.1$) \\
-FMQ-distil 10k, mixed-AWR & mixed-awr & 75.6 & 88.8 (Grad-MPC $K{=}5$); 86.4 (FMQ $\eta{=}0.1$) \\
+FMQ-distil, fast-relabel, mixed     & mixed     & 72.8 & 92.4 (Grad-MPC $K{=}5$); 86.8 (FMQ $\eta{=}0.1$) \\
+FMQ-distil, fast-relabel, AWR-mixed & mixed-awr & 75.6 & 88.8 (Grad-MPC $K{=}5$); 86.4 (FMQ $\eta{=}0.1$) \\
 \bottomrule
 \end{tabular}
 
 \medskip
-\noindent\textbf{Mixed-injection variant standalone progression} (eval every $100$k steps):
+\noindent\textbf{Standalone progression of \emph{FMQ-distil, fast-relabel, mixed}} (eval every $100$k steps):
 $100$k:~$70.4\%$, \textbf{$200$k:~$90.0\%$}, $300$k:~$77.6\%$,
 $400$k:~$81.6\%$, $500$k:~$72.8\%$. The $200$k peak was lost due to
 missing intermediate checkpoints; this bug was fixed in all subsequent
@@ -33,72 +62,134 @@ runs.
 
 \begin{table}[h]
 \centering
-\caption{Training hyperparameter sweep over FMQ-label interleaved distillation. All runs use FMQ label generation at $\eta_{\text{train}}$, mixed injection,
-   eval+checkpoint every $25$k. Baseline configuration (the headline \emph{FMQ-distil, 50k} run in Chapter~\ref{chap:mpc-distill}): $\mathrm{lr}=3\times 10^{-4}$, $\mathrm{mix}=0.3$, $\mathrm{relabel}=50\text{k}$, $\mathrm{buf}=2000$, $\mathrm{warmup}=100\text{k}$, $\eta_{\text{train}}=0.1$, seed $42$. ``Peak SA'' is the highest standalone success rate ($\mathrm{BoN}\,N=4$) across all saved checkpoints. The 300k-steps variants and the lower-learning-rate variants were run for $300$k steps; the rest are $500$k.}
+\caption{Training hyperparameter sweep over FMQ-label interleaved
+   distillation. All runs use FMQ label generation at
+   $\eta_{\text{train}}$, mixed injection, eval$+$checkpoint every
+   $25$k. Baseline (\emph{FMQ-distil, slow-relabel}): $\mathrm{lr}=3
+   {\times}10^{-4}$, $\mathrm{mix}=0.3$, $\mathrm{relabel}=50$k,
+   $\mathrm{buf}=2000$, $\mathrm{warmup}=100$k, $\eta_{\text{train}}=0.1$,
+   seed $42$. ``Peak SA'' is the highest standalone success rate
+   ($\mathrm{BoN}\,N=4$) across saved checkpoints.}
 \label{tab:app-train-sweep}
 \begin{tabular}{l l l l l l l l}
 \toprule
 Run & lr & mix & relabel & buf & warmup & $\eta_{\text{train}}$ & Peak SA (\%) \\
 \midrule
 \multicolumn{8}{l}{\emph{Relabelling-interval / buffer / mix-ratio variants}} \\
-FMQ-distil A & $3{\times}10^{-4}$ & 0.5 & 10k & 2000 & 100k & 0.10 & 82.4 \\
-FMQ-distil B & $3{\times}10^{-4}$ & 0.5 & 25k & 2000 & 100k & 0.10 & 86.4 \\
-FMQ-distil C & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 &  50k & 0.10 & 86.0 \\
-FMQ-distil D & $3{\times}10^{-4}$ & 0.3 & 10k &  500 & 100k & 0.10 & 82.4 \\
-FMQ-distil E & $3{\times}10^{-4}$ & 0.3 & 50k & 5000 & 100k & 0.10 & 89.2 \\
-FMQ-distil F & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 & 100k & 0.05 & 88.0 \\
-FMQ-distil G & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 & 100k & 0.10 & 88.0 \\
-FMQ-distil H & $3{\times}10^{-4}$ & 0.5 & 10k &  500 & 100k & 0.10 & 84.0 \\
+fast-relabel, strong-mix          & $3{\times}10^{-4}$ & 0.5 & 10k & 2000 & 100k & 0.10 & 82.4 \\
+medium-relabel, strong-mix        & $3{\times}10^{-4}$ & 0.5 & 25k & 2000 & 100k & 0.10 & 86.4 \\
+short-warmup                      & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 &  50k & 0.10 & 86.0 \\
+small-buffer                      & $3{\times}10^{-4}$ & 0.3 & 10k &  500 & 100k & 0.10 & 82.4 \\
+slow-relabel, big-buffer          & $3{\times}10^{-4}$ & 0.3 & 50k & 5000 & 100k & 0.10 & 89.2 \\
+fine-$\eta$                       & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 & 100k & 0.05 & 88.0 \\
+fast-relabel (replicate 1)        & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 & 100k & 0.10 & 88.0 \\
+fast-relabel (replicate 2)        & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 & 100k & 0.10 & 87.6 (at 150k) \\
+fast-relabel, strong-mix, small-buffer & $3{\times}10^{-4}$ & 0.5 & 10k &  500 & 100k & 0.10 & 84.0 \\
 \midrule
 \multicolumn{8}{l}{\emph{Lower-learning-rate variants}} \\
-FMQ-distil I & $3{\times}10^{-4}$ & 0.3 & 10k & 2000 & 100k & 0.10 & 87.6 (at 150k) \\
-FMQ-distil J & $1{\times}10^{-4}$ & 0.3 & 50k & 2000 & 100k & 0.10 & 86.0 \\
-FMQ-distil K & $5{\times}10^{-5}$ & 0.3 & 50k & 2000 & 100k & 0.10 & 81.2 \\
-FMQ-distil L & $1{\times}10^{-4}$ & 0.5 & 50k & 2000 & 100k & 0.10 & \textbf{90.0 (at 275k)} \\
+low-lr                            & $1{\times}10^{-4}$ & 0.3 & 50k & 2000 & 100k & 0.10 & 86.0 \\
+very-low-lr                       & $5{\times}10^{-5}$ & 0.3 & 50k & 2000 & 100k & 0.10 & 81.2 \\
+\textbf{low-lr, strong-mix}       & $1{\times}10^{-4}$ & 0.5 & 50k & 2000 & 100k & 0.10 & \textbf{90.0 (at 275k)} \\
 \bottomrule
 \end{tabular}
 
 \medskip
 \noindent\textbf{Key takeaways.} Buffer size has the largest single
-effect: FMQ-distil~E ($\mathrm{buf}=5000$, peak $89.2\%$) versus
-FMQ-distil~D ($\mathrm{buf}=500$, peak $82.4\%$) is a $+6.8\%$ absolute lift. A lower
-learning rate paired with a stronger mix ratio (FMQ-distil~L: $\mathrm{lr}=10^{-4}$, $\mathrm{mix}=0.5$) achieves the cleanest single peak ($90.0\%$ at $275$k), suggesting reduced oscillation allows the training to maintain the peak longer. The very low learning rate $5\times 10^{-5}$ (FMQ-distil~K) underperforms: too slow even at $300$k.
+effect: \emph{slow-relabel, big-buffer} (peak $89.2\%$) versus
+\emph{small-buffer} (peak $82.4\%$) is a $+6.8\%$ absolute lift. A
+lower learning rate paired with a stronger mix ratio
+(\emph{low-lr, strong-mix}: $\mathrm{lr}=10^{-4}$, $\mathrm{mix}=0.5$)
+achieves the cleanest single peak ($90.0\%$ at $275$k), suggesting
+reduced oscillation allows the training to maintain the peak longer.
+The \emph{very-low-lr} variant ($5\times 10^{-5}$) underperforms: too
+slow even at $300$k.
 \end{table}
 
 \begin{table}[h]
 \centering
 \caption{FMQ ($\eta=0.02$, $H=2$, Q-all scoring, $N=32$)
    evaluation on the best-of-each-run standalone checkpoints. Pending
-   evaluations are marked ``--''. The reference row is the
-   \emph{FMQ-distil, 50k} run at its $400$k checkpoint --- the headline $96.0\%$ result of Chapter~\ref{chap:mpc-distill}.}
+   evaluations are marked ``--''. The reference row is the headline
+   \emph{FMQ-distil, slow-relabel} run at its $400$k checkpoint --- the
+   $96.0\%$ result of Chapter~\ref{chap:online-with-wm}.}
 \label{tab:app-fmq002}
 \begin{tabular}{l l r r}
 \toprule
 Run & Checkpoint & Standalone SR (\%) & FMQ $\eta = 0.02$ SR (\%) \\
 \midrule
-FMQ-distil L & \texttt{params\_275000.pkl} & 90.0 & -- \\
-FMQ-distil E & \texttt{params\_300000.pkl} & 89.2 & -- \\
-FMQ-distil F & \texttt{params\_200000.pkl} & 88.0 & -- \\
-FMQ-distil G & \texttt{params\_275000.pkl} & 88.0 & -- \\
-FMQ-distil I & \texttt{params\_150000.pkl} & 87.6 & -- \\
-FMQ-distil, 50k & \texttt{params\_400000.pkl} & 86.8 & 96.0 (reference, Table~\ref{tab:mpc-fmq-distilled}) \\
+low-lr, strong-mix         & \texttt{params\_275000.pkl} & 90.0 & -- \\
+slow-relabel, big-buffer   & \texttt{params\_300000.pkl} & 89.2 & -- \\
+fine-$\eta$                & \texttt{params\_200000.pkl} & 88.0 & -- \\
+fast-relabel (replicate 1) & \texttt{params\_275000.pkl} & 88.0 & -- \\
+fast-relabel (replicate 2) & \texttt{params\_150000.pkl} & 87.6 & -- \\
+\textbf{slow-relabel}      & \texttt{params\_400000.pkl} & 86.8 & 96.0 (ref.) \\
 \bottomrule
 \end{tabular}
 \end{table}
 
+\chapter{Run Provenance}
+\label{app:provenance}
+
+For traceability, the per-run training and evaluation artefacts are
+catalogued here.
+\begin{itemize}
+    \item World-model pre-training: \texttt{lightning\_logs/version\_\{0,1\}/metrics.csv}.
+    \item High-level MLP training: \texttt{hl\_ogb\_gap\{2,5,10,20\}.o*}.
+    \item Latent-reach during SAC+HER ($64{\times}64$): \texttt{checkpoints\_her\_*/training\_metrics.csv}, with SLURM logs \texttt{sac\_\{gap,pd\}\_bc*.o*}.
+    \item Real-task evaluation of the $64{\times}64$ flat checkpoints: \texttt{eval\_results\_her\_*\_sparse\_bc0.5/results.txt}.
+    \item Hierarchical native evaluation: the campaign in \texttt{eval\_native\_checkpoints\_*} hit the $60$-minute SLURM walltime on every cell and produced no results files; a re-submission with longer walltime is required.
+    \item CEM/LeJEPA real-task evaluation: \texttt{results\_cube\_eval\_2026-03-28\_13-53/ogb\_cube\_results.txt} (PBS log \texttt{lewm\_eval\_cube.o2042856}).
+    \item Legacy LHRL latent-reach: \texttt{latent\_hindsight\_rl/logs/\{lewm,her\}\_*.o*}.
+    \item Legacy LHRL BC sweep: \texttt{latent\_hindsight\_rl/logs/her\_\{pure,gap5\}\_bc*.o*}.
+    \item Legacy LHRL real-task evaluation: \texttt{latent\_hindsight\_rl/eval\_results\_old/*/results.txt}.
+    \item Resolution sensitivity experiment: \texttt{resolution\_experiment.o2546715}.
+\end{itemize}
+
+\chapter{WGSP Training Trajectory}
+\label{app:wgsp-dynamics}
+
+The WGSP method of \S\ref{sec:wgsp} failed by a specific
+control-theoretic mechanism. The training trajectory of the headline
+WGSP run is recorded in Table~\ref{tab:wgsp-dynamics} for reference.
+
 \begin{table}[h]
 \centering
-\caption{Combined-best run, $500$k steps: $\mathrm{lr}=10^{-4}$ (from FMQ-distil~L), $\mathrm{mix}=0.5$ (FMQ-distil~L), $\mathrm{buf}=5000$ (FMQ-distil~E), $\mathrm{relabel}=50$k (\emph{FMQ-distil, 50k} / FMQ-distil~E), $\eta_{\text{train}}=0.1$. Pending at the time of writing.}
-\label{tab:app-combined-best}
-\begin{tabular}{l r l}
+\caption{WGSP training dynamics ($224{\times}224$, advantage-J,
+   $\beta_{\text{geom}}=0$, $N{=}8$, $M{=}4$, $k{=}3$, 500k total steps,
+   warmup 10\%). \texttt{closer\_frac}: fraction of $N{\times}M$ WM
+   rollouts where $\|z_k - g\| < \|z_0 - g\|$ (goal-directedness;
+   $>0.5$ is better than random). \texttt{ll\_h}: LL HIQL log-prob loss
+   (collapse $\to 0$). \texttt{ll\_d}: LL distil loss (negative
+   $\Rightarrow$ runaway std collapse). \texttt{v\_std\_ep}: $V$ std
+   across rollout endpoints ($J$ signal strength). Warmup ends at step
+   50k; WGSP active from step 50k.}
+\label{tab:wgsp-dynamics}
+\begin{tabular}{rcccccc}
 \toprule
-Step & Standalone SR (\%) & Note \\
+\textbf{Step} & \textbf{Phase} & \textbf{closer\_frac} & \textbf{ll\_h} & \textbf{ll\_d} & \textbf{v\_std\_ep} & \textbf{J\_std} \\
 \midrule
-25k--475k & -- & ($20$ eval points, saved at every $25$k) \\
-500k      & -- & final \\
-\midrule
-Peak                            & -- & \\
-Best MPC-eval (FMQ $\eta = 0.02$) & -- & \\
+    0k & warmup & --   & 10.1 & --    &  0.0 &  0.0 \\
+   50k & warmup$\to$WGSP & 0.505 & 272  & 0.00  &  7.2 & 32.7 \\
+   75k & WGSP   & 0.576 & 220  & 0.95  & 11.0 & 39.0 \\
+  100k & WGSP   & 0.584 & 181  & 1.39  & 18.4 & 49.8 \\
+  \textbf{150k} & \textbf{WGSP} & \textbf{0.588} & 123 & 0.91 & 26.6 & 50.0 \\
+  195k & WGSP   & 0.579 & 91   & $-$0.04 & 32.3 & 57.0 \\
+  200k & WGSP   & 0.578 & 86   & $-$0.19 & 29.4 & 57.2 \\
+  250k & WGSP   & 0.573 & 49   & $-$1.82 & 30.3 & 59.3 \\
+  300k & WGSP   & 0.569 & 37   & $-$2.66 & 29.2 & 54.5 \\
+  338k & WGSP   & 0.564 & 9    & $-$3.15 & 30.8 & 55.7 \\
 \bottomrule
 \end{tabular}
+
+\smallskip
+\noindent\textbf{Diagnosis.} \texttt{closer\_frac} peaks at $0.588$
+(step 150k) then regresses as the LL policy collapses:
+\texttt{ll\_d} crosses zero at $\sim$195k, entering a runaway
+positive-feedback loop (\texttt{ll\_h}: $272\to 9$, a $30\times$ drop
+versus the LeJEPA baseline $\approx 187$). Root cause: the
+distillation loss $-\mathbb{E}[w_{\text{HL}}\log\pi_{\text{LL}}]$ has
+no lower bound on the Gaussian standard deviation, so minimising a
+negative loss forces the LL towards a near-deterministic point,
+collapsing WM rollout diversity and degrading the HL's learning
+signal.
 \end{table}

@@ -1,267 +1,99 @@
-
-\chapter{Experiments}
+\chapter{Evaluation}
 \label{chap:experiments}
 
-This chapter evaluates the methods of Chapter~\ref{chap:methodology}
-on \textsc{OGBench} cube-single-play. We first describe the
-experimental setup (\S\ref{sec:exp-setup}), then characterise the
-quality of the underlying world model (\S\ref{sec:exp-wm}), and
-proceed through the five RL methods in the same order as
-Chapter~\ref{chap:methodology}: curriculum SAC
-(\S\ref{sec:exp-curr-sac}), HER+SAC (\S\ref{sec:exp-her-sac}),
-hierarchical joint SAC (\S\ref{sec:exp-joint}), HIQL+LeWM
-(\S\ref{sec:exp-hiql}), and the flow-matching variant
-(\S\ref{sec:exp-flow}). \S\ref{sec:exp-cem} reports an alternative
-evaluation in which LeWM is used as the model in a sample-based
-planner (CEM/MPC); \S\ref{sec:exp-diag} collects diagnostics; and
-\S\ref{sec:exp-discuss} concludes.
+This chapter collects the empirical evidence for the methods of
+Chapters~\ref{chap:wm-as-env}--\ref{chap:online-with-wm}. It is
+organised to mirror the three story chapters: \S\ref{sec:exp-wm-as-env}
+covers the WM-as-environment family (Chapter~\ref{chap:wm-as-env} plus
+the offline-to-online WM-env experiments of
+Chapter~\ref{chap:online-with-wm}), \S\ref{sec:exp-wm-as-subgoal}
+covers HIQL+LeWM, flow-matching, and WGSP, and \S\ref{sec:exp-mpc}
+covers the BoN/Grad-MPC/FMQ pipeline. A headline cross-chapter
+comparison is given in \S\ref{sec:exp-headline}, and the diagnostic
+discussion in \S\ref{sec:exp-discuss} closes the chapter.
 
 % ---------------------------------------------------------------------
 \section{Experimental Setup}
 \label{sec:exp-setup}
 
-\subsection{Environment and Datasets}
-We use \textsc{OGBench} cube-single-play, a five-task object-pushing
-benchmark with $25$-D continuous actions and either $64{\times}64$ or
-$224{\times}224$ RGB observations. Each evaluation runs the five
-predefined tasks (\texttt{horizontal}, \texttt{vertical1},
-\texttt{vertical2}, \texttt{diagonal1}, \texttt{diagonal2}) for $50$
-episodes each, with a maximum of $200$ steps per episode.
-World-model and offline-cache training data come from the expert
-trajectories distributed with \textsc{OGBench}.
+\subsection{Environment and datasets}
+We use \textsc{OGBench} cube-single-play \cite{ogbench_park2025}, a
+five-task object-pushing benchmark with $25$-D continuous actions and
+either $64{\times}64$ or $224{\times}224$ RGB observations. Each
+evaluation runs the five predefined tasks
+(\texttt{horizontal}, \texttt{vertical1}, \texttt{vertical2},
+\texttt{diagonal1}, \texttt{diagonal2}) for $50$ episodes each, with
+a maximum of $200$ steps per episode. The offline-to-online experiments
+of Chapter~\ref{chap:online-with-wm} use the single-task variant
+\texttt{visual-cube-single-singletask-task1-v0} ($250$ episodes per
+evaluation) so that the success rates can be compared against the
+OGBench IMPALA reference number ($92.8\%$). World-model and
+offline-cache training data come from the expert trajectories
+distributed with OGBench.
 
-\subsection{Evaluation Protocols}
-Three protocols are used.
+\subsection{Evaluation protocols}
 
-\paragraph{Native OGBench.} The agent is rolled out in the real
-simulator and a task counts as solved when the cube ends within
-$4$\,cm of the target (\textsc{OGBench}'s native success criterion).
-This is our headline metric and the one reported in all main tables.
+\paragraph{Native OGBench.}
+The agent is rolled out in the real simulator and a task counts as
+solved when the cube ends within $4$\,cm of the target. This is the
+headline metric for almost every table in this chapter.
 
-\paragraph{Latent goal-reaching (latent-reach rate).} An
-in-distribution sanity check in which goals are sampled from training
-data and the agent must drive the latent state to within $\delta_d$ of
-the goal embedding in $\mathcal{Z}$. During SAC+HER training the agent
-never touches MuJoCo: transitions are produced entirely by the LeWM
-predictor inside \texttt{LatentEnv}, the environment is teleported to a
-cached start latent, and a ``success'' is logged when
-$\|z_t - z^\star\|_2 < \delta_d$. The done-threshold is
-$\delta_d{=}2.887$ for the $64{\times}64$ sweep and $\delta_d{=}2.0$ for
-the legacy $224{\times}224$ stack. The ``\texttt{Success\_Rate}'' column
-of every \texttt{training\_metrics.csv} is the running mean of this
-Boolean over the last $2{,}000$ attempts. \emph{This latent-reach rate
-measures only whether the actor can drive the predictor to a target
-latent; it says nothing about whether the cube task is solved, and must
-never be compared head-to-head with the native-OGBench rate below.}
-Used during training and for the diagnostics of \S\ref{sec:exp-diag}.
+\paragraph{Latent goal-reaching.}
+An in-distribution sanity check in which goals are sampled from
+training data and the agent must drive the latent state to within
+$\delta_d$ of the goal embedding in $\mathcal{Z}$. During SAC+HER
+training the agent never touches MuJoCo: transitions are produced
+entirely by the LeWM predictor inside a latent environment, and a
+``success'' is logged when the predicted latent gets within $\delta_d$
+of the latent target. We emphasise that this measures only whether the
+actor can drive the predictor to a target latent and not whether the
+cube task is solved; it must not be compared head-to-head with native
+OGBench success rates, and we use it only as a training-time diagnostic.
 
-\paragraph{CEM/MPC planning.} As an alternative to learning a policy,
-we replace the actor with a cross-entropy-method planner that
-optimises action sequences against the LeWM rollout. We use $300$
-samples, $30$ CEM iterations, top-$30$ selection, planning horizon
-$5$, receding horizon $5$, and an action-block of $5$
-environment steps per planned action. Reported separately in
-\S\ref{sec:exp-cem}.
+\paragraph{CEM/MPC planning.}
+As an alternative to learning a policy, we replace the actor with a
+cross-entropy-method planner that optimises action sequences against
+the LeWM rollout. Reported separately in \S\ref{sec:exp-cem-baseline}.
 
-\subsection{Metrics}
-\begin{itemize}
-\item \textbf{Success rate (\%):} fraction of episodes solved by the
-native OGBench criterion. Reported per-task and as a $5$-task average.
-\item \textbf{Latent drift:} $\|\hat z_{t+\Delta} - z_{t+\Delta}\|_2$
-between the predictor's $\Delta$-step rollout and the encoded ground
-truth (\S\ref{sec:exp-wm-drift}).
-\item \textbf{Per-step diagnostics:} latent distance to goal and
-action norm logged at every step (\S\ref{sec:exp-diag}).
-\end{itemize}
+\paragraph{Singletask offline-to-online.}
+The Chapter~\ref{chap:online-with-wm} experiments run $5\!\times\!10^5$
+offline steps followed by a post-offline phase (either MPC at
+inference, interleaved distillation, or one of the failed WM-env
+variants); native task success is evaluated over $250$ episodes from
+randomised initial states.
 
 % ---------------------------------------------------------------------
-\section{World Model Quality}
-\label{sec:exp-wm}
+\section{Using the World Model as an Environment}
+\label{sec:exp-wm-as-env}
 
-\subsection{Pre-training Convergence}
-\label{sec:exp-wm-pretrain}
-The LeJEPA world model is pre-trained on the OGBench cube data
-($224{\times}224$ images) with PyTorch Lightning. The objective combines
-the JEPA latent-prediction loss with the spectral isotropy regulariser
-(Eq.~\eqref{eq:sigreg}).
+This section reports the results for Chapter~\ref{chap:wm-as-env} (the
+goal-conditioned WM-as-env experiments) and the offline-to-online
+analogues of Chapter~\ref{chap:online-with-wm}
+(§\ref{sec:owm-exp1}--§\ref{sec:owm-exp8}). The unified picture is
+that no method that uses the WM as an environment substitute beats
+its corresponding non-WM baseline; latent-reach rates saturate but
+native task success collapses.
 
-\begin{table}[h]
-\centering
-\caption{LeJEPA pre-training. \texttt{fit/loss} is the total objective,
-\texttt{pred\_loss} the latent prediction loss, and \texttt{sigreg\_loss}
-the $\sigma$-regulariser on the encoder covariance. Values are the last
-logged step in \texttt{lightning\_logs/version\_*/metrics.csv};
-\texttt{version\_0} was truncated before a validation epoch was written.}
-\label{tab:lewm-pretraining}
-\begin{tabular}{lrrrr}
-\toprule
-Run & Epochs & Final fit/loss & Val pred\_loss & Val sigreg\_loss \\
-\midrule
-\texttt{version\_0} & 10 (in-progress) & 0.0927 & --      & --    \\
-\texttt{version\_1} & 19 (completed)   & --     & 0.00252 & 1.352 \\
-\bottomrule
-\end{tabular}
-\end{table}
+\subsection{Curriculum SAC and HER+SAC}
+\label{sec:exp-her-results}
 
-\subsection{Predictor Drift vs Horizon}
-\label{sec:exp-wm-drift}
-We measure mean L2 drift in latent space as a function of the
-predictor rollout horizon $\Delta$ (in raw frames). This is the most
-useful single diagnostic of whether downstream RL can be expected to
-succeed, because every method in Chapter~\ref{chap:methodology} uses
-$\|z_{t+1} - g\|_2$ as a learning signal.
+The flat curriculum SAC (\S\ref{sec:curr-sac}) advances quickly
+through the early curriculum stages but stalls at the longer-horizon
+ones; native task success remains in the low single digits across all
+runs. HER+SAC (\S\ref{sec:her-sac}) raises the latent-reach metric
+substantially --- the agent can drive the predictor to a target latent
+in nearly every configuration --- but the same checkpoints collapse to
+$0$--$2\%$ native success across all task-sampling modes (curriculum,
+fixed-gap, pure-distance) with sparse reward.
 
 \begin{table}[h]
 \centering
-\caption{Mean latent-space drift
-$\|\hat z_{t+\Delta}-z_{t+\Delta}\|_2$ as a function of prediction
-horizon $\Delta$ (frames). The non-linear growth explains the
-gap-cliff in Table~\ref{tab:joint-gap}.}
-\label{tab:drift}
-\begin{tabular}{lccccc}
-\toprule
-$\Delta$ (frames) & 1 & 5 & 10 & 25 & 50 \\
-\midrule
-mean L2 drift & 1.77 & \todo{verify} & \todo{verify} & \todo{verify} & 16.54 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.65\linewidth]{figures/l2_vs_gap.png}
-\caption{Mean latent-space drift versus prediction horizon
-$\Delta$. Single-step drift of $\sim\!1.77$ calibrates the
-done-threshold $\delta_d=2.0$ used in
-Eqs.~\eqref{eq:her-sparse}--\eqref{eq:her-dense}; the rapid
-super-linear growth beyond $\Delta\!\approx\!10$ frames is the source
-of the failure mode discussed in \S\ref{sec:exp-joint-gap}.}
-\label{fig:drift}
-\end{figure}
-
-\subsection{Latent Geometry under SIGReg}
-The spectral isotropy regulariser
-(Eq.~\eqref{eq:sigreg}) is intended to make $\|z-g\|_2$ a meaningful
-distance. Figure~\ref{fig:latent-norms} shows histograms of latent
-norms and goal distances on in-distribution and out-of-distribution
-states; the distributions are well-concentrated, justifying the use
-of a single done-threshold across tasks.
-
-\begin{figure}[h]
-\centering
-\begin{tabular}{cc}
-\includegraphics[width=0.45\linewidth]{figures/goal_norms_ood.png} &
-%\includegraphics[width=0.45\linewidth]{../diagnostics_lewm/goal_distance_histograms.png}
-\end{tabular}
-\caption{Left: distribution of latent norms on OOD goals. Right:
-distribution of goal-to-state L2 distances for the OGBench tasks,
-used to set $\delta_d$ and $\kappa$.}
-\label{fig:latent-norms}
-\end{figure}
-
-\subsection{Resolution Study}
-\label{sec:exp-wm-resolution}
-We test whether the $64{\times}64$ checkpoints can be safely compared
-against the $224{\times}224$ LeJEPA model by measuring latent agreement
-between native $224{\times}224$ cube images and $64{\to}224$ up-sampled
-versions ($n{=}128$ images from \texttt{ogbench/cube\_single\_expert}).
-The baseline cosine similarity on \emph{different} images is
-$-0.009 \pm 0.050$, so the high agreement below indicates the encoder is
-largely resolution-robust.
-
-\begin{table}[h]
-\centering
-\caption{Latent agreement between native $224{\times}224$ and
-$64{\to}224$ up-sampled cube images. Source:
-\texttt{resolution\_experiment.o2546715}.}
-\label{tab:resolution}
-\begin{tabular}{lcccc}
-\toprule
-Comparison & $\overline{\cos}$ & cos std & $\overline{L_2}$ & $L_2$ std \\
-\midrule
-224 vs 64$\to$224 bilinear & 0.9900 & 0.0106 & 1.781 & 0.832 \\
-224 vs 64$\to$224 bicubic  & 0.9939 & 0.0060 & 1.404 & 0.618 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-% ---------------------------------------------------------------------
-\section{Curriculum SAC (\S\ref{sec:curr-sac})}
-\label{sec:exp-curr-sac}
-
-\todo{verify: report final curriculum stage reached, success rate at
-each stage, and headline native-OGBench success rate. Source: SAC
-baseline log files.}
-
-The flat curriculum SAC of \S\ref{sec:curr-sac} establishes a lower
-bound: with no hindsight relabelling and no expert data, even the
-dense potential reward in Eq.~\eqref{eq:sac-reward} provides little
-useful signal once the goal is more than a handful of LeWM steps
-away. Empirically, the curriculum advances quickly through the early
-stages but stalls at the longer-horizon ones, motivating the
-introduction of HER in \S\ref{sec:her-sac}.
-
-% ---------------------------------------------------------------------
-\section{HER+SAC (\S\ref{sec:her-sac})}
-\label{sec:exp-her-sac}
-
-\subsection{Curriculum vs Fixed-Gap vs Pure-Distance}
-\label{sec:exp-her-tasks}
-
-We compare the three task-sampling modes of
-Eqs.~\eqref{eq:her-curr}--\eqref{eq:her-pure}, each with both the
-sparse and the dense reward of
-Eqs.~\eqref{eq:her-sparse}--\eqref{eq:her-dense}.
-
-\begin{table}[h]
-\centering
-\caption{HER+SAC (\S\ref{sec:her-sac}) on OGBench cube-single,
-\textbf{native task success (\%)}. Task-sampling mode $\times$ reward
-type. All WM-rollout variants (flat and curriculum-proxy) score $0\%$
-natively despite high latent-reach (Table~\ref{tab:sac-train-sr}); dense
-cells not yet re-run natively are marked.}
-\label{tab:her-sac}
-\begin{tabular}{lcc}
-\toprule
-mode & sparse & dense \\
-\midrule
-curriculum & 0.0 & \todo{verify} \\
-fixed-gap ($G=5$) & 0.0 & \todo{verify} \\
-pure-distance & 0.0 & \todo{verify} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Sparse vs Dense Reward}
-The sparse reward (Eq.~\eqref{eq:her-sparse}) is uninformative but
-unbiased: it gives no gradient until a relabelled goal is actually
-reached, but when it does fire the signal is exact. The dense potential
-reward (Eq.~\eqref{eq:her-dense}) supplies a gradient at every step, but
-the clip on the per-step potential introduces a bias toward
-short-horizon goal reduction and can reward latent motion that does not
-correspond to real cube motion. In the native-OGBench tables below the
-dense variant is consistently the stronger of the two
-(Tables~\ref{tab:her-sac},~\ref{tab:joint-gap}), but neither approaches
-the state-observation upper bound (Table~\ref{tab:headline}).
-
-\subsection{Latent-Reach During Training (\texorpdfstring{$64{\times}64$}{64x64} Sweep)}
-\label{sec:exp-her-latentreach}
-Before turning to native-task transfer we report the
-\emph{latent-reach rate} (\S\ref{sec:exp-setup}) at the end of training
-for the $64{\times}64$ SAC+HER sweep. Recall this is an in-distribution
-sanity metric --- the fraction of teleported latent rollouts whose
-predictor-rolled state reached within $\delta_d{=}2.887$ of the latent
-target --- and is \emph{not} the cube task.
-
-\begin{table}[h]
-\centering
-\caption{End-of-training latent-reach rate for the $64{\times}64$
-SAC+HER sweep (mean over the last 30 logged iterations; $2{,}000$-attempt
-window). $50$k iterations, $256$ parallel envs, sparse reward,
-future-goal HER. Because $T_{\max}$ equals the gap, smaller gaps give
-fewer actions to reach a farther-ahead latent and are therefore harder
-\emph{at training time}. Source:
-\texttt{checkpoints\_her\_*/training\_metrics.csv}.}
+\caption{End-of-training \emph{latent-reach} rate for the
+$64{\times}64$ SAC+HER sweep (mean over the last 30 logged iterations;
+$2{,}000$-attempt window). $50$k iterations, $256$ parallel envs,
+sparse reward, future-goal HER. Because $T_{\max}$ equals the gap,
+smaller gaps give fewer actions to reach a farther-ahead latent and
+are therefore harder \emph{at training time}.}
 \label{tab:sac-train-sr}
 \begin{tabular}{lcccc}
 \toprule
@@ -279,26 +111,16 @@ BC weight $\alpha$ & Pure-dist.\ ($T_{\max}{=}40$) & Gap = 2 & Gap = 10 & Gap = 
 \vspace{2pt}\small
 $^{\dagger}$Stopped at walltime after the rate had plateaued.\quad
 $^{\ddagger}$Diverged (actor loss $\approx-5.9\!\times\!10^{5}$, critic
-loss $\approx 2.5\!\times\!10^{10}$). A separate gap=5, $\alpha{=}0.5$ run
-reaches $87.4\%$ latent-reach.
+loss $\approx 2.5\!\times\!10^{10}$). A separate gap{=}5,
+$\alpha{=}0.5$ run reaches $87.4\%$ latent-reach.
 \end{table}
-
-\subsection{Real-Task Transfer of the \texorpdfstring{$64{\times}64$}{64x64} Policies}
-\label{sec:exp-her-realtask}
-The same checkpoints, evaluated in the full MuJoCo simulator
-(\texttt{eval\_actor.py}) with an in-trajectory goal $25$ steps ahead,
-collapse from $>\!87\%$ latent-reach to the low-to-mid range below; under
-the harder native five-task suite they fall further still (to
-$\sim\!0$--$2\%$, consistent with Tables~\ref{tab:her-sac}
-and~\ref{tab:headline}).
 
 \begin{table}[h]
 \centering
 \caption{Real-task (full MuJoCo) evaluation of two $64{\times}64$
-SAC+HER checkpoints; flat policy, 50 rollouts of
+SAC+HER checkpoints; flat policy, $50$ rollouts of
 \texttt{visual-cube-single-v0}, \texttt{goal\_offset\_steps}${=}25$,
-OGBench block-pose success criterion. Source:
-\texttt{eval\_results\_*/results.txt}.}
+OGBench block-pose success criterion.}
 \label{tab:single-task-eval}
 \begin{tabular}{lcc}
 \toprule
@@ -308,103 +130,30 @@ Checkpoint & Real-task success (\%) & Eval time (s) \\
 \texttt{her\_pure\_distance\_sparse\_bc0.5} & 22.0 & 1445 \\
 \bottomrule
 \end{tabular}
+\end{table}
 
-\vspace{2pt}\small
-The contrast with Table~\ref{tab:sac-train-sr} (both $>87\%$ latent-reach)
-is the central observation of this chapter: high latent-reach does not
+The contrast between Tables~\ref{tab:sac-train-sr} and
+\ref{tab:single-task-eval} is the central observation for the
+WM-as-environment family in this thesis: high latent-reach does not
 translate into solving the cube task.
-\end{table}
 
-\subsection{Legacy \texorpdfstring{$224{\times}224$}{224x224} Stack (latent-reach)}
-\label{sec:exp-her-legacy}
-For completeness we include the earlier $224{\times}224$ LHRL runs. These
-numbers are \emph{latent-reach rates} (in-distribution,
-$\delta_d{=}2.0$), not native-task success, and should be read alongside
-Table~\ref{tab:sac-train-sr} rather than the native tables.
+\subsection{Joint Hierarchical SAC}
+\label{sec:exp-joint-results}
 
-\begin{table}[h]
-\centering
-\caption{Final latent-reach rate for the legacy $224{\times}224$ LHRL
-runs ($25$k iterations, single-frame \texttt{LatentEnv}). ``LeWM'' is
-\texttt{sac\_baseline.py} (cache goals, no relabelling); ``HER'' is the
-\texttt{VectorizedEpisodicHERBuffer} future-goal variant. HER starves at
-small gaps because the tight $T_{\max}{=}K$ budget rarely yields a true
-reach for relabelling to lock onto. Source:
-\texttt{latent\_hindsight\_rl/logs/}.}
-\label{tab:lhrl-train}
-\begin{tabular}{lcc}
-\toprule
-Mode & LeWM latent-reach (\%) & HER latent-reach (\%) \\
-\midrule
-Pure distance         & 99.2 & 96.8 \\
-Fixed gap = 2         & 55.6 &  4.5 \\
-Fixed gap = 8         & 39.4 &  6.2 \\
-Fixed gap = 24        & 63.6 & 81.9 \\
-Curriculum (1$\to$40) & 50.2 &  1.6 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{table}[h]
-\centering
-\caption{Legacy LHRL behavioural-cloning sweep (HER + sparse, $50$k
-iterations), latent-reach rate. BC regularisation does not move the
-gap=5 rate: the bottleneck is the action budget, not action realism.
-Source: \texttt{latent\_hindsight\_rl/logs/her\_*\_bc*.o*}.}
-\label{tab:lhrl-bc}
-\begin{tabular}{lcccc}
-\toprule
-Mode & $\alpha{=}0$ & $\alpha{=}0.1$ & $\alpha{=}0.5$ & $\alpha{=}1.0$ \\
-\midrule
-Pure-distance & 98.5 & 99.5 & 99.7 & 99.5 \\
-Fixed gap = 5 & 20.3 & 21.3 & 17.6 & 16.6 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{table}[h]
-\centering
-\caption{Legacy LHRL ``evaluation'' campaign and high-level decoder
-study. \emph{Caveat:} these older runs are believed to report
-in-distribution latent-reachability rather than native five-task success
-and are retained only for the relative comparison between modes /
-decoders. Sources:
-\texttt{latent\_hindsight\_rl/eval\_results\_old/*/results.txt}.}
-\label{tab:lhrl-eval}
-\begin{tabular}{lcc}
-\toprule
-Mode & LeWM (\%) & HER (\%) \\
-\midrule
-Pure distance         & 54.0 & 70.0 \\
-Fixed gap = 2         & 54.0 & 44.0 \\
-Fixed gap = 8         & 62.0 & 36.0 \\
-Fixed gap = 24        & 58.0 & 60.0 \\
-Curriculum (1$\to$40) & 56.0 & 44.0 \\
-\midrule
-\multicolumn{3}{l}{\emph{High-level decoder (gap=24 sparse-HER):}} \\
-MLP (2 runs)       & \multicolumn{2}{c}{48.0 / 48.0} \\
-Diffusion (2 runs) & \multicolumn{2}{c}{40.0 / 38.0} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-% ---------------------------------------------------------------------
-\section{Joint Hierarchical SAC (\S\ref{sec:joint})}
-\label{sec:exp-joint}
-
-\subsection{Effect of High-Level Gap}
-\label{sec:exp-joint-gap}
-
-We sweep the high-level gap $G$ that separates $z_t$ from the
-predicted waypoint $z_{\mathrm{sub}}$.
+The hierarchical joint SAC formulation (\S\ref{sec:joint}) sweeps the
+high-level gap $G$ at two AWR temperatures $\beta\in\{3.0, 20.0\}$. The
+best native result is $3.6\%$ at small gap (Table~\ref{tab:joint-gap}),
+which is an order of magnitude below the state-observation upper
+bound. The performance cliff between $G{=}2$ and $G{=}5$ is sharp and
+consistent with the predictor-drift curve of \S\ref{sec:wm-drift}: a
+waypoint at $G{=}5$ lies $25$ raw frames into the future and is past
+the predictor's reliable horizon.
 
 \begin{table}[h]
 \centering
 \caption{Joint hierarchical SAC (\S\ref{sec:joint}) on OGBench
-cube-single, \textbf{native five-task success rate (\%)}, freshly
-re-evaluated ($5$ tasks $\times$ $50$ episodes, AWR high-level actor
-$\beta{=}3$). The performance cliff at $G\!\geq\!5$ motivates the move to
-HIQL in \S\ref{sec:exp-hiql}.}
+cube-single, native five-task success rate (\%), $5$ tasks $\times$
+$50$ episodes, AWR high-level actor $\beta{=}3$.}
 \label{tab:joint-gap}
 \begin{tabular}{lcc}
 \toprule
@@ -413,64 +162,22 @@ $G$ & sparse & dense \\
 1  & 0.4 & 3.6 \\
 2  & 1.6 & 3.6 \\
 5  & 0.0 & 0.0 \\
-10 & 0.0 & 0.0 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The best native results ($3.6\%$ at $G\!\in\!\{1,2\}$, dense reward)
-remain an order of magnitude below the state-observation upper bound,
-but the cliff at $G\!\geq\!5$ is sharp and consistent with the
-predictor-drift curve of Fig.~\ref{fig:drift}: a waypoint $G\!=\!2$ steps
-ahead lies $G\cdot 5 = 10$ frames into the future and is still
-reachable, whereas at $G\!\geq\!5$ ($\geq\!25$ frames) the LeWM error has
-grown well beyond the done-threshold $\delta_d$ and the high-level
-advantage signal $A_t = \|z_t - g\|_2 - \|z_{t+G} - g\|_2$ becomes
-meaningless. Dense reward dominates sparse throughout.
-
-\subsection{High-Level Subgoal Pre-training}
-\label{sec:exp-joint-hl}
-The high-level actor can optionally be warm-started from a supervised
-MLP that regresses $(z_{\mathrm{curr}}, z_{\mathrm{goal}})$ to the latent
-$K$ world-model steps ahead. The MSE floor grows with $K$ because
-farther-ahead latents are intrinsically harder to predict --- the same
-horizon effect seen in the predictor-drift curve.
+Mixing offline expert transitions into each batch
+($\rho_{\mathrm{cache}}$) together with a sharper AWR temperature gives
+the largest single-task gains we observed in the hierarchical setting:
+at $G{=}2$, $\beta{=}20$, raising $\rho_{\mathrm{cache}}$ from $0$ to
+$0.5$ lifts native success from $1.2\%$ to $3.6\%$. The improvement is
+driven almost entirely by task~1 (horizontal), which reaches $18\%$ in
+isolation; the remaining tasks stay at $0\%$.
 
 \begin{table}[h]
 \centering
-\caption{Supervised high-level subgoal MLP ($50$ epochs, latent-space
-MSE). Source: \texttt{hl\_ogb\_gap*.o*}.}
-\label{tab:hl-mlp-train}
-\begin{tabular}{lrrr}
-\toprule
-Run & Best val loss & Final train loss & Final val loss \\
-\midrule
-\texttt{gap2}  & 0.0922 & 0.0906 & 0.0922 \\
-\texttt{gap5}  & 0.2196 & 0.2158 & 0.2196 \\
-\texttt{gap10} & 0.3551 & 0.3491 & 0.3554 \\
-\texttt{gap20} & 0.5104 & 0.4979 & 0.5109 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Effect of \texttt{cache\_ratio} and AWR Temperature}
-\label{sec:exp-joint-cache}
-Mixing offline expert transitions into each SAC batch
-(\texttt{cache\_ratio}) together with a sharper AWR temperature
-($\beta$) gives the largest single-task gains we observed in the
-hierarchical setting. At $G{=}2$ with $\beta{=}20$, raising
-\texttt{cache\_ratio} from $0$ to $0.5$ lifts native success from $1.2\%$
-to $3.6\%$, driven almost entirely by task~1 (horizontal), which reaches
-$18\%$ in isolation; the remaining tasks stay at $0\%$, indicating the
-expert mix biases the policy toward the easiest trajectory rather than
-broadly improving competence. Configurations with
-$\texttt{cache\_ratio}\!\geq\!0.8$ were only run under the latent-reach
-protocol (where they scored $0\%$) and are not native-confirmed.
-
-\begin{table}[h]
-\centering
-\caption{Native success (\%) at $G{=}2$, sparse reward, $\beta{=}20$, as
-a function of \texttt{cache\_ratio}.}
+\caption{Native success (\%) at $G{=}2$, sparse reward, $\beta{=}20$,
+as a function of \texttt{cache\_ratio}.}
 \label{tab:joint-cache}
 \begin{tabular}{lcc}
 \toprule
@@ -482,42 +189,63 @@ a function of \texttt{cache\_ratio}.}
 \end{tabular}
 \end{table}
 
-\subsection{State-Observation Hierarchical Control}
-\label{sec:exp-joint-state}
-To isolate the effect of the JEPA encoder from the hierarchical
-algorithm itself, we re-implemented the full two-level architecture
-(AWR high-level + SAC low-level) directly on the $28$-D state
-observation, with the high-level proposing an intermediate cube position
-(\texttt{train\_joint\_state.py}). Despite removing the encoder
-bottleneck entirely, both $G{=}5$ and $G{=}10$ variants score $0.0\%$ on
-all five native tasks. The failure mode is distinct from the flat state
-baseline (which solves three tasks, Table~\ref{tab:headline}): the
-high-level proposes poorly-calibrated subgoals early in training, giving
-the low-level a noisier effective goal than the direct physical goal,
-which triggers premature entropy collapse ($\alpha\!\to\!0.01$ floor
-within a few hundred iterations). This indicates the hierarchical
-decomposition \emph{itself} is fragile without a reliable high-level
-policy, independently of representation quality, and that a warm-started
-high-level (\S\ref{sec:exp-joint-hl}) is a prerequisite rather than an
-optional refinement.
+To isolate the encoder's role we re-implemented the same two-level
+architecture directly on $28$-D state observations
+(\texttt{train\_joint\_state.py}): both $G{=}5$ and $G{=}10$ score
+$0.0\%$ on all five native tasks. The failure mode is distinct from
+the flat state baseline (which solves three tasks): an unreliable
+high-level gives the low-level a noisier effective goal than a direct
+physical goal, triggering premature entropy collapse. This indicates
+the hierarchical decomposition itself is fragile without a reliable
+high-level policy, independently of representation quality.
 
-\subsection{Cost Regularisation Sweep}
-\todo{verify: report success rate as a function of the action-cost
-weight in the dense reward. Source: \texttt{logs/eval\_gap*\_cr*.out}.}
+\subsection{Offline-to-online WM-env experiments}
+\label{sec:exp-oo-wm-env}
 
-% ---------------------------------------------------------------------
-\section{HIQL with LeWM (\S\ref{sec:hiql-lewm})}
-\label{sec:exp-hiql}
-
-\subsection{Warm-up Fraction $\times$ Subgoal Horizon}
-\label{sec:exp-hiql-sweep}
+Chapter~\ref{chap:online-with-wm} runs the same WM-as-environment idea
+on the singletask offline-to-online benchmark; the headline numbers
+were given in
+Table~\ref{tab:owm-summary} of that chapter. We additionally include
+TD-MPC2 in two variants (BC-regularised and IQL-style) as a
+model-based-RL reference point; both collapse to $0.0\%$ on the
+single-task evaluation, consistent with the model-based RL failure
+mode discussed in Chapter~\ref{chap:online-with-wm}.
 
 \begin{table}[h]
 \centering
-\caption{HIQL+LeWM on OGBench cube-single ($5$ tasks $\times$ $50$
-episodes). Success rate (\%) as a function of warm-up fraction
-$\rho_{\mathrm{wu}}$ (Eqs.~\eqref{eq:hiql-phase1}--\eqref{eq:hiql-phase2})
-and subgoal horizon $k$, with $d_r{=}10$.}
+\caption{Model-based RL baselines on
+\texttt{visual-cube-single-singletask-task1-v0}, pixel observations,
+no online interaction. Both TD-MPC2 variants fail entirely on this
+benchmark.}
+\label{tab:tdmpc2}
+\begin{tabular}{lc}
+\toprule
+Method & Success (\%) \\
+\midrule
+TD-MPC2 + IQL (pixel)     & 0.0 \\
+TD-MPC2 + BC-reg (pixel)  & 0.0 \\
+SAC (pixel obs., no WM)   & 2.4 \\
+SAC + WM-latent (pixel)   & 0.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------
+\section{Using the World Model to Ground Subgoals}
+\label{sec:exp-wm-as-subgoal}
+
+\subsection{HIQL+LeWM, sweep over warm-up and horizon}
+\label{sec:exp-hiql-results}
+
+HIQL in the LeWM latent space (\S\ref{sec:hiql-lewm}) is the first
+method to break double-digit native success. The headline sweep over
+the warm-up fraction $\rho_{\mathrm{wu}}$ and the subgoal horizon $k$
+is shown in Table~\ref{tab:hiql-lewm-sweep}.
+
+\begin{table}[h]
+\centering
+\caption{HIQL+LeWM on OGBench cube-single, $5$ tasks $\times$ $50$
+episodes, native success rate (\%). $d_r{=}10$.}
 \label{tab:hiql-lewm-sweep}
 \begin{tabular}{lcc}
 \toprule
@@ -530,125 +258,279 @@ $\rho_{\mathrm{wu}}$ & $k=2$ & $k=5$ \\
 \end{tabular}
 \end{table}
 
-.
+The best operating point uses $\rho_{\mathrm{wu}}=1$ --- i.e., no
+imagined data at all --- which is consistent with the WM-as-env
+failures from Chapter~\ref{chap:wm-as-env}: on this task the WM
+contributes more noise than signal when fed into the training loop.
 
-\subsection{Per-Task Breakdown}
+\subsection{HIQL adapter ablations and the no-WM baseline}
+\label{sec:exp-hiql-adapter}
+
+Plain HIQL on raw $224{\times}224$ pixels (no WM) outperforms
+HIQL+LeWM, indicating that the WM is currently \emph{losing}
+information rather than adding it on this benchmark. The
+adapter-architecture ablations in Table~\ref{tab:hiql-adapter} explore
+which pooling and projection choice in the encoder--adapter--policy
+stack performs best.
+
 \begin{table}[h]
 \centering
-\caption{Per-task success rate (\%) for the best HIQL+LeWM
-configuration ($k{=}2$, $\rho_{\mathrm{wu}}{=}1$, $d_r{=}10$).}
-\label{tab:per-task}
-\begin{tabular}{lc}
+\caption{HIQL on the OGBench cube-single benchmark with different
+representation choices ($5$ tasks $\times$ $50$ episodes).
+``End-to-end'' trains the CNN encoder jointly with the policy;
+``LeJEPA-224'' freezes the JEPA encoder and trains a $256$-dim adapter
+on top of the CLS token; ``LeWM-64'' uses the $64{\times}64$
+OGBench-trained world-model encoder. Per-task columns give horizontal,
+vertical1, vertical2, diagonal1, diagonal2 in that order.}
+\label{tab:hiql-adapter}
+\begin{tabular}{lccccc|c}
 \toprule
-Task & success \\
+Method & T1 & T2 & T3 & T4 & T5 & Overall \\
 \midrule
-\texttt{task1\_horizontal} & \todo{verify} \\
-\texttt{task2\_vertical1} & \todo{verify} \\
-\texttt{task3\_vertical2} & \todo{verify} \\
-\texttt{task4\_diagonal1} & \todo{verify} \\
-\texttt{task5\_diagonal2} & \todo{verify} \\
+HIQL end-to-end ($k{=}10$)            & 78 & 78 & 90 & 72 & 66 & \textbf{76.8} \\
+HIQL + LeJEPA-224 (no adapter)         & 42 & 50 & 72 & 42 & 40 & 49.2 \\
+HIQL + LeJEPA-224 + adapter256, run A  & 66 & 80 & 78 & 62 & 62 & 69.6 \\
+HIQL + LeJEPA-224 + adapter256, run B  & 52 & 56 & 90 & 58 & 56 & 62.4 \\
+HIQL + LeJEPA-224 + adapter256, 200k snap & 66 & 78 & 84 & 74 & 74 & \textbf{75.2} \\
+HIQL + LeWM-64 + adapter256            & 22 & 14 & 12 & 26 & 18 & 18.4 \\
 \midrule
-overall & 20.8 \\
+\multicolumn{7}{l}{\emph{LeJEPA-224 + adapter256 representation ablations}} \\
+\quad depth=3                          & 56 & 74 & 74 & 80 & 50 & 66.8 \\
+\quad hidden=512                       & 60 & 64 & 66 & 90 & 40 & 64.0 \\
+\quad CLS-raw token                    & 82 & 60 & 76 & 62 & 70 & 70.0 \\
+\quad patch-mean pooling               & 56 & 54 & 54 & 38 & 32 & 46.8 \\
+\quad CLS$+$patch-cat                  & 72 & 64 & 74 & 62 & 58 & 66.0 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Comparison to HIQL Baseline (no World Model)}
+The end-to-end variant ($76.8\%$) is the strongest result on the
+goal-conditioned cube benchmark in this thesis; it is not directly
+comparable to the frozen-encoder variants since it benefits from
+task-specific representation learning. The two adapter runs ($69.6\%$
+and $62.4\%$ respectively) are the canonical frozen-encoder baseline;
+their variance reflects $50$-episode stochasticity from the same
+checkpoint. The $64{\times}64$ LeWM-encoder variant ($18.4\%$) does
+substantially worse than LeJEPA-224, likely due to smaller model
+capacity and lower resolution.
+
+\subsection{WGSP}
+\label{sec:exp-wgsp}
+
+WGSP (\S\ref{sec:wgsp}) attempts to extend HIQL by scoring imagined
+subgoals against the value function. The training trajectory and the
+LL-collapse diagnosis are in Appendix~\ref{app:wgsp-dynamics}. The
+real-task evaluation, summarised in Table~\ref{tab:wgsp-snapshots},
+shows the same pattern as the training trajectory: the best snapshot
+is around step $128$k, before the LL distillation loss crosses zero
+and the policy starts to collapse.
 
 \begin{table}[h]
 \centering
-\caption{HIQL baseline (no LeWM, raw $224{\times}224$ pixels) sweep
-over subgoal horizon $k$ and goal-rep dim $d_r$. Reproduces a plain
-\textsc{OGBench} HIQL upper bound for context.}
-\label{tab:hiql-baseline}
-\begin{tabular}{lcc}
+\caption{WGSP snapshots, native five-task success rate (\%). Best
+snapshot is the $128$k checkpoint; later snapshots regress as the LL
+policy collapses (Appendix~\ref{app:wgsp-dynamics}).}
+\label{tab:wgsp-snapshots}
+\begin{tabular}{lccccc|c}
 \toprule
-config & $d_r=10$ & $d_r=192$ \\
+Snapshot & T1 & T2 & T3 & T4 & T5 & Overall \\
 \midrule
-$k=2$ & \todo{verify} & \todo{verify} \\
-$k=5$ & \textbf{37.6} & \todo{verify} \\
-$k=10$ & \todo{verify} & \todo{verify} \\
-$k=25$ & 7.2 & \todo{verify} \\
+$92$k    & 24 & 20 &  8 & 24 & 64 & 28.0 \\
+\textbf{$128$k}   & 38 & 18 & 34 & 54 & 52 & \textbf{39.2} \\
+$156$k   & 48 & 26 & 12 & 28 & 30 & 28.8 \\
+$338$k (collapsed) & 44 & 12 & 8 & 12 & 38 & 22.8 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The plain HIQL baseline outperforms HIQL+LeWM at the same $k=5$
-($37.6\%$ vs $14.4\%$), establishing that the world model is
-currently \emph{losing} information that the raw-pixel HIQL retains.
-The same pattern is visible at $k=2$, where HIQL+LeWM recovers most
-but not all of the baseline gap (Table~\ref{tab:hiql-lewm-sweep}).
+WGSP's best result ($39.2\%$) is below the HIQL+LeJEPA baseline
+($69.6\%$), confirming that the attempt to inject WM rollouts into the
+HL training loop introduces more noise than signal on this benchmark.
+The mechanism is the LL std collapse documented in
+Appendix~\ref{app:wgsp-dynamics}.
 
 % ---------------------------------------------------------------------
-\section{HIQL with Flow-Matching Policy (\S\ref{sec:hiql-flow})}
-\label{sec:exp-flow}
+\section{Online-Phase MPC and FMQ Distillation}
+\label{sec:exp-mpc}
 
-\todo{verify: paste headline numbers from
-\texttt{eval\_hiql\_flow\_224\_sweep.sh} runs. Cells should match the
-sweep over $\rho_{\mathrm{wu}}$ and $k$ used in
-Table~\ref{tab:hiql-lewm-sweep} so the two are directly comparable.}
+\subsection{Frozen-policy MPC at inference}
+\label{sec:exp-mpc-frozen}
 
-The flow-matching policy is designed to capture multimodal expert
-behaviour at the same inference cost as the Gaussian actor of
-\S\ref{sec:hiql-lewm}. We expect the gain to be largest in
-configurations where the dataset shows multiple plausible action
-modes for the same latent state.
-
-% ---------------------------------------------------------------------
-\section{Headline Comparison}
-\label{sec:exp-headline}
+With the $81.6\%$ offline checkpoint as the frozen actor, BoN-MPC and
+Grad-MPC at inference lift native task success substantially
+(Table~\ref{tab:mpc-frozen}). The best frozen-actor configuration is
+Grad-MPC ($H{=}2$, $K{=}5$, Q-term) at $90.0\%$.
 
 \begin{table}[h]
 \centering
-\caption{Best-configuration comparison on OGBench cube-single
-(5 tasks, 50 episodes each).}
-\label{tab:headline}
-\begin{tabular}{lcc}
+\caption{Frozen offline policy combined with WM-based inference. All
+entries use the $81.6\%$ offline checkpoint, $N{=}32$, $250$ episodes
+on \texttt{visual-cube-single-singletask-task1-v0}.}
+\label{tab:mpc-frozen}
+\begin{tabular}{l c c l r}
 \toprule
-Method & Latent space & Success (\%) \\
+Method & $H$ & $K$ & Scoring & SR (\%) \\
 \midrule
-SAC+HER (state obs., \emph{upper bound}) & $28$-D state & \textbf{19.6} \\
+BoN-MPC                 & 1 & 0 & dense$+$Q & 87.2 \\
+BoN-MPC                 & 1 & 0 & Q-term    & \textbf{88.0} \\
+BoN-MPC                 & 2 & 0 & Q-term    & 83.6 \\
+BoN-MPC                 & 3 & 0 & dense$+$Q & 81.6 \\
 \midrule
-Curriculum SAC (\S\ref{sec:curr-sac}) & $192$-D LeWM & \todo{verify} \\
-HER+SAC (\S\ref{sec:her-sac}, best mode) & $192$-D LeWM & 0.0 \\
-Joint hier.\ SAC (\S\ref{sec:joint}, $G{\in}\{1,2\}$, dense) & $192$-D LeWM & 3.6 \\
-HIQL baseline (no WM, $k{=}5$, $d_r{=}10$) & $224{\times}224$ raw & \textbf{37.6} \\
-HIQL+LeWM (\S\ref{sec:hiql-lewm}, $k{=}2$, $\rho_{\mathrm{wu}}{=}1$) & $192$-D LeWM & 20.8 \\
-HIQL+LeWM+Flow (\S\ref{sec:hiql-flow}) & $192$-D LeWM & \todo{verify} \\
-CEM/MPC with LeWM (\S\ref{sec:exp-cem}, 224) & $192$-D LeWM & 0.0$^{\ast}$ \\
+Grad-MPC                & 1 & 5 & Q-term    & 88.8 \\
+Grad-MPC                & 2 & 5 & Q-term    & \textbf{90.0} \\
+Grad-MPC                & 3 & 5 & dense$+$Q & 88.8 \\
 \bottomrule
 \end{tabular}
-
-\vspace{2pt}\small
-$^{\ast}$Native task success. The same planner reaches $72.0\%$ on the
-in-distribution latent-reach metric (\S\ref{sec:exp-cem}); the two must
-not be conflated. The state-observation SAC+HER row is a non-LeWM upper
-bound included for calibration only.
 \end{table}
 
-% ---------------------------------------------------------------------
-\section{CEM/MPC with the Learned World Model}
-\label{sec:exp-cem}
+FMQ inference applied to the base critic peaks at $\eta{=}0.1$ and
+collapses sharply for $\eta>0.1$ --- the base critic is calibrated for
+BC-flow actions, not FMQ-shaped actions
+(Table~\ref{tab:mpc-fmq-basepolicy}).
 
-We replace the learned policy with a CEM planner that optimises
-action sequences against LeWM rollouts (settings in
-\S\ref{sec:exp-setup}). The two evaluation regimes diverge sharply for
-this planner: it reaches $72.0\%$ on the in-distribution
-\emph{latent-reach} metric (it is, after all, directly optimising latent
-distance to the goal embedding) yet solves $0.0\%$ of the native cube
-task. This is the cleanest single demonstration of the central finding
-of this chapter --- excellent latent goal-reaching does not imply task
-success, because the predictor drift documented in Fig.~\ref{fig:drift}
-means a latent trajectory that ends at the goal embedding need not
-correspond to a physical trajectory that places the cube.
+\begin{table}[h]
+\centering
+\caption{FMQ inference applied to the $81.6\%$ frozen offline
+checkpoint. $N{=}32$.}
+\label{tab:mpc-fmq-basepolicy}
+\begin{tabular}{c l c r}
+\toprule
+$H$ & Scoring & $\eta$ & SR (\%) \\
+\midrule
+2 & Q-all  & 0.10 & \textbf{90.0} \\
+2 & Q-all  & 0.30 & 57.2 \\
+2 & Q-all  & 0.50 & 25.6 \\
+1 & Q-all  & 0.30 & 60.0 \\
+2 & Q-term & 0.30 & 58.8 \\
+1 & Q-term & 0.30 & 61.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Interleaved Grad-MPC distillation}
+\label{sec:exp-mpc-interleaved-grad}
+
+With Grad-MPC labels and $500\,000$ offline steps, the
+\emph{Grad-MPC distil, full, mixed} configuration reaches $92.4\%$
+MPC-eval, the first method within $0.4\%$ of the IMPALA target.
+Mixed-mode injection (where MPC actions enter the main batch) beats
+the separate-mode variant where MPC labels are used only in an
+actor-only step.
+
+\begin{table}[h]
+\centering
+\caption{Interleaved MPC distillation with Grad-MPC labels
+(Alg.~\ref{alg:mpc-interleaved}, $K{=}5$). $5\!\times\!10^{5}$ offline
+steps, seed $42$, starting from the $81.6\%$ offline checkpoint.
+\emph{Standalone} is the best per-checkpoint success rate when the
+actor is used without the WM ($\mathrm{BoN}\,N{=}4$); \emph{MPC-eval}
+re-applies Grad-MPC ($N{=}32$, $H{=}2$, $K{=}5$) on top of the final
+actor.}
+\label{tab:mpc-interleaved-grad}
+\begin{tabular}{l l l c r r}
+\toprule
+Configuration & MPC HP & Mode & $p$ & Peak SA (\%) & MPC-eval (\%) \\
+\midrule
+Grad-MPC distil, light, actor-only  & $N{=}8$, $H{=}1$, $K{=}3$   & sep   & 1.0 & 83.6 & 86.8 \\
+Grad-MPC distil, light, mixed       & $N{=}8$, $H{=}1$, $K{=}3$   & mixed & 0.3 & 81.6 & 91.2 \\
+Grad-MPC distil, full, actor-only   & $N{=}32$, $H{=}2$, $K{=}5$  & sep   & 1.0 & 84.0 & 85.6 \\
+Grad-MPC distil, full, mixed        & $N{=}32$, $H{=}2$, $K{=}5$  & mixed & 0.3 & 82.8 & \textbf{92.4} \\
+AWR-filtered, actor-only            & $N{=}32$, $H{=}2$, $K{=}5$  & awr   & 0.3 & 84.4 & 90.0 \\
+AWR-filtered, mixed                 & $N{=}32$, $H{=}2$, $K{=}5$  & mixed-awr & 0.3 & 84.4 & 91.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Interleaved FMQ-label distillation}
+\label{sec:exp-mpc-fmq-distil}
+
+Replacing Grad-MPC labels with FMQ labels
+($\eta_{\text{train}}=0.1$, $H{=}2$, $N{=}32$) is what makes
+fine-grained FMQ inference work. The relabelling-interval sweep in
+Table~\ref{tab:mpc-relabel-sweep} shows that the slow-relabel variant
+($T_{\text{relabel}}{=}50$k) reaches the highest MPC-eval score
+($93.2\%$ with Grad-MPC inference) and is the checkpoint from which
+the $96.0\%$ FMQ-inference result is recovered.
+
+\begin{table}[h]
+\centering
+\caption{FMQ-label interleaved distillation: relabelling-interval
+sweep. All runs use FMQ labels at $\eta_{\text{train}}{=}0.1$, $H{=}2$,
+$N{=}32$, mixed injection at $p{=}0.3$. MPC-eval uses Grad-MPC
+($N{=}32$, $H{=}2$, $K{=}5$, Q-term).}
+\label{tab:mpc-relabel-sweep}
+\begin{tabular}{l l l r r r r r}
+\toprule
+& & & \multicolumn{5}{c}{SR at checkpoint (\%)} \\
+\cmidrule(lr){4-8}
+Run & Labels & Interval & 100k & 200k & 300k & 400k & 500k \\
+\midrule
+\multicolumn{8}{l}{\emph{Standalone ($\mathrm{BoN}\,N{=}4$)}} \\
+FMQ-distil, medium-relabel & FMQ      & 25k & 67.2 & \textbf{86.8} & 80.0 & 82.0 & 71.2 \\
+FMQ-distil, slow-relabel   & FMQ      & 50k & 68.4 & 80.8           & 68.0 & \textbf{86.8} & 74.0 \\
+\midrule
+\multicolumn{8}{l}{\emph{MPC-eval (Grad-MPC $K{=}5$, Q-term)}} \\
+FMQ-distil, medium-relabel & FMQ      & 25k & 80.8 & 88.4 & 91.2 & 91.6 & 88.8 \\
+FMQ-distil, slow-relabel   & FMQ      & 50k & 79.2 & 88.8 & 79.2 & \textbf{93.2} & 90.4 \\
+Grad-MPC labels (control)  & Grad-MPC & 25k & 62.8 & 74.4 & 67.6 & 79.2 & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Inference sweep on the FMQ-distilled actor}
+\label{sec:exp-mpc-inference-sweep}
+
+The FMQ-distilled actor (the $400$k checkpoint of \emph{FMQ-distil,
+slow-relabel}) is robust to a wide range of inference-time FMQ radii.
+The headline $96.0\%$ result is achieved at $\eta\in\{0.02, 0.03\}$,
+both of which would have collapsed the base critic
+(Table~\ref{tab:mpc-fmq-basepolicy}).
+
+\begin{table}[h]
+\centering
+\caption{Inference-time sweep on the FMQ-distilled actor (the $400$k
+checkpoint of \emph{FMQ-distil, slow-relabel}). The distilled critic
+is robust to small FMQ radii: SR stays above $94\%$ for
+$\eta\in[0.01, 0.05]$ and reaches $96.0\%$ at $\eta\in\{0.02, 0.03\}$,
+a $+3.2\%$ lift over the IMPALA reference.}
+\label{tab:mpc-fmq-distilled}
+\begin{tabular}{l l l r}
+\toprule
+Method & Scoring & Config & SR (\%) \\
+\midrule
+FMQ      & Q-all  & $\eta = 0.01$ & 94.8 \\
+FMQ      & Q-all  & $\eta = 0.02$ & \textbf{96.0} \\
+FMQ      & Q-all  & $\eta = 0.03$ & \textbf{96.0} \\
+FMQ      & Q-all  & $\eta = 0.05$ & 94.0 \\
+FMQ      & Q-all  & $\eta = 0.10$ & 90.8 \\
+FMQ      & Q-all  & $\eta = 0.20$ & 80.8 \\
+FMQ      & Q-term & $\eta = 0.05$ & 93.6 \\
+\midrule
+Grad-MPC & Q-term & $K = 5$       & 93.2 \\
+Grad-MPC & Q-term & $K = 8$       & \textbf{96.0} \\
+Grad-MPC & Q-term & $K = 10$      & 90.8 \\
+\midrule
+Standalone ($\mathrm{BoN}\,N=4$) & -- & -- & 86.8 \\
+IMPALA reference (OGBench)        & -- & -- & 92.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{CEM baseline (latent-distance only)}
+\label{sec:exp-cem-baseline}
+
+For reference, a CEM planner that optimises action sequences directly
+against the LeWM rollout under a latent-distance reward reaches
+$72.0\%$ on the in-distribution latent-reach metric but
+\emph{$0.0\%$} on the native cube task --- exactly the gap diagnosed
+throughout this chapter between latent-reach and physical task
+success.
 
 \begin{table}[h]
 \centering
 \caption{CEM planning directly in the $224{\times}224$ LeJEPA latent
-space on \texttt{swm/OGBCube-v0} (\texttt{terminate\_at\_goal}, $50$
-episodes). The latent-reach rate is high but native task success is
-zero. Source:
-\texttt{results\_cube\_eval\_2026-03-28\_13-53/ogb\_cube\_results.txt}.}
+space. \texttt{terminate\_at\_goal}, $50$ episodes. The latent-reach
+rate is high but native task success is zero.}
 \label{tab:cem-baseline}
 \begin{tabular}{lc}
 \toprule
@@ -658,89 +540,166 @@ Plan / receding horizon      & 5 / 5 \\
 Action block                 & 5 \\
 CEM samples $\times$ iters   & $300 \times 30$ \\
 CEM elite (top-$k$)          & 30 \\
-Episodes                     & 50 \\
 \midrule
 Latent-reach rate            & 72.0\% \\
 \textbf{Native task success} & \textbf{0.0\%} \\
-Eval wall-time               & 654\,s \\
 \bottomrule
 \end{tabular}
 \end{table}
 
+\subsection{Online MPC with world-model transitions}
+\label{sec:exp-mpc-online-wm}
+
+The method of \S\ref{sec:mpc-online-wm} reintroduces imagined
+transitions into the replay buffer during an online phase run entirely
+inside the world model. On the single task
+(Table~\ref{tab:mpc-online-e2}), freezing the critic is decisive: with
+the critic updated on the imagined transitions the policy collapses
+(E2a, $30.7\%$), whereas freezing it lifts the standalone policy from
+the $76.4\%$ offline start to $90.7 \pm 0.8\%$ final and
+$94.8 \pm 0.7\%$ peak (E2c), with no planner at test time. Applying the
+FMQ-MPC planner on top of the best E2c checkpoints does not improve on
+this ($93.2 \pm 0.7\%$), because the actor has already absorbed the
+controller. The goal-conditioned extension
+(Table~\ref{tab:mpc-online-e3}) does not beat its $90.0\%$ offline
+baseline on final success; the leakage-free variants are strongest at
+$\approx 84\%$.
+
+\begin{table}[h]
+\centering
+\caption{Offline-to-online inside the world model, single task
+   (\texttt{visual-cube-single-singletask-task1-v0}). The online phase runs $500\,000$
+   FMQ-MPC steps ($N = 32$, $H = 2$, $\eta = 0.02$, Q-all) \emph{inside the WM}, adding each
+   imagined transition $(z, \mathbf{a}^{\text{MPC}}, r_\psi, z'_\psi)$ to a buffer seeded with the
+   offline data. Success rate is \emph{standalone} (best-of-$4$, no planner at test time), $250$
+   episodes, mean $\pm$ std over $3$ seeds. E2a and E2c differ only in whether the critic is updated
+   on the mixed buffer.}
+\label{tab:mpc-online-e2}
+\begin{tabular}{l l r r}
+\toprule
+Run & Critic during online & Final SR (\%) & Peak SR (\%) \\
+\midrule
+Offline FQL start          & --- (frozen offline)         & 76.4 & 88.0 \\
+E2a                        & updated on real $+$ imagined & 30.7 $\pm$ 20.8 & 89.5 $\pm$ 0.7$^{\dagger}$ \\
+E2c                        & frozen (real only)           & \textbf{90.7 $\pm$ 0.8} & \textbf{94.8 $\pm$ 0.7} \\
+\midrule
+E2c $+$ FMQ-MPC at test$^{\ddagger}$ & frozen              & --- & 93.2 $\pm$ 0.7 \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize $^{\dagger}$ E2a's peak is transient --- reached near $50$k steps before the critic destabilises; by $500$k all three seeds have collapsed (final $60/14/18\%$).\quad
+$^{\ddagger}$ FMQ-MPC planner ($N = 32$, $H = 2$, $\eta = 0.02$) applied post-hoc to each seed's best standalone checkpoint ($250$ episodes; per-seed $92.4 / 94.0 / 93.2\%$). It does \emph{not} improve on the standalone peak.}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Goal-conditioned extension (E3): multi-task across all five \texttt{visual-cube-single}
+   tasks with hindsight relabelling, $[z, z_{\text{goal}}]$ observations, and the HIQL-style
+   indicator reward. Online phase as in Table~\ref{tab:mpc-online-e2}; SR is the standalone $5$-task
+   average ($50$ episodes/task), mean $\pm$ std over $3$ seeds unless noted. \emph{Goal source} is
+   how online rollout goals are drawn: the five evaluation goals, or random achieved states (the
+   leakage-free ``fair'' setting).}
+\label{tab:mpc-online-e3}
+\begin{tabular}{l l l l r r}
+\toprule
+Run & Sampling & Critic & Goal source & Final SR (\%) & Peak SR (\%) \\
+\midrule
+Offline GC baseline & ---        & ---     & ---            & 90.0 & 90.0 \\
+\midrule
+E3b & HER        & frozen  & eval goals     & 80.1 $\pm$ 1.6 & 92.1 $\pm$ 0.2 \\
+E3c & no-HER     & frozen  & eval goals     & 73.2 $\pm$ 1.2 & 84.8 $\pm$ 2.0 \\
+E3d & mix 50/50  & frozen  & eval goals     & 77.8 $\pm$ 3.0$^{\ddagger}$ & 87.4 $\pm$ 1.0$^{\ddagger}$ \\
+E3f & mix 75/25  & frozen  & eval goals     & 80.9 $\pm$ 1.5 & 87.9 $\pm$ 0.7 \\
+E3e & HER        & updated & eval goals     & 81.5 $\pm$ 1.3 & 90.9 $\pm$ 0.7 \\
+\midrule
+E3g       & HER       & frozen & random states & 84.0 $\pm$ 1.5 & 91.1 $\pm$ 0.5 \\
+E3g-clean & mix 50/50 & frozen & random states & 84.4 $\pm$ 0.9 & 90.9 $\pm$ 0.5 \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize $^{\ddagger}$ E3d: two complete seeds (the third was truncated by a disk fault at $75$k).}
+\end{table}
+
 % ---------------------------------------------------------------------
-\section{Diagnostics and Failure Mode Analysis}
-\label{sec:exp-diag}
+\section{Headline Comparison}
+\label{sec:exp-headline}
 
-\subsection{Flat vs Hierarchical}
-The diagnostic suite (\texttt{run\_diagnostics.sh}, step A) evaluates
-the low-level actor of \S\ref{sec:joint} \emph{without} the
-high-level head, treating it as a flat goal-conditioned policy. \todo{verify:
-paste flat-policy success rates and compare to the corresponding
-hierarchical row of Table~\ref{tab:joint-gap}.}
+\begin{table}[h]
+\centering
+\caption{Best-configuration comparison on the OGBench cube-single
+benchmarks. Goal-conditioned numbers are five-task averages over $50$
+episodes; singletask numbers are over $250$ episodes on
+\texttt{visual-cube-single-singletask-task1-v0}.}
+\label{tab:headline}
+\begin{tabular}{ll c}
+\toprule
+Method & Setting & Success (\%) \\
+\midrule
+\multicolumn{3}{l}{\emph{Baselines (no learned WM in the loop)}} \\
+HIQL end-to-end (pixel, no WM, $k{=}10$)        & GCRL, 5 tasks & 76.8 \\
+HIQL + LeJEPA-224 + adapter256 (frozen enc.)    & GCRL, 5 tasks & 69.6 \\
+Offline JEPA ($81.6\%$ checkpoint)              & singletask    & 81.6 \\
+IMPALA reference (OGBench)                      & singletask    & 92.8 \\
+\midrule
+\multicolumn{3}{l}{\emph{WM as environment}} \\
+SAC+HER (best flat config)                     & GCRL, 5 tasks & $\sim 0$ \\
+Joint hierarchical SAC ($G{\in}\{1,2\}$, dense, $\rho_{\mathrm{cache}}{=}0.5$) & GCRL, 5 tasks & 3.6 \\
+Plain WM-env, anchored, full FT WM              & singletask    & 15.2 \\
+Joint WM$+$policy training                      & singletask    & 9.6 \\
+\midrule
+\multicolumn{3}{l}{\emph{WM to ground subgoals}} \\
+HIQL+LeWM ($k{=}2$, $\rho_{\mathrm{wu}}{=}1$, $d_r{=}10$) & GCRL, 5 tasks & 20.8 \\
+WGSP (best snapshot)                            & GCRL, 5 tasks & 39.2 \\
+\midrule
+\multicolumn{3}{l}{\emph{WM in the offline-to-online phase (Ch.~\ref{chap:online-with-wm})}} \\
+Frozen actor $+$ BoN-MPC ($H{=}1$)              & singletask    & 88.0 \\
+Frozen actor $+$ Grad-MPC ($H{=}2$, $K{=}5$)    & singletask    & 90.0 \\
+Grad-MPC distil, full, mixed (MPC-eval)         & singletask    & 92.4 \\
+FMQ-distil, slow-relabel (FMQ inference $\eta{=}0.02$) & singletask & \textbf{96.0} \\
+E2c: online MPC-in-WM, standalone (no planner)  & singletask    & 94.8 \\
+Offline GC (FQL on LeWM latents, multi-task)    & GCRL, 5 tasks & 90.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\subsection{Predictor Consistency}
-Step C of the diagnostic suite checks
-$\|f_\psi(z_t, a_t) - E_\xi(s_{t+1})\|$ over the on-policy roll-out
-distribution. \todo{verify: paste mean and standard deviation across
-$20$ episodes $\times$ $10$ steps and compare to the in-distribution
-drift of Fig.~\ref{fig:drift}.}
-
-\subsection{Goal-Reachability}
-Step B of the diagnostic suite logs
-$\|z_t - g\|_2$ and $\|a_t\|_2$ at every environment step. The
-characteristic failure mode is a slow distance reduction that
-plateaus before crossing $\delta_d = 2.0$, suggesting that the policy
-has learned a useful direction but cannot refine the final
-positioning step.
+The cross-chapter pattern is the central takeaway of this thesis: the
+WM-as-environment family fails almost without exception, the WM as a
+subgoal grounder lifts the baseline modestly, and the WM as an
+inference-time planner --- combined with a critic trained on
+MPC-relabelled actions --- recovers a $+3.2\%$ absolute lift over the
+strongest non-WM baseline on the single-task offline-to-online
+benchmark.
 
 % ---------------------------------------------------------------------
-\section{Discussion}
+\section{Diagnostics and Failure-Mode Analysis}
 \label{sec:exp-discuss}
 
-The single most important finding of this chapter is the gulf between
-the two evaluation regimes of \S\ref{sec:exp-setup}. Every method that
-optimises latent distance --- SAC+HER ($>\!87\%$ latent-reach,
-Table~\ref{tab:sac-train-sr}), the CEM planner ($72\%$ latent-reach,
-Table~\ref{tab:cem-baseline}), and the legacy $224$ stack ($>\!95\%$,
-Table~\ref{tab:lhrl-train}) --- can drive the predictor to a target
-embedding almost perfectly, yet the same policies solve at most a few
-percent of the native cube task, and the CEM planner solves none. High
-latent-reach is necessary but nowhere near sufficient: a latent
-trajectory that terminates at the goal embedding need not correspond to
-a physical trajectory that places the cube, precisely because of the
-predictor drift in Fig.~\ref{fig:drift}. Any latent-reach number in this
-chapter should therefore be read as a training diagnostic, never as a
-task result.
+The single most important finding of this chapter is the gap between
+the two evaluation regimes. Every method that optimises latent
+distance --- SAC+HER ($>\!87\%$ latent-reach), the CEM planner ($72\%$
+latent-reach), and the legacy $224$ stack ($>\!95\%$ latent-reach) ---
+can drive the predictor to a target embedding almost perfectly, yet
+the same policies solve at most a few percent of the native cube task
+and the CEM planner solves none. High latent-reach is necessary but
+nowhere near sufficient: a latent trajectory that terminates at the
+goal embedding need not correspond to a physical trajectory that
+places the cube, precisely because of the predictor drift documented
+in \S\ref{sec:wm-drift}. Any latent-reach number in this chapter
+should be read as a training diagnostic, never as a task result.
 
-The progression from \S\ref{sec:exp-curr-sac} to
-\S\ref{sec:exp-flow} maps cleanly onto the algorithmic progression of
-Chapter~\ref{chap:methodology}. Curriculum SAC fails for lack of a
-learning signal on long-horizon tasks; HER+SAC adds the signal but
-still scores $0\%$ natively; the hierarchical joint variant reaches a
-modest $3.6\%$ at short gaps but collapses once the high-level gap
-exceeds the predictor's horizon of fidelity ($G\!\geq\!5$,
-Table~\ref{tab:joint-gap}); HIQL+LeWM is the first method to break
-double-digit success, and is best when imagination is \emph{disabled}
-($\rho_{\mathrm{wu}}=1$, Table~\ref{tab:hiql-lewm-sweep}); the
-flow-matching variant
-\todo{verify: confirm whether it improves on the Gaussian actor or
-not.}
-
-A second, independent fragility is exposed by the state-observation
-hierarchical control of \S\ref{sec:exp-joint-state}: even with the
-encoder removed entirely, the two-level architecture scores $0\%$
-because an unreliable high-level gives the low-level a noisier goal than
-a flat policy would, triggering entropy collapse. The hierarchy thus
-requires a warm-started high-level (Table~\ref{tab:hl-mlp-train}) as a
-prerequisite, not an add-on.
-
-The most informative diagnostic remains the predictor-drift curve in
-Fig.~\ref{fig:drift}: methods whose effective horizon exceeds roughly
-$10$--$25$ raw frames fall off a cliff, matching the joint-SAC gap
-boundary between $G{=}2$ ($10$ frames, $3.6\%$) and $G{=}5$ ($25$
-frames, $0\%$). This frames the principal direction for future work as
-improving long-horizon predictor fidelity, either by (i) larger or
-longer-trained world models, (ii) a contrastive auxiliary objective on
-top of the JEPA loss in Eq.~\eqref{eq:pred-loss}, or (iii) abandoning
-closed-form roll-outs in favour of a hybrid offline+real-data training
-regime in which the world model is consulted only on short horizons.
+The progression of native success rates --- curriculum SAC stalling
+near zero, HER+SAC still at zero natively, hierarchical SAC at a
+modest $3.6\%$, HIQL+LeWM at $20.8\%$, the offline-to-online MPC
+pipeline at $96.0\%$ --- maps directly onto the changing role of the
+WM. As long as the WM is in the training loop, performance is
+bounded by the predictor's accuracy, and the predictor is not accurate
+enough. Once the WM is restricted to short-horizon scoring at
+inference time, the same predictor becomes useful. The most
+informative single diagnostic remains the predictor-drift curve
+(\S\ref{sec:wm-drift}): the methods whose effective horizon exceeds
+roughly $10$--$25$ raw frames fall off a cliff that matches the
+joint-SAC gap boundary between $G{=}2$ ($10$ frames, $3.6\%$) and
+$G{=}5$ ($25$ frames, $0\%$), and the methods that stay below that
+horizon succeed.

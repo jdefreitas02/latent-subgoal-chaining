@@ -1,0 +1,379 @@
+\chapter{Using the World Model to Ground Subgoals}
+\label{chap:wm-as-subgoal}
+
+\section{Motivation}
+\label{sec:wm-as-subgoal-motivation}
+
+The synthesis of Chapter~\ref{chap:wm-as-env} closed with a strong negative
+conclusion: when the LeWM predictor is used as a training-time environment
+substitute, the agent's predicted-latent skill does not transfer to the
+real task. The diagnosis was that long-horizon WM rollouts drift off the
+offline support, the critic fits Bellman targets in regions the WM never
+saw at training time, and the resulting policy chases hallucinated states.
+
+That diagnosis does not, however, rule out a much weaker use of the same
+predictor: applying $f_\psi$ for one or two steps starting from a real
+on-policy latent, in order to \emph{rank} candidate subgoals or actions
+against a learned value function. Short rollouts from a real latent stay
+close to the offline support, the value function is queried at states the
+predictor was trained to model, and the WM is only ever asked to provide a
+relative ordering rather than a ground-truth next state. This chapter
+explores three offline methods that use the WM in this restricted way.
+The first two --- HIQL in the LeWM latent space and a flow-matching
+low-level extension --- avoid the WM at training time entirely and lift
+the offline goal-conditioned baseline modestly. The third, World-Grounded
+Subgoal Planning (WGSP), attempts to break the behaviour-cloning ceiling
+of HIQL by scoring imagined subgoal candidates against the value function;
+the attempt did not pan out, and the failure is informative for
+Chapter~\ref{chap:online-with-wm}.
+
+% ---------------------------------------------------------------------
+\section{HIQL in the LeWM Latent Space}
+\label{sec:hiql-lewm}
+
+The hierarchical SAC formulation in \S\ref{sec:joint} alleviates
+long-horizon planning by introducing temporal abstraction, but it still
+relies on an action-conditioned critic $Q(z,g,a)$. In practice, this
+remains a major source of instability: estimating $Q$ requires reasoning
+over both state and action spaces, and small errors in the world model
+compound when evaluating out-of-distribution actions.
+
+To address this, we move to an \emph{offline} formulation based on
+Implicit Q-Learning (IQL), and adopt its hierarchical extension (HIQL)
+in the LeWM latent space \cite{park2024hiqlofflinegoalconditionedrl}.
+The key idea is to \emph{eliminate explicit dependence on actions in
+the value function}, replacing $Q(z,g,a)$ with an action-free value
+function $V(z, \varphi(z,g))$. This removes the need to evaluate unseen
+actions and significantly improves stability.
+
+\paragraph{Model components.}
+The world model $(E_\xi, f_\psi)$ remains fixed. The trainable
+components are
+\begin{equation}
+\varphi_\eta(z,g) \in \mathbb{R}^{d_r}, \qquad d_r = 10,
+\qquad \|\varphi_\eta(z,g)\|_2 = \sqrt{d_r},
+\end{equation}
+\begin{equation}
+V_{\phi_1}, V_{\phi_2} : \mathcal{Z} \times \mathbb{R}^{d_r} \to \mathbb{R},
+\qquad
+\pi^{\mathrm{HL}}(\varphi \mid z,g), \quad
+\pi^{\mathrm{LL}}(a \mid z,\varphi).
+\end{equation}
+
+Here, $\varphi_\eta(z,g)$ is a learned low-dimensional representation
+of the goal, compressing the high-dimensional latent space into a more
+manageable form. This is particularly important because the LeWM
+latent space ($d_z=192$) is significantly overparameterised for value
+learning. Projecting onto a $10$-dimensional sphere enforces a
+structured and bounded representation, improving generalisation and
+stability.
+
+\paragraph{Value learning via expectile regression.}
+Instead of learning a $Q$-function, HIQL learns a value function that
+implicitly captures the maximum over actions. Given a subgoal
+$z_{\mathrm{sub}} = z_{t+k}$ sampled from the dataset, we define a dense
+reward
+\[
+\hat r_t = -\|z_{t+1} - z_{\mathrm{sub}}\|_2,
+\]
+consistent with the latent geometry induced by LeWM
+(\S\ref{sec:wm-geometry}). We construct target values
+\begin{align}
+q_i &= \hat r_t + \gamma\,V_{\bar\phi_i}\!\big(z_{t+1},\,\bar\varphi(z_{t+1}, z_{\mathrm{sub}})\big),
+\end{align}
+and define an advantage-like quantity
+\begin{align}
+A_t = \frac{1}{2}\sum_i q_i - \frac{1}{2}\sum_i V_{\bar\phi_i}\!\big(z_t,\,\bar\varphi(z_t, z_{\mathrm{sub}})\big).
+\end{align}
+The value function is trained using \emph{expectile regression}
+\cite{kostrikov2021offlinereinforcementlearningimplicit}:
+\begin{align}
+\ell_\tau(u) &= \big|\tau - \mathbb{1}[u < 0]\big|\,u^2, \qquad \tau = 0.7,
+\label{eq:hiql-expectile}\\
+\mathcal{L}_V &= \mathbb{E}\!\left[\sum_{i=1}^{2}
+\ell_\tau\!\Big(q_i - V_{\phi_i}\!\big(z_t, \varphi_\eta(z_t, z_{\mathrm{sub}})\big)\Big)\right].
+\end{align}
+Intuitively, expectile regression biases the value function toward the
+\emph{upper tail} of the observed returns. This serves as a stable
+proxy for the $\max_a Q(z,g,a)$ operator in classical Q-learning,
+without ever evaluating actions explicitly. As a result, the method
+avoids overestimation errors on out-of-distribution actions --- the key
+failure mode in offline RL that drove every collapse in
+Chapter~\ref{chap:wm-as-env}.
+
+\paragraph{Policy learning via advantage-weighted regression.}
+Both the low-level and high-level policies are trained using
+advantage-weighted regression (AWR), which encourages imitation of
+actions and subgoals that lead to high-value outcomes.
+
+For the low-level policy:
+\begin{align}
+A^{\mathrm{LL}}_t &=
+\frac{1}{2}\sum_i \Big[
+V_{\phi_i}\!\big(z_{t+1}, \varphi(z_{t+1}, z_{\mathrm{sub}})\big)
+- V_{\phi_i}\!\big(z_t, \varphi(z_t, z_{\mathrm{sub}})\big)
+\Big], \\
+\mathcal{L}_{\pi^{\mathrm{LL}}} &=
+-\mathbb{E}\!\left[
+\min\big(\exp(\alpha_{\mathrm{LL}} A^{\mathrm{LL}}_t), 100\big)
+\log \pi^{\mathrm{LL}}\!\big(a_t \mid z_t, \varphi(z_t, z_{\mathrm{sub}})\big)
+\right].
+\end{align}
+For the high-level policy:
+\begin{align}
+A^{\mathrm{HL}}_t &=
+\frac{1}{2}\sum_i \Big[
+V_{\phi_i}\!\big(z_{t+k}, \varphi(z_{t+k}, g_{\mathrm{ult}})\big)
+- V_{\phi_i}\!\big(z_t, \varphi(z_t, g_{\mathrm{ult}})\big)
+\Big], \\
+\mathcal{L}_{\pi^{\mathrm{HL}}} &=
+-\mathbb{E}\!\left[
+\min\big(\exp(\alpha_{\mathrm{HL}} A^{\mathrm{HL}}_t), 100\big)
+\log \pi^{\mathrm{HL}}\!\big(\varphi(z_t, z_{\mathrm{sub}}) \mid z_t, g_{\mathrm{ult}}\big)
+\right].
+\end{align}
+Both policies learn by \emph{reweighting behaviour} according to value
+improvement: transitions that lead to greater progress toward the goal
+are exponentially upweighted.
+
+\paragraph{Offline training with optional imagination.}
+HIQL is fundamentally an offline method, trained on fixed datasets of
+transitions. To leverage the learned world model, we introduce a
+two-phase training procedure:
+\begin{align}
+\textbf{Phase 1 (offline warm-up):} &\quad \text{train only on real data},
+\label{eq:hiql-phase1}\\
+\textbf{Phase 2 (augmentation):} &\quad \text{mix real and synthetic data}.
+\label{eq:hiql-phase2}
+\end{align}
+Synthetic transitions are generated by rolling out the low-level policy
+through the latent dynamics model $f_\psi$. Subgoals are still sampled
+from real trajectories, ensuring that the imagined data remains
+grounded in the dataset distribution. The warm-up phase prevents
+catastrophic damage in the synthetic-rollout phase --- empirically the
+best operating point is $\rho_{\mathrm{wu}}=1$ (no synthetic data at
+all), confirming the diagnosis from Chapter~\ref{chap:wm-as-env} that
+on this task the WM contributes more noise than signal when fed into
+the training loop.
+
+\paragraph{Stability mechanisms.}
+To stabilise training, we maintain target networks for both the value
+function and goal representation:
+\[
+\bar\phi \leftarrow (1 - \tau)\bar\phi + \tau \phi, \qquad
+\bar\eta \leftarrow (1 - \tau)\bar\eta + \tau \eta,
+\]
+with $\tau = 0.005$.
+
+\paragraph{Discussion.}
+By removing the action-conditioned critic and adopting an offline
+learning paradigm, HIQL eliminates the primary source of instability
+observed in Chapter~\ref{chap:wm-as-env}. The combination of expectile
+regression and advantage-weighted regression enables stable learning
+from static data while still supporting hierarchical reasoning. The
+quantitative improvement over the SAC-family methods is substantial
+(\S\ref{sec:exp-hiql-results}), and HIQL+LeWM is the first method in
+this thesis to cross double-digit native task success. The remaining
+weakness is the low-level actor: a unimodal Gaussian cannot represent
+the multimodal expert action distributions seen on manipulation tasks,
+which motivates the flow-matching extension in the next section.
+
+% ---------------------------------------------------------------------
+\section{Flow-Matching Low-Level Policy}
+\label{sec:hiql-flow}
+
+The HIQL formulation in \S\ref{sec:hiql-lewm} removes the instability
+arising from action-conditioned value estimation, but the low-level
+policy remains a unimodal Gaussian. This assumption is restrictive in
+manipulation tasks, where multiple distinct actions may be equally
+valid in the same state (e.g., approaching an object from different
+directions). As a result, the Gaussian policy tends to average over
+modes, producing suboptimal or physically implausible actions.
+
+To address this limitation, we replace the Gaussian low-level actor
+with a \emph{flow-matching policy} that can represent complex,
+multimodal action distributions \cite{park2025flow}. The policy
+consists of two components: (i) a conditional velocity field trained
+via behaviour cloning, and (ii) a distilled one-step policy trained
+using advantage-weighted regression. All other components (value
+function, high-level policy, goal representation, training procedure)
+remain unchanged.
+
+\paragraph{Conditional flow matching.}
+We model the action distribution implicitly as a continuous
+transformation from Gaussian noise to expert actions. Specifically, we
+define a velocity field $u_\theta$ that describes how a sample evolves
+over time from an initial noise distribution to a target action.
+
+Following the flow-matching formulation, we sample
+\[
+x_0 \sim \mathcal{N}(0,I), \qquad x_1 = a^*, \qquad t \sim \mathrm{Unif}[0,1],
+\]
+and construct an interpolation
+\[
+x_t = (1 - t)\,x_0 + t\,x_1.
+\]
+The velocity field is trained to predict the direction from noise to
+the target action:
+\begin{equation}
+\mathcal{L}_{\mathrm{BC}}(\theta)
+= \mathbb{E}\!\left[
+\big\| u_\theta(z, \varphi, x_t, t) - (x_1 - x_0) \big\|_2^2
+\right].
+\label{eq:flow-bc-clean}
+\end{equation}
+Intuitively, this learns a continuous vector field that transports a
+simple Gaussian distribution into the complex, multimodal distribution
+of expert actions, conditioned on the current state and goal.
+
+\paragraph{Action generation via integration.}
+To generate an action, we simulate this flow starting from Gaussian
+noise. Using a simple Euler integration scheme with $S$ steps,
+\begin{equation}
+x_{i+1} = x_i + \frac{1}{S}\,u_\theta(z, \varphi, x_i, i/S),
+\qquad x_0 = \epsilon \sim \mathcal{N}(0,I),
+\end{equation}
+and the final action is
+\begin{equation}
+\hat{a}_{\mathrm{flow}} = \mathrm{clip}(x_S, -s_{\max}, s_{\max}).
+\label{eq:flow-euler-clean}
+\end{equation}
+This procedure allows the policy to generate diverse actions depending
+on the initial noise sample, naturally capturing multimodal behaviour.
+
+\paragraph{Advantage-weighted distillation.}
+While the flow model is expressive, iterative integration is
+computationally expensive at inference time. To address this, we train
+a second network $\mu_\psi$ to approximate the output of the flow in a
+single forward pass. This network takes a noise sample $\epsilon$ and
+predicts an action directly. It is trained using advantage-weighted
+regression to imitate the flow output:
+\begin{equation}
+\mathcal{L}_{\mathrm{dist}}(\psi)
+= \mathbb{E}\!\left[
+\min\big(\exp(\alpha_{\mathrm{LL}} A^{\mathrm{LL}}_t), 100\big)
+\|\mu_\psi(z, \varphi, \epsilon) - \hat{a}_{\mathrm{flow}}\|_2^2
+\right].
+\label{eq:flow-dist-clean}
+\end{equation}
+The advantage weights ensure that the distilled policy focuses on
+high-value behaviours, effectively selecting the most useful modes of
+the action distribution.
+
+\paragraph{Training objective.}
+The two components are trained jointly:
+\begin{equation}
+\mathcal{L}^{\mathrm{LL}}_{\mathrm{flow}}
+= \mathcal{L}_{\mathrm{BC}}(\theta)
++ \mathcal{L}_{\mathrm{dist}}(\psi).
+\label{eq:flow-total-clean}
+\end{equation}
+The behaviour-cloning loss uses all available expert transitions and
+learns the full action distribution, while the distillation loss
+shapes the final policy toward high-advantage regions.
+
+\paragraph{Inference.}
+At evaluation time, the agent uses only the distilled policy
+$\mu_\psi$, requiring a single forward pass. This makes inference as
+efficient as the Gaussian actor used in \S\ref{sec:hiql-lewm}, while
+retaining the ability to model multimodal action distributions. The
+same flow-matching actor reappears as the proposal distribution for
+the BoN/Grad-MPC/FMQ planners of Chapter~\ref{chap:online-with-wm} ---
+the multimodality it captures is what makes those planners worth
+running in the first place.
+
+% ---------------------------------------------------------------------
+\section{World-Grounded Subgoal Planning (WGSP)}
+\label{sec:wgsp}
+
+HIQL keeps the policy strictly within the support of the behaviour
+distribution: the value function is trained on dataset transitions
+only, and the high-level actor regresses onto subgoals drawn from
+trajectories that are already in the dataset. This is what makes HIQL
+stable, but it also caps how much improvement is possible at the
+high-level: the high-level cannot propose a subgoal the dataset does
+not already contain.
+
+WGSP is our attempt to extend the high-level beyond this ceiling. The
+high-level proposes \emph{candidate} subgoals, the WM rolls each
+candidate forward $k$ steps under the low-level policy, and the value
+function scores the rollout endpoint. The candidate with the highest
+WM-based score becomes the supervision target for the high-level
+regression --- the high-level is no longer constrained to imitate
+data-sampled subgoals, but can prefer dynamically plausible candidates
+that the value function rates higher. The motivation is that HIQL's
+behaviour-cloning ceiling is most binding on the high level (the
+low-level is essentially a one-step BC problem), and that short WM
+rollouts from a real on-policy latent can score subgoals the dataset
+does not directly contain.
+
+\paragraph{Notation.}
+A high-level candidate is a goal-representation vector
+$\mathrm{rep}^{(i)}\sim\pi^{\mathrm{HL}}(\cdot\mid z_t, g)$, with
+$N$ such candidates drawn per training step. Each candidate is decoded
+into an action chunk $c^{(i,m)} \in \mathbb{R}^{25}$ by the low-level
+chunk decoder, and $M$ such chunks are sampled per candidate. The chunk
+is rolled forward $k$ WM steps to obtain a rollout endpoint
+$z_k^{(i,m)}$ in the offline latent space. The within-representation
+advantage assigns credit across the $M$ rollouts of the same candidate
+$i$, and the cross-candidate weight $w^{(i)}$ aggregates across the
+$N$ candidates.
+
+\paragraph{HL update.}
+Each candidate is scored by its rollout endpoint under the value
+function $V$ and an optional geometric residual:
+\begin{equation}
+J^{(i,m)} \;=\; V_\phi\!\big(z_k^{(i,m)},\,\varphi(z_k^{(i,m)}, g)\big)
+   \;-\; \beta_{\mathrm{geom}}\,\big\|z_k^{(i,m)} - g\big\|_2,
+\end{equation}
+with the geometric term weighted by $\beta_{\mathrm{geom}}\ge 0$.
+Cross-candidate weights are softmax-normalised across $N$
+candidates; within-candidate weights $u^{(i,m)}$ are softmax-normalised
+across the $M$ rollouts of the same candidate. The high-level
+regression target is the chosen candidate's rep vector, and the
+high-level loss is the AWR objective from \S\ref{sec:hiql-lewm} with
+the WGSP-derived weights substituted for the dataset-derived ones.
+
+\paragraph{Distillation to the LL.}
+The same WM rollouts produce action chunks $c^{(i,m)}$. The LL
+distillation loss reuses these chunks as supervision targets, weighted
+by the same $w^{(i)} \cdot u^{(i,m)}$ product. This means the LL is
+nudged toward action chunks that, in the WM, reach high-value
+endpoints under the value function --- a regression-to-high-value
+target rather than the dataset-derived target of plain HIQL.
+
+\paragraph{Training pipeline.}
+Phase 1 (warm-up): train $V$, $\varphi$, and the low-level on real
+data with plain HIQL. Phase 2 (WGSP-active): every training step,
+sample $N$ rep candidates from the current high-level, roll out $M$
+chunks each through the WM, compute the WGSP weights, and update the
+high-level and (optionally) the low-level distil head against them.
+Value updates remain on real data only --- the WM is never queried as
+part of $V$'s Bellman target, only as part of the high-level scoring.
+
+\paragraph{Why it failed.}
+The WGSP training trajectory on the cube benchmark is recorded in
+Table~\ref{tab:wgsp-dynamics} of the appendix. The relevant pattern is
+that the closer-fraction metric --- the share of WM rollouts whose
+endpoint is closer to the goal than the start --- peaks at $0.588$
+around step $150$k and then regresses back to $0.564$ by step $338$k.
+At the same time the LL distillation loss
+$-\mathbb{E}[w_{\mathrm{HL}}\,\log\pi_{\mathrm{LL}}]$ crosses zero at
+$\sim$195k and continues into negative territory. The diagnosis is
+that the distillation loss has no lower bound on the Gaussian standard
+deviation: minimising a negative loss collapses the LL toward a
+near-deterministic point, which collapses WM rollout diversity, which
+degrades the HL's learning signal. The cube-task evaluation reflects
+this: WGSP's best checkpoint (128k snap) reaches $39.2\%$, well below
+the HIQL+LeJEPA baseline at $69.6\%$. The failure is a control-theoretic
+one in the LL training loss rather than a fundamental problem with the
+subgoal-grounding idea --- but in this thesis we did not have time to
+test the obvious fixes (clipping the LL std, reducing the distillation
+weight), and the method is retained here as a documented attempt
+rather than a positive result.
+
+The negative result is still informative for
+Chapter~\ref{chap:online-with-wm}. WGSP's collapse comes from training
+the LL on WM-derived rollouts; the interleaved MPC distillation of
+Chapter~\ref{chap:online-with-wm} avoids that route by supervising the
+actor on MPC-relabelled \emph{actions}, not on WM-imagined trajectories.
