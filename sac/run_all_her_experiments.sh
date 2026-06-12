@@ -44,7 +44,7 @@ export EPHEMERAL=\$EPHEMERAL
 
 source ${VENV}
 
-python train.py --mode ${mode} ${extra_args}
+python sac_train.py --mode ${mode} ${extra_args}
 
 echo "=== ${job_name} finished ==="
 EOF
