@@ -341,6 +341,31 @@ class ACFQLAgent(flax.struct.PyTreeNode):
     @jax.jit
     def update(self, batch):
         return self._update(self, batch)
+
+    @staticmethod
+    def _update_actor_only(agent, batch):
+        """Update only the actor's params (critic stays frozen).
+
+        For actor_type='best-of-n' this is just bc_flow loss; the critic does
+        not appear in actor_loss so its params receive zero gradient. The
+        target_critic Polyak update is skipped because the critic is unchanged.
+        Used by the online MPC phase to avoid bootstrapping Q from biased
+        WM-generated transitions (the destabilization mechanism observed in
+        E2a/E2b/E3a).
+        """
+        new_rng, rng = jax.random.split(agent.rng)
+        def loss_fn(grad_params):
+            rng_inner, actor_rng = jax.random.split(rng)
+            actor_loss, actor_info = agent.actor_loss(batch, grad_params, actor_rng)
+            info = {f'actor/{k}': v for k, v in actor_info.items()}
+            return actor_loss, info
+        new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
+        # No target_update — critic params unchanged
+        return agent.replace(network=new_network, rng=new_rng), info
+
+    @jax.jit
+    def update_actor_only(self, batch):
+        return self._update_actor_only(self, batch)
     
     @jax.jit
     def batch_update(self, batch):
