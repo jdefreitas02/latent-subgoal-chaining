@@ -724,8 +724,53 @@ def load_jepa(ckpt_path, device, img_size=64, patch_size=8):
         patch_size: ViT patch size (8 for 64x64, 14 for 224x224).
     """
     if img_size == 224:
-        # Use the same loading pattern as eval.py: AutoCostModel resolves
-        # base_path → base_path_object.ckpt automatically.
+        # Prefer the _state_dict.pt sibling if it exists — bypasses pickle
+        # issues like CostShim being defined in __main__ of finetune_wm_on_play.py
+        # (which prevents AutoCostModel from loading lejepa_play_ft_full).
+        # Falls through to AutoCostModel for checkpoints without state_dict.pt.
+        from jepa import JEPA
+        from module import ARPredictor, Embedder, MLP
+
+        sd_candidate = str(ckpt_path) + "_state_dict.pt"
+        if os.path.exists(sd_candidate):
+            encoder = spt.backbone.utils.vit_hf(
+                "tiny", patch_size=patch_size, image_size=img_size,
+                pretrained=False, use_mask_token=False)
+            predictor = ARPredictor(
+                num_frames=3, input_dim=192, hidden_dim=192, output_dim=192,
+                depth=6, heads=16, mlp_dim=2048, dim_head=64,
+                dropout=0.1, emb_dropout=0.0)
+            action_encoder = Embedder(input_dim=25, emb_dim=192)
+            projector = MLP(input_dim=192, output_dim=192,
+                            hidden_dim=2048, norm_fn=nn.BatchNorm1d)
+            pred_proj  = MLP(input_dim=192, output_dim=192,
+                             hidden_dim=2048, norm_fn=nn.BatchNorm1d)
+            model = JEPA(encoder=encoder, predictor=predictor,
+                         action_encoder=action_encoder,
+                         projector=projector, pred_proj=pred_proj)
+            ckpt = torch.load(sd_candidate, map_location="cpu",
+                              weights_only=False)
+            raw_sd = (ckpt["state_dict"] if isinstance(ckpt, dict)
+                      and "state_dict" in ckpt else dict(ckpt))
+            # Strip 'model.' prefix if present (Lightning convention).
+            if any(k.startswith("model.") for k in raw_sd):
+                raw_sd = {k[len("model."):]: v for k, v in raw_sd.items()
+                          if k.startswith("model.")}
+            model.load_state_dict(raw_sd, strict=True)
+            print(f"  Loaded 224×224 JEPA from state_dict at {sd_candidate}")
+            model = model.to(device).eval()
+            for p in model.parameters():
+                p.requires_grad_(False)
+            return model
+
+        # No state_dict.pt — fall back to AutoCostModel, stubbing CostShim
+        # in __main__ to avoid pickle AttributeError.
+        import __main__ as _main
+        if not hasattr(_main, "CostShim"):
+            import torch.nn as _nn
+            class _CostShimCompat(_nn.Module):
+                pass
+            _main.CostShim = _CostShimCompat
         model = swm.policy.AutoCostModel(ckpt_path)
         print(f"  Loaded 224×224 JEPA via AutoCostModel from {ckpt_path}")
         model = model.to(device).eval()
@@ -1157,7 +1202,20 @@ def main():
         env_name      = 'swm/OGBCube-v0'
         goal_info_key = 'target'
         print(f"Creating {env_name} environment (native 224x224 rendering)...")
-        env = gymnasium.make(env_name, ob_type='pixels', env_type='single', visualize_info=False)
+        # stable_worldmodel's CubeEnv references colors not in ogbench's _colors dict.
+        import ogbench.manipspace.envs.manipspace_env as _ms_env
+        _orig_ms_init = _ms_env.ManipSpaceEnv.__init__
+        def _patched_ms_init(self, *a, **kw):
+            _orig_ms_init(self, *a, **kw)
+            self._colors.setdefault('yellow',        np.array([1.0,  0.93, 0.0,  1.0]))
+            self._colors.setdefault('magenta',       np.array([0.9,  0.2,  0.6,  1.0]))
+            self._colors.setdefault('lightyellow',   np.array([1.0,  0.98, 0.8,  1.0]))
+            self._colors.setdefault('lightmagenta',  np.array([0.98, 0.85, 0.92, 1.0]))
+        _ms_env.ManipSpaceEnv.__init__ = _patched_ms_init
+        import stable_worldmodel.envs.ogbench.cube_env as _swm_cube
+        _swm_cube.CubeEnv.compute_reward = lambda self, *a, **kw: 0.0
+        env = gymnasium.make(env_name, ob_type='pixels', env_type='single',
+                             visualize_info=False, disable_env_checker=True)
     task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
     num_tasks  = len(task_infos)
     print(f"  {num_tasks} predefined tasks: {[t.get('task_name','?') for t in task_infos]}")
@@ -1223,7 +1281,8 @@ def main():
     is_hiql_baseline = (has_goal_rep and not is_hiql_endtoend
                         and 'baseline' in str(ckpt_dir).lower())
     is_hiql_wgsp     = (has_goal_rep and not is_hiql_endtoend
-                        and 'wgsp' in str(ckpt_dir).lower()
+                        and ('wgsp' in str(ckpt_dir).lower()
+                             or 'grpo' in str(ckpt_dir).lower())
                         and not is_hiql_flow and not is_hiql_baseline)
     is_hiql_lewm_v2  = (has_goal_rep and not is_hiql_endtoend and not is_hiql_baseline
                         and not is_hiql_wgsp and not is_hiql_flow)
@@ -1472,14 +1531,19 @@ def main():
                   f"(goal_dim={inferred_goal_dim})")
 
         hl_model = _HIQLBaselineHighLevelWrapper(hl_actor_net)
+        # native_eval path reshapes ll_out to (1, 5) so it only works for 5D LL.
+        # For 25D LL (use_decoder=False training) use the chunked path which
+        # consumes the 25D output directly.
+        _wgsp_native_eval = (ll_out_dim == 5)
         policy = _WGSPHierarchicalPolicy(
             jepa_model, ll_actor, action_scaler, hl_model,
             gap=subgoal_steps, device=device, decoder=decoder,
             subgoal_reached_threshold=0.0, latent_adapter=wgsp_adapter,
-            native_eval=True,
+            native_eval=_wgsp_native_eval,
         )
-        print(f"  Policy: WGSP Hierarchical native-eval (k={subgoal_steps}, rep_dim={rep_dim}, "
-              f"policy_dim={policy_dim})")
+        print(f"  Policy: WGSP Hierarchical "
+              f"{'native' if _wgsp_native_eval else 'chunked'}-eval "
+              f"(k={subgoal_steps}, rep_dim={rep_dim}, policy_dim={policy_dim})")
 
     elif is_hiql_lewm_v2:
         # ── LeWM-hybrid HIQL with HER + 10D goal_rep (train_hiql_lewm.py) ────

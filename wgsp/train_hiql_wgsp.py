@@ -837,6 +837,9 @@ def hl_wgsp_step(z_t, g_ult,
             'w_hl':        w_hl.detach(),
             'u_ll':        u_ll.detach(),
             'B': B, 'N': N, 'M': M, 'k': k,
+            # FMQ-WGSP: best candidate selection
+            'rep_cand':    rep_cand.detach(),     # [B, N, rep_dim]
+            'J_per_rep':   J_per_rep.detach(),    # [B, N]
         }
         if v_diag is not None:
             out['v_diag'] = {k: v.detach() for k, v in v_diag.items()}
