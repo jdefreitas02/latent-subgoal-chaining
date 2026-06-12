@@ -46,13 +46,18 @@ def convert(input_path: str, output_path: str, chunk_episodes: int = 50) -> None
     terminals    = data["terminals"]      # (N,)            bool
     qpos         = data["qpos"]           # (N, qpos_dim)   float32
     qvel         = data["qvel"]           # (N, qvel_dim)   float32
+    # scene / puzzle datasets also carry per-step button_states (N, num_buttons);
+    # they are required to faithfully re-render those envs at 224 (set_state needs them).
+    button_states = data["button_states"] if "button_states" in data.files else None
     N = observations.shape[0]
     H, W        = observations.shape[1], observations.shape[2]
     action_dim  = actions.shape[1]
     qpos_dim    = qpos.shape[1]
     qvel_dim    = qvel.shape[1]
+    btn_dim     = button_states.shape[1] if button_states is not None else 0
     print(f"  Loaded {N:,} frames in {time.time()-t0:.1f}s")
-    print(f"  Image: {H}×{W}  action_dim={action_dim}  qpos_dim={qpos_dim}  qvel_dim={qvel_dim}")
+    print(f"  Image: {H}×{W}  action_dim={action_dim}  qpos_dim={qpos_dim}  qvel_dim={qvel_dim}"
+          + (f"  button_dim={btn_dim}" if button_states is not None else "  (no button_states)"))
 
     # --- Episode boundaries from terminals ---
     term_indices = np.where(terminals)[0]              # last step of each episode
@@ -86,6 +91,9 @@ def convert(input_path: str, output_path: str, chunk_episodes: int = 50) -> None
                                      dtype=np.float32, chunks=(4096, qpos_dim))
         qvel_ds   = f.create_dataset("qvel",   shape=(N, qvel_dim),
                                      dtype=np.float32, chunks=(4096, qvel_dim))
+        btn_ds    = (f.create_dataset("button_states", shape=(N, btn_dim),
+                                      dtype=np.int64, chunks=(4096, btn_dim))
+                     if button_states is not None else None)
 
         ep_chunk = chunk_episodes
 
@@ -100,6 +108,8 @@ def convert(input_path: str, output_path: str, chunk_episodes: int = 50) -> None
             action_ds[row_start:row_end] = actions     [row_start:row_end]
             qpos_ds  [row_start:row_end] = qpos        [row_start:row_end]
             qvel_ds  [row_start:row_end] = qvel        [row_start:row_end]
+            if btn_ds is not None:
+                btn_ds[row_start:row_end] = button_states[row_start:row_end]
 
             pct = end_ep / num_eps * 100
             print(f"  {end_ep}/{num_eps} episodes ({pct:.0f}%)", end="\r", flush=True)
@@ -117,6 +127,8 @@ def convert(input_path: str, output_path: str, chunk_episodes: int = 50) -> None
         print(f"  action:    {f['action'].shape}  dtype={f['action'].dtype}")
         print(f"  qpos:      {f['qpos'].shape}  (qpos_dim={qpos_dim})")
         print(f"  qvel:      {f['qvel'].shape}  (qvel_dim={qvel_dim})")
+        if "button_states" in f:
+            print(f"  button_states: {f['button_states'].shape}  (btn_dim={btn_dim})")
         # Sample a random frame to confirm round-trip integrity
         idx = 12345
         orig = observations[idx]

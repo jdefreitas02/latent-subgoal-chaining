@@ -53,6 +53,10 @@ def _load_ogbench_singletask_dataset(task_id, hdf5_path=None, env_family="cube-s
         qpos     = f["qpos"][...].astype(np.float32)      # (N, 21)
         ep_len   = f["ep_len"][...].astype(np.int64)      # (n_eps,)
         ep_offset = f["ep_offset"][...].astype(np.int64)  # (n_eps,)
+        # scene / puzzle relabeling needs button_states (drawer/window/button
+        # success terms); preserved in the 224 HDF5 by convert/refilm.
+        button_states = (f["button_states"][...].astype(np.int64)
+                         if "button_states" in f else None)
 
     # Build flat terminals array: last frame of each episode = 1
     n_total = actions.shape[0]
@@ -64,6 +68,8 @@ def _load_ogbench_singletask_dataset(task_id, hdf5_path=None, env_family="cube-s
     env_name = f"{env_family}-singletask-task{task_id}-v0"
     env = gymnasium.make(env_name)
     ds = {"actions": actions, "qpos": qpos, "terminals": terminals}
+    if button_states is not None:
+        ds["button_states"] = button_states
     ogbench.relabel_utils.relabel_dataset(env_name, env, ds)
     env.close()
 
