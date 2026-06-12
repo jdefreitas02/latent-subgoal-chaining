@@ -1,7 +1,7 @@
 \documentclass[a4paper, twoside]{report}
 
 %% Language and font encodings
-\usepackage[english]{babel}
+\usepackage[british]{babel}
 \usepackage[utf8x]{inputenc}
 \usepackage[T1]{fontenc}
 
@@ -15,41 +15,79 @@
 \usepackage{algorithm}
 \usepackage{algpseudocode}
 \usepackage{booktabs}
+\usepackage{multirow}
 \usepackage[colorinlistoftodos]{todonotes}
 \usepackage[colorlinks=true, allcolors=blue]{hyperref}
 
-\title{Leveraging Latent World Models for Offline Goal-Conditioned Reinforcement Learning}
+\title{Leveraging Latent World Models for Offline Reinforcement Learning}
 \author{Jorge de Freitas}
 % Update supervisor and other title stuff in title/title.tex
 
 \begin{document}
+\pagenumbering{roman}
 \input{title/title.tex}
 
 \begin{abstract}
-Your abstract goes here
+
+Offline reinforcement learning can learn effective policies from fixed datasets, but its performance is ultimately limited by the coverage of the collected data. Latent action-conditioned world models offer a potential way to plan and improve policies without further real-environment interaction, but it remains unclear when their predictions provide useful signal and when model error instead harms learning.
+
+On the OGBench benchmark suite, we evaluate a progression of uses: replacing real environment interaction during online fine-tuning, restricting the model to short-horizon decision-time planning, using planner-generated actions and transitions as training signal, and transferring the same proposal-and-score mechanism to hierarchical subgoal selection.
+Our results show that directly replacing the environment with a learned model consistently degrades performance, with evidence suggesting that compounding prediction errors and corruption of value-learning targets are major contributing factors. In contrast, short-horizon planning with learned model dynamics remains effective, improving decision-making while limiting exposure to accumulated model error.
+Building on this observation, we introduce a model-based policy improvement method that performs an entire online phase inside learned model dynamics while keeping the offline-trained critic fixed. In the standalone no-planner setting, the resulting policy achieves a final success rate of $90.7 \pm 0.8\%$ and a peak success rate of $94.8 \pm 0.7\%$ on the \texttt{cube-single} benchmark. Relative to the corresponding offline baseline success rates ($81.6\%$ and $88.0\%$), these represent improvements of $11.2\%$ and $7.7\%$, respectively, without any additional real-environment interaction.
+In this thesis, we find that frozen latent action-conditioned world models are most reliable as short-horizon proposal mechanisms grounded by offline critics, rather than as direct substitutes for the environment.
+
 \end{abstract}
 
 \renewcommand{\abstractname}{Acknowledgements}
 \begin{abstract}
-Thanks mum!
+I would first like to thank my supervisor, Christos Ziakas, who went above and beyond all expectations throughout this project. Many of the ideas in this thesis came from our brainstorming sessions, and I am extremely grateful for the time, guidance, and encouragement he gave me along the way. His enthusiasm and support helped shape the project into something I am proud of. I am also grateful to Nuri Cingillioglu for serving as second marker.
+
+I would also like to thank my family for their love, encouragement, and support, not just during this project but throughout my entire time at Imperial. They have supported me through every challenge, celebrated every success, and helped me keep going when things felt difficult. Thank you for everything, I would not be here today without you.
+
+I am also thankful to my friends for making my time at Imperial such a fun and memorable one. We made many great memories over the years, and got through the difficult times together. Finally, I would like to thank my girlfriend, Delilah, for listening to all my struggles and helping me stay positive. Your support, patience, and interest in what I was working on made such a difference, so thank you.
 \end{abstract}
 
 \tableofcontents
-\listoffigures
-\listoftables
+% \listoffigures
+% \listoftables
 
+\chapter*{Notation}
+\addcontentsline{toc}{chapter}{Notation}
+\noindent
+The following notation is used throughout the thesis. Where a chapter
+needs to distinguish particular parameter sets, the relevant symbols are
+given local subscripts.
+
+\medskip
+
+\noindent
+\begin{tabular}{ll}
+$s \in \mathcal S$ & observation \\
+$z,z'\in\mathcal Z$ & latent states \\
+$g\in\mathcal Z$ & latent goal state \\
+$a\in\mathcal A$ & action \\
+$\pi(a|z,g)$ & goal-conditioned policy \\
+$Q(z,g,a)$ & action-value function \\
+$V(z,g)$ & state-value function \\
+$f_\psi(z,a)$ & latent dynamics predictor \\
+$E_\xi(s)$ & encoder mapping observations to latent states \\
+\end{tabular}
+
+\cleardoublepage
+\pagenumbering{arabic}
 \input{introduction/introduction.tex}
 \input{background/background.tex}
 \input{foundations/foundations.tex}
 \input{wm-as-env/wm-as-env.tex}
+\input{wm-as-planner/wm-as-planner.tex}
+\input{mpc-distillation/mpc-distillation.tex}
 \input{wm-as-subgoal/wm-as-subgoal.tex}
-\input{online-with-wm/online-with-wm.tex}
 \input{evaluation/evaluation.tex}
 \input{conclusion/conclusion.tex}
 
 \bibliographystyle{vancouver}
 \bibliography{bibs/sample}
-
+\input{declarations/declarations}
 \input{appendix/appendix.tex}
 
 \end{document}

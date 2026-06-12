@@ -1,0 +1,371 @@
+\chapter{World Model as Data Generator}
+\label{chap:mpc-distillation}
+
+\section{Motivation}
+\label{sec:mpcd-motivation}
+
+Chapter~\ref{chap:wm-planner} defined planners that use the world model
+only at inference time. This keeps model use local and critic-guided, but
+it also means that the final policy still depends on test-time search.
+This raises a natural question: can the behaviour of the planner be
+\emph{absorbed into the policy itself}, so that the final agent
+executes at the same level without requiring any online search,
+simulation, or test-time optimisation?
+Instead of treating the world model as an external decision-time module,
+we use it to generate supervision during training, transferring MPC
+improvements into the actor so that planning becomes implicit in the
+policy parameters.
+
+We explore three progressively more integrated formulations. The
+first is a static relabel-and-train pipeline
+(\S\ref{sec:mpcd-offline}), where MPC is run once to generate a fixed
+dataset of improved actions. The second is an interleaved procedure
+(\S\ref{sec:mpcd-interleaved}), where MPC labels and policy updates
+are continuously refreshed as training proceeds. The third is a full
+online phase inside the world model
+(\S\ref{sec:mpcd-online-wm}), where both MPC-generated actions and
+world-model-imagined transitions are injected into the replay buffer,
+creating generated transition data for continued training.
+Across these variants, the central design question is where WM-derived
+information enters learning: only as fixed labels, as periodically
+updated supervision, or as full synthetic interaction data.
+
+% ---------------------------------------------------------------------
+\section{Offline Policy Learning from MPC-Generated Actions}
+\label{sec:mpcd-offline}
+
+We begin with the simplest way of converting inference-time gains into
+training data: run MPC once over the offline dataset, then train the
+policy to imitate the resulting actions.
+
+\paragraph{Phase A --- relabel.}
+For every latent state $z \in \mathcal{Z}_{\text{off}}$, we compute a
+corresponding improved action chunk $\mathbf{a}^{\text{MPC}}(z)$ by
+running Grad-MPC with parameters $N = 32$, $H = 2$, $K = 5$,
+$\eta = 0.01$, and Q-term scoring, using the fully trained actor,
+critic, and world model.
+This produces a fixed relabelled dataset in which each state is paired
+with an action that is locally improved according to the planner.
+
+\paragraph{Phase B --- train.}
+The BC-flow actor is then trained on these relabelled pairs
+$(z, \mathbf{a}^{\text{MPC}})$ using the standard flow-matching loss
+from Eq.~\eqref{eq:bc-flow-bg}. During this phase, both the critic
+and the original network heads are frozen; only the actor is
+updated. Training uses AdamW with learning rate $10^{-4}$, weight
+decay $10^{-4}$, batch size $256$, for $10^5$ gradient steps.
+
+\paragraph{Phase C --- evaluate.}
+After training, the policy can be evaluated directly, or
+used again as the proposal distribution inside MPC (BoN, Grad-MPC, or
+FMQ), without requiring any additional training.
+
+\paragraph{Limitations of static action relabelling.}
+The main limitation is that the relabelled dataset is generated from a
+fixed actor and critic, and therefore reflects a single snapshot of the
+optimisation process.
+As training progresses, the policy shifts away from the behaviour that
+generated the labels, and the frozen relabelling critic cannot improve
+the scoring function that defines $\mathbf{a}^{\text{MPC}}$. The
+supervision signal therefore becomes stale, limiting continued training.
+The next section addresses this by making MPC relabelling part of the
+training loop itself.
+
+% ---------------------------------------------------------------------
+\section{Interleaved Policy Learning from MPC-Generated Actions}
+\label{sec:mpcd-interleaved}
+
+The key limitation of static relabelling is that MPC labels are computed
+only once, even though they depend on the actor that proposes actions
+and the critic that scores them. A more consistent approach is therefore
+to recompute labels periodically as both networks evolve.
+
+\paragraph{Mechanism.}
+We maintain a buffer $\mathcal{B}_{\text{MPC}}$ of relabelled
+transitions $(z, \mathbf{a}^{\text{MPC}}(z))$. After an initial warm-up
+period of $T_{\text{warm}}$ steps, this buffer is refreshed every
+$T_{\text{relabel}}$ gradient updates by sampling states from the
+offline dataset and recomputing their MPC actions using the current
+actor and critic.
+During training, each minibatch is formed by mixing real offline
+samples with relabelled MPC samples. Specifically, a fraction of each
+batch is replaced with entries from $\mathcal{B}_{\text{MPC}}$, and
+the standard FQL update is applied to the combined batch.
+
+\paragraph{What the critic sees.}
+Importantly, the replacement affects only the state-action pairs. The
+rewards and next states remain those of the original offline
+transition. Thus, the critic is updated on tuples of the form
+$(z, \mathbf{a}^{\text{MPC}}, r, z')$, where $r$ and $z'$ correspond
+to the environment transition induced by the original action, not the
+MPC action.
+In practice, this mismatch is often small because MPC actions remain
+close to the behaviour policy due to local refinement. However, it is
+conceptually important: the critic is being trained on transitions
+that did not actually occur. The fully online variant in
+\S\ref{sec:mpcd-online-wm} removes this inconsistency entirely.
+
+\paragraph{Critic update.}
+We compare an actor-only variant with a critic-update variant. In the
+actor-only setting, MPC labels are used only for an additional policy
+loss, while the critic continues to see the original offline actions. In
+the critic-update setting, MPC-labelled actions are also inserted into
+critic batches. This tests whether the actor can benefit from planner
+labels when the critic has never been calibrated on the same action
+distribution.
+
+\paragraph{Grad-MPC vs FMQ labels.}
+The relabelling procedure can use either Grad-MPC or FMQ. Grad-MPC
+produces strong improvements but can introduce noisy action updates due
+to iterative optimisation. FMQ produces more stable and structured
+updates by constraining refinement to a trust region.
+The Grad-MPC and FMQ relabelling results are reported in
+\S\ref{sec:exp-mpc-interleaved-grad}--\ref{sec:exp-fmq-distil-inf}
+(Tables~\ref{tab:mpc-interleaved-grad}, \ref{tab:mpc-relabel-sweep},
+and~\ref{tab:mpc-fmq-distilled}), with the full hyperparameter sweep in
+Appendix~\ref{app:oo-sweeps}. The next section removes the remaining
+real-transition inconsistency by generating the successor state with the
+same world model used for action selection.
+
+\begin{algorithm}[h]
+\caption{Interleaved training with MPC-generated actions.}
+\label{alg:mpc-interleaved}
+\begin{algorithmic}[1]
+\Require offline dataset $\mathcal{D}_{\text{off}}$, FQL agent $(\pi_\theta, Q_\phi)$, frozen WM $f_\psi$, hyperparameters $T_{\text{warm}}$, $T_{\text{relabel}}$, buffer size $|\mathcal{B}_{\text{MPC}}|$, mix ratio $p$, label generator $\mathcal{M} \in \{\text{Grad-MPC},\, \text{FMQ}\}$.
+\State $\mathcal{B}_{\text{MPC}} \leftarrow \emptyset$.
+\For{$\text{step} = 1, \dots, T_{\text{total}}$}
+    \If{$\text{step} \ge T_{\text{warm}}$ \textbf{and} $\text{step} \bmod T_{\text{relabel}} = 0$}
+        \State Sample $|\mathcal{B}_{\text{MPC}}|$ states from $\mathcal{D}_{\text{off}}$.
+        \State For each $z$, set $\mathbf{a}^{\text{MPC}}(z) \leftarrow \mathcal{M}(z;\,\pi_\theta,\,Q_\phi,\,f_\psi)$ using Grad-MPC (\S\ref{sec:mpc-grad}) or FMQ (Alg.~\ref{alg:mpc-fmq}).
+        \State $\mathcal{B}_{\text{MPC}} \leftarrow \{(z,\,\mathbf{a}^{\text{MPC}}(z))\}$; reset the actor-only optimiser state.
+    \EndIf
+    \State Sample minibatch $B$ from $\mathcal{D}_{\text{off}}$.
+    \If{$\mathcal{B}_{\text{MPC}} \ne \emptyset$}
+        \State Sample $\lfloor pB \rfloor$ pairs from $\mathcal{B}_{\text{MPC}}$ and overwrite the first $\lfloor pB \rfloor$ rows of $B$'s observations and actions.
+    \EndIf
+    \State Update $(\pi_\theta, Q_\phi)$ on $B$ with the standard FQL critic and actor losses.
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------
+\section{Actor Fine-Tuning with World-Model Transitions}
+\label{sec:mpcd-online-wm}
+
+All methods in this chapter so far use the world model either as a
+planning tool (Chapter~\ref{chap:wm-planner}) or as a way to relabel
+actions in an otherwise real-data training loop
+(\S\S\ref{sec:mpcd-offline}--\ref{sec:mpcd-interleaved}). In both cases,
+the replay buffer remains grounded in real environment transitions.
+This section goes a step further: rather than relabelling actions, we
+use the world model to \emph{generate the transitions themselves}, so
+that the agent effectively performs offline-to-online reinforcement
+learning entirely within the learned dynamics.
+This is close to the setting of Chapter~\ref{chap:wm-env}, but with two
+additional constraints: actions are selected by a critic-scored MPC
+controller, and successor states are generated by the same
+action-conditioned model used in the rollout. The design therefore tests
+whether synthetic transitions are more useful when action selection and
+successor generation are kept consistent.
+
+\paragraph{From action relabelling to full transition synthesis.}
+The interleaved method (\S\ref{sec:mpcd-interleaved}) still relies on
+the latents from real transitions: it modifies the action in a stored tuple but keeps the
+original successor $z'$. This creates a subtle inconsistency: the critic
+is trained on tuples of the form
+\[
+(z,\, \mathbf{a}^{\text{MPC}},\, r,\, z'),
+\]
+where $z'$ corresponds to the behaviour action $\mathbf{a}$, not the
+MPC action $\mathbf{a}^{\text{MPC}}$. The approach works because MPC
+keeps $\mathbf{a}^{\text{MPC}}$ close to $\mathbf{a}$, but it does not
+represent a true transition under the modified action.
+
+We remove this inconsistency by constructing transitions entirely inside
+the world model. Starting from a real initial latent, we use FMQ-MPC to
+select an action chunk $\mathbf{a}^{\text{MPC}}$ and then execute it in
+the world model:
+\[
+z'_\psi = f_\psi(z, \mathbf{a}^{\text{MPC}}).
+\]
+We assign a sparse task reward in latent space,
+\[
+r_\psi = \mathbb{1}\{\lVert z'_\psi - z_{\text{goal}}\rVert < \delta\},
+\]
+and obtain a fully self-consistent synthetic transition
+\[
+(z,\, \mathbf{a}^{\text{MPC}},\, r_\psi,\, z'_\psi).
+\]
+These transitions are added to a replay buffer seeded with offline data,
+and training proceeds as in standard FQL.
+The key change is that the successor state is no longer inherited from
+the dataset: it is now generated by the same dynamics model that
+produced the action-conditioned rollout.
+
+\paragraph{Constraints.}
+At first sight, this procedure appears to reintroduce exactly the risks
+identified in Chapter~\ref{chap:wm-env}. It is therefore constrained in
+two ways.
+First, actions are not arbitrary model rollouts but are selected by an
+offline-trained critic through MPC. This means the model is only queried
+along trajectories that the critic already assigns high value under real
+data, effectively restricting synthetic transitions to regions close to
+the data manifold.
+Second, the world model is only used over short horizons inside MPC
+($H=2$), where empirical drift remains limited (\S\ref{sec:wm-drift}).
+Thus, the model is never required to produce long-horizon consistency,
+only locally plausible one-step transitions under curated actions.
+
+\paragraph{Training regimes.}
+We evaluate two variants that differ only in whether the critic is
+updated on synthetic transitions.
+In the \emph{full update} variant, the critic performs standard FQL
+updates on the mixed buffer. This tests whether imagined successors can
+safely enter Bellman targets.
+In the \emph{frozen critic} variant, the offline-trained critic is kept
+fixed throughout the online phase and only used for (i) MPC scoring and
+(ii) supervision of the BC-flow actor. This removes value
+bootstrapping on imagined transitions. The full comparison is reported
+in \S\ref{sec:exp-mpc-online-wm}
+(Table~\ref{tab:mpc-online-e2}).
+
+\paragraph{Effect of reintroducing planning at test time.}
+We also evaluate whether applying MPC on top of the trained actor still
+helps. This checks whether the actor has absorbed the planner's local
+improvement signal or whether test-time search remains necessary.
+
+% ---------------------------------------------------------------------
+\section{Goal-Conditioned Actor Fine-Tuning with World-Model Transitions}
+\label{sec:mpcd-gc}
+
+The single-task setting isolates the online-in-WM loop, but it is also
+favourable because the agent only needs to cover one narrow goal
+distribution. In the goal-conditioned setting, the policy must represent
+a much larger state-goal space, so world-model-driven data collection is
+more likely to reduce coverage.
+This section evaluates whether the same frozen-critic online-in-WM
+procedure from \S\ref{sec:mpcd-online-wm} transfers to the
+five-task goal-conditioned setting.
+
+\paragraph{Setup.}
+The underlying algorithm is unchanged from
+\S\ref{sec:mpcd-online-wm}: FMQ-MPC is used to select actions inside
+the world model, the replay buffer is augmented with imagined
+transitions, and the critic is frozen so that only the BC-flow actor
+is updated.
+Three modifications define the goal-conditioned version. First, the
+observation is augmented to include the goal embedding:
+$[z, z_{\text{goal}}]$. Second, training is performed jointly across a
+set of related goal-conditioned tasks rather than a single task. Third,
+rewards follow the HIQL HER-style indicator formulation used in the
+offline goal-conditioned baseline.
+The pure offline goal-conditioned FQL checkpoint serves as the main
+reference point for evaluating whether online-in-WM training provides
+additional benefit.
+
+\paragraph{HER inside the online-in-WM loop.}
+During the online phase, goals can be sampled in two ways.
+The default setting uses evaluation goals directly (``eval-goals''),
+meaning that the same goal distribution appears both during training
+and evaluation. While effective, this introduces a mild evaluation
+leakage, since the agent is repeatedly trained on the exact goals it
+will later be tested on.
+To address this, we also evaluate a hindsight relabelling (HER)
+variant \cite{her}, where goals are sampled from achieved states in
+previous trajectories. Concretely, each rollout can be relabelled by
+treating a future achieved state as the goal, and training goals are
+drawn from a buffer of achieved states rather than the evaluation goal
+set. In the indicator-reward setting, HER only modifies the goal
+argument; the underlying transitions remain unchanged.
+Algorithm~\ref{alg:owm-gc} summarises the full procedure.
+
+\begin{algorithm}[h]
+\caption{Goal-conditioned online-in-WM with HER. The single-task
+controller of \S\ref{sec:mpcd-online-wm} is the special case in
+which the goal is fixed across the entire online phase and the HER
+relabelling step is skipped.}
+\label{alg:owm-gc}
+\begin{algorithmic}[1]
+\Require offline GC checkpoint $(\pi_\theta, Q_\phi)$, frozen WM $f_\psi$, replay buffer $\mathcal{D}_{\text{off}}$ seeded with the offline transitions, achieved-state buffer $\mathcal{G}$, goal source $\mathcal{S} \in \{\text{eval}, \text{random achieved}\}$.
+\State Freeze the critic $Q_\phi$.
+\For{$\text{step} = 1, \dots, T_{\text{online}}$}
+    \State Sample initial latent $z_0 \sim \mathcal{D}_{\text{off}}$ and goal $g \sim \mathcal{S}$ (or $g \sim \mathcal{G}$ for HER).
+    \State Roll out: at each WM step $h$, $\mathbf{a}_h \leftarrow \text{FMQ-MPC}(z_h \oplus g)$ and $z_{h+1} \leftarrow f_\psi(z_h, \mathbf{a}_h)$.
+    \State Compute reward $r_h = r_h^{\text{HIQL}}(z_{h+1}, g)$.
+    \State Append $(z_h \oplus g,\, \mathbf{a}_h,\, r_h,\, z_{h+1} \oplus g)$ to $\mathcal{D}_{\text{off}}$ and store $z_{h+1}$ in $\mathcal{G}$.
+    \State Sample minibatch from $\mathcal{D}_{\text{off}}$, take an actor-only gradient step with $Q_\phi$ frozen.
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+The main limiting factor appears to be a combination of reduced
+coverage and distributional drift. First, the FMQ-MPC controller
+induces a narrow visitation distribution inside the world model, which
+progressively biases the online buffer away from the broader
+state-action coverage present in the offline data. Second, the
+goal-conditioned observation space effectively increases dimensionality
+relative to the single-task case, meaning that a fixed number of online
+steps explores a smaller fraction of the relevant space.
+
+A useful consistency check arises when comparing with the single-task
+setting. There, critic updates on imagined transitions are a risky
+design choice because the offline and generated data use different
+reward scales. In the goal-conditioned setting, both offline and online
+data share the same HIQL-style indicator reward convention, so the same
+ablation tests whether critic updates remain fragile once the reward
+scale is aligned. The corresponding results are reported in
+\S\ref{sec:exp-mpc-online-wm-gc} (Table~\ref{tab:mpc-online-e3}).
+
+\section{Static Dataset Generation with World Model}
+\label{sec:mpcd-dataset-gen}
+
+The online-in-WM method of \S\ref{sec:mpcd-online-wm} uses the world
+model continuously during training: at every step it generates one MPC
+transition, appends it to the replay buffer, and immediately updates
+the policy. A natural alternative is to remove this coupling entirely
+and use the world model only once, as a static generator of a dataset
+that is then used for standard offline training.
+This section evaluates whether such a decoupled use of the world model
+can reproduce the benefits of online-in-WM training without requiring
+any further interaction with the model during learning.
+
+\paragraph{Experimental design.}
+We construct two synthetic datasets using the frozen GC checkpoint from
+\S\ref{sec:mpcd-gc}, each consisting of full trajectories:
+
+\begin{itemize}
+    \item \emph{FMQ rollout}: trajectories are generated by running
+    FMQ-MPC inside the world model. At each step, FMQ selects the
+    action, and the world model produces the successor state. The goal
+    is used only for action selection and is not stored in the dataset.
+
+    \item \emph{BoN rollout}: identical, but without FMQ refinement.
+    Actions are taken directly from the best-of-$N$ candidate set
+    produced by the BC-flow actor.
+\end{itemize}
+
+Both datasets are matched in size and episode structure to the original
+offline play dataset (maximum horizon 40 or goal completion). As a
+control, we also evaluate the original play dataset under the same HER
+goal relabelling procedure, ensuring that all datasets are processed
+with identical goal construction at training time.
+
+\paragraph{Evaluation question.}
+This experiment tests whether world-model-generated data remains useful
+when data generation is decoupled from the learner. In online-in-WM
+training, the current actor is repeatedly updated on the same type of
+planner-improved actions it helps generate. In the static setting, a
+fresh learner receives a fixed corpus generated by another policy and
+critic. The comparison is reported in \S\ref{sec:exp-wm-dataset-gen}
+(Table~\ref{tab:wm-dataset-gen}).
+% ---------------------------------------------------------------------
+\section{Summary}
+\label{sec:mpcd-discussion}
+
+This chapter defined three ways of turning planner improvements into
+training signal: fixed MPC labels, periodically refreshed MPC labels,
+and full online fine-tuning inside the world model. The key distinction
+is how tightly generated data remains coupled to the current actor and
+critic. The detailed results are reported in
+\S\S\ref{sec:exp-mpc-interleaved-grad}--\ref{sec:exp-wm-dataset-gen} and
+summarised in \S\ref{sec:exp-headline}.

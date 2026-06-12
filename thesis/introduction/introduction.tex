@@ -1,27 +1,114 @@
 \chapter{Introduction}
 
 \section{Motivation}
-A defining trend in modern machine learning is the rise of general-purpose models trained using self-supervised objectives on large-scale, unlabelled datasets \cite{ogbench_park2025}. This paradigm has proven highly effective, largely because unannotated data is abundant and inexpensive to collect, enabling models to scale without the bottleneck of manual labelling. In contrast, reinforcement learning (RL) has traditionally relied on a very different paradigm: agents learn through interaction with an environment, guided by carefully designed, task-specific reward functions. This reliance on online interaction makes RL both computationally expensive and difficult to deploy safely in real-world settings such as robotics, where exploration can be costly or even dangerous.
+A defining trend in modern machine learning is the rise of
+general-purpose models trained using self-supervised objectives on
+large-scale, unlabelled datasets. This paradigm has proven highly
+effective largely because unannotated data is abundant and
+inexpensive to collect, enabling models to scale without the
+bottleneck of manual labelling
+\cite{devlin2019bertpretrainingdeepbidirectional, chen2020simpleframeworkcontrastivelearning, he2021maskedautoencodersscalablevision}.
+However, learning from fixed datasets is ultimately limited by the range
+and quality of the data that has already been collected; continued
+progress may therefore require agents to acquire new experience through
+interaction rather than only consuming static human-generated data
+\cite{SilverSutton2025}. In contrast, reinforcement learning
+has traditionally relied on a different paradigm: agents learn
+through interaction with an environment, guided by carefully
+designed reward functions \cite{sutton2018reinforcement}. This reliance on online interaction
+makes RL both computationally expensive and difficult to deploy
+safely in real-world settings such as robotics, where exploration
+can be costly \cite{kober2013reinforcement,dulacarnold2019challengesrealworldreinforcementlearning}.
 
-Offline reinforcement learning offers a promising alternative by learning entirely from previously collected datasets, avoiding the need for further interaction. Within this setting, goal-conditioned reinforcement learning (GCRL) provides a natural framework for learning general-purpose behaviours. The idea of learning to achieve multiple goals has long been studied in RL \cite{Kaelbling1993LearningTA} and was later formalised through architectures such as Universal Value Function Approximators \cite{pmlr-v37-schaul15}; offline GCRL builds on these ideas by training agents to reach arbitrary states using static datasets of past experience \cite{ogbench_park2025}. Despite this conceptual simplicity, learning to reach goals from offline data is challenging in practice: in long-horizon, continuous-control tasks, reward signals are often sparse, and offline learning suffers from the distribution shift between the behaviour policy that generated the data and the policy that is being learned.
+Offline reinforcement learning offers an alternative by learning
+entirely from previously collected datasets, avoiding the need for
+further interaction. Within this setting, goal-conditioned
+reinforcement learning provides a natural framework for learning
+general-purpose behaviours: train an agent on a static dataset of
+past experience and ask it to reach arbitrary states at evaluation
+\cite{Kaelbling1993LearningTA, pmlr-v37-schaul15, ogbench_park2025}.
+The conceptual simplicity is appealing, but in practice the task is hard:
+reward signals in long-horizon continuous-control tasks are sparse,
+and offline learning suffers from the distribution shift between
+the behaviour policy that generated the data and the policy that
+is being learned \cite{levine2020offlinereinforcementlearningtutorial}.
 
-Model-based reinforcement learning offers a potential solution. By learning a model of the environment dynamics, an agent can simulate future trajectories and plan using imagined rollouts \cite{ha2018worldmodels, hafner2020dreamer, hafner2025dreamerv4}. The most direct version of this idea uses a learned latent world model in place of additional environment interaction. How effective that substitution is in practice --- across goal-conditioned and single-task offline RL, across different training-time and inference-time uses of the model --- is the question this thesis tries to answer.
+Model-based RL offers a potential solution. By learning a model
+of the environment dynamics, an agent can simulate future
+trajectories and plan using imagined rollouts
+\cite{ha2018worldmodels, hafner2020dreamer, hafner2025dreamerv4}.
+The most direct version of this idea uses a learned latent world model
+in place of additional environment interaction. Prior work has shown
+that learned models can support policy learning through imagined
+rollouts, offline model-based optimisation, and value-guided planning
+\cite{ha2018worldmodels, hafner2020dreamer, yu2020mopomodelbasedofflinepolicy, hansen2022temporaldifferencelearningmodel}.
+However, how reliably a frozen latent world model can provide useful
+training or planning signals in offline RL remains an open research
+question, particularly when the model is used beyond short-horizon
+prediction. This thesis addresses that question by evaluating a single
+frozen world model across several uses in single-task and
+goal-conditioned offline reinforcement learning.
 
-\section{Thesis question}
+\section{Thesis Question}
 
-We test different ways to apply a single frozen latent world model (LeWM, \S\ref{sec:lewm-bg}) to offline reinforcement learning, in both goal-conditioned and single-task settings. The world model is asked to play three roles, and the methodology chapters are organised by which role they pursue:
+This thesis investigates a central question:
+
+\begin{quote}
+\emph{How can a frozen latent world model be used to improve offline reinforcement learning, and under what conditions are its predictions reliable enough to provide useful training or planning signals?}
+\end{quote}
+
+To answer this question, we study the use of a latent action-conditioned world model across several roles. In each case, the same underlying offline RL agent is used, allowing differences in performance to be attributed to how the world model is integrated rather than to changes in the reinforcement learning algorithm itself.
+
+The world model is evaluated in four settings:
+
 \begin{itemize}
-    \item As a \emph{training-time environment substitute} (Chapter~\ref{chap:wm-as-env}), in which the predictor stands in for the real simulator during goal-conditioned online RL.
-    \item As a \emph{grounder for subgoal proposals} (Chapter~\ref{chap:wm-as-subgoal}), in which short WM rollouts are used to evaluate candidate subgoals inside a hierarchical offline RL agent.
-    \item As an \emph{inference-time planner} for the offline-to-online phase of single-task RL (Chapter~\ref{chap:online-with-wm}), in which the WM scores candidate action chunks under a learned $Q$-function.
+\item \textbf{As a training environment}
+(Chapter~\ref{chap:wm-env}), where the learned dynamics model is used as a direct substitute for the real environment during the online fine-tuning phase. This provides a controlled study of whether imagined experience can replace real interaction.
+
+\item \textbf{As an inference-time planner}
+(Chapter~\ref{chap:wm-planner}), where the world model is queried only at decision time. Short imagined rollouts are scored using the offline-trained value function and used to select actions, while policy training remains entirely offline.
+
+\item \textbf{As a source of additional training signal}
+(Chapter~\ref{chap:mpc-distillation}), where planner-selected actions and short imagined transitions are converted into policy-improvement data. This tests whether world-model rollouts can be used to generate useful training datasets and supervision targets for the policy.
+
+\item \textbf{As a subgoal evaluator for hierarchical RL}
+(Chapter~\ref{chap:latent-subgoal-planning}), where imagined rollouts are used to assess candidate subgoals proposed by a high-level policy. The world model therefore influences behaviour through subgoal selection rather than direct action planning.
+
 \end{itemize}
-The first role largely fails. The second works in HIQL+LeWM as long as the WM is used only at evaluation, and fails when the WM is used inside the training loop (WGSP). The third works.
+
+Together, these experiments map out the boundary between settings where a frozen world model can provide useful decision-making signal and settings where model errors dominate.
 
 \section{Contributions}
 
+The main contributions of this thesis are:
+
 \begin{itemize}
-    \item \emph{World-model–based training techniques operating entirely in the JEPA latent space.} We learn $Q$-functions, hierarchical value functions, flow-matching policies, and MPC-distilled actors all in the same $192$-dimensional latent space induced by a single frozen LeWM, and compare them under a unified offline-RL setup (Chapters~\ref{chap:wm-as-env}--\ref{chap:online-with-wm}).
-    \item \emph{A catalogue of failure modes when the world model is used as a training environment.} Across the goal-conditioned SAC family (Chapter~\ref{chap:wm-as-env}) and the offline-to-online setting (Chapter~\ref{chap:online-with-wm} §\ref{sec:owm-exp1}--§\ref{sec:owm-synthesis}), we identify four distinct failure mechanisms --- compounding latent error, $Q$-function corruption, termination-threshold pathology, and the model-exploitation trap --- and provide the diagnostic chain that isolates each one.
-    \item \emph{Offline-learned $Q$-functions are a useful in-distribution indicator for world-model latents.} The empirical observation underpinning Chapter~\ref{chap:online-with-wm}: where the offline-trained $Q$-function assigns high values and low ensemble disagreement, the WM's predictions are reliable enough for short-horizon planning; where it assigns low values or high disagreement, the WM is in OOD territory. This is what makes FMQ inference (a gradient step under the offline $Q$-function) a usable OOD-aware search procedure even though it never explicitly models the WM's uncertainty.
-    \item \emph{FMQ-MPC for offline-to-online RL.} The headline positive result: using FMQ-guided MPC as the offline-to-online fine-tuning technique --- combining short-horizon WM rollouts, $Q$-gradient trust-region action refinement, and policy updates that incorporate those refined actions --- reaches $96.0\%$ on \texttt{visual-cube-single-singletask-task1-v0}, a $+3.2\%$ absolute lift over the OGBench IMPALA reference, without collecting a single real-env transition in the post-offline phase. The interleaved MPC-label distillation that produces a critic compatible with fine FMQ inference is a component of this pipeline.
+
+\item \textbf{A systematic study of world-model usage in offline reinforcement learning.}
+We evaluate the same frozen latent action-conditioned world model across
+multiple roles --- environment simulation, inference-time planning, policy
+improvement, and hierarchical subgoal selection --- while keeping the underlying
+agent architecture and offline RL algorithm fixed. This provides a controlled
+comparison of what a modern latent world model can and cannot contribute to
+offline RL
+(Chapters~\ref{chap:wm-env}--\ref{chap:latent-subgoal-planning}).
+
+\item \textbf{An empirical characterisation of the limitations of world-model-generated training data.}
+Directly replacing the environment with the world model consistently degrades performance despite strong one-step prediction accuracy. Through a series of diagnostic experiments, we identify several plausible mechanisms underlying this behaviour, including compounding prediction error, corruption of value-learning targets, and value-aware model exploitation
+(Chapter~\ref{chap:wm-env}).
+
+\item \textbf{A positive result for short-horizon value-guided world-model use.} Although long imagined rollouts are unreliable, short-horizon world-model use can still improve policy performance when constrained by an offline-trained critic. We show that value-guided planning provides useful policy-improvement signals without requiring additional real-environment interaction (Chapter~\ref{chap:wm-planner}).
+
+\item \textbf{A model-based policy improvement procedure that operates entirely within the world model.}
+Building on the inference-time planner, we introduce an online phase in which planner-selected actions and imagined transitions are used to train the policy while keeping the offline-trained critic fixed. Without test-time planning, the resulting policy reaches
+$90.7 \pm 0.8\%$ final success and
+$94.8 \pm 0.7\%$ peak success on
+\texttt{visual-cube-single-singletask-task1-v0},
+corresponding to relative improvements of $11.2\%$ and $7.7\%$ over the corresponding offline baseline success rates ($81.6\%$ and $88.0\%$). The method requires no additional real-environment interaction and does not require the world model at evaluation time
+(Chapter~\ref{chap:mpc-distillation}).
+
+\item \textbf{An empirical evaluation of world-model-guided hierarchical subgoal planning.}
+We introduce a hierarchical reinforcement learning method that uses imagined rollouts to evaluate candidate subgoals while keeping value estimation grounded in real data. Although the approach does not outperform the offline baseline, the results provide insight into the challenges of combining world-model prediction with latent-space subgoal learning
+(Chapter~\ref{chap:latent-subgoal-planning}).
+
 \end{itemize}

@@ -1,281 +1,228 @@
-\chapter{Problem Formulation and the LeWM World Model}
+\chapter{Problem Formulation}
 \label{chap:foundations}
-
-This chapter collects the shared foundations that every later chapter
-depends on. We first state the goal-conditioned MDP we operate in
-(\S\ref{sec:problem}), then describe the frozen latent world model
-LeWM that is the central building block of all methods in
-Chapters~\ref{chap:wm-as-env}--\ref{chap:online-with-wm}
-(\S\ref{sec:lewm-bg}), and finally characterise its empirical accuracy
-(\S\ref{sec:wm-quality}). Every formulation, symbol, and architectural
-choice in this chapter applies to every method that follows unless
-explicitly noted otherwise.
+This chapter introduces the shared formal setup used throughout the
+thesis. We first formulate the goal-conditioned RL problem
+(\S\ref{sec:problem}) and then describe the latent action-conditioned
+world model assumed by the later methods (\S\ref{sec:lewm-bg}). The
+description is kept independent of a particular implementation: the
+LeWM instantiation used in the experiments is described in
+\S\ref{sec:exp-wm-instantiation}, and its predictive accuracy, latent
+geometry, and cross-environment variation are evaluated in
+\S\S\ref{sec:wm-quality}--\ref{sec:wm-quality-envs}.
 
 % ---------------------------------------------------------------------
-\section{Problem Formulation}
+\section{Goal-Conditioned Control in Latent Space}
 \label{sec:problem}
 
-We consider goal-reaching as a goal-conditioned Markov decision process
-(GCMDP) $\mathcal{M}_g = (\mathcal{S}, \mathcal{A}, \mathcal{G}, p, r, \gamma)$,
-where $\mathcal{S}$ denotes the observation space, $\mathcal{A} = \mathbb{R}^{d_a}$
-is a continuous action space, $\mathcal{G} \subseteq \mathcal{S}$ is the set of
-valid goals, $p(s' \mid s,a)$ defines the (unknown) environment dynamics,
-$r(s,a,g)$ is a goal-conditioned reward function, and $\gamma \in [0,1)$ is the
-discount factor. The objective is to learn a policy $\pi(a \mid s, g)$ that
-maximises expected return for arbitrary goals $g$. Where a chapter restricts to
-a single fixed goal (Chapter~\ref{chap:online-with-wm}), the goal $g$ is dropped
-from the conditioning set.
+We formulate robotic goal-reaching as a goal-conditioned Markov
+decision process (GCMDP)
 
-In our setting, observations are high-dimensional RGB images
-($224 \times 224$), making direct learning in $\mathcal{S}$ both
-computationally inefficient and statistically challenging. To address this,
-we introduce a learned latent representation $\mathcal{Z} = \mathbb{R}^{d_z}$
-with $d_z = 192$, obtained via an encoder $E_\xi : \mathcal{S} \to \mathcal{Z}$.
-This induces a latent goal-conditioned MDP:
+\begin{equation}
+\mathcal{M}_g =
+(\mathcal{S}, \mathcal{A}, \mathcal{G}, p, r, \gamma),
+\end{equation}
+where $\mathcal{S}$ is the observation space,
+$\mathcal{A}=\mathbb{R}^{d_a}$ is a continuous action space,
+$\mathcal{G}\subseteq\mathcal{S}$ denotes the set of valid goals,
+$p(s'|s,a)$ describes the environment dynamics,
+$r(s,a,g)$ is a goal-conditioned reward function, and
+$\gamma\in[0,1)$ is the discount factor. The objective is to learn a
+goal-conditioned policy $\pi(a|s,g)$ that reaches arbitrary target
+states $g$.
+
+In the environments considered throughout this thesis, observations are
+high-dimensional RGB images. Learning and planning directly from pixels
+is computationally expensive and sample-inefficient, particularly over
+long horizons.
+Instead, all methods operate in a learned latent space
+
+\begin{equation}
+\mathcal{Z}=\mathbb{R}^{d_z},
+\end{equation}
+obtained through an encoder
+$E_\xi:\mathcal{S}\rightarrow\mathcal{Z}$.
+The resulting latent-space GCMDP is
+
 \begin{equation}
 \widehat{\mathcal{M}}_g
-= (\mathcal{Z}, \mathcal{A}, \mathcal{Z}, \hat{p}, \hat{r}, \gamma),
+=
+(\mathcal{Z}, \mathcal{A}, \mathcal{Z}, \hat p, \hat r, \gamma),
 \end{equation}
-where both states and goals are represented in the same latent space.
+where both the current state and the goal are represented as latent
+vectors.
 
-The latent dynamics are modelled by an action-conditioned predictor
+State transitions in this latent space are modelled by an
+action-conditioned predictor
+
 \begin{equation}
-\hat{p}(z' \mid z, a) \approx f_\psi(z, a),
+\hat p(z'|z,a) \approx f_\psi(z,a),
 \end{equation}
-which deterministically predicts the next latent state. Together, the encoder
-and predictor $(E_\xi, f_\psi)$ constitute the world model described in
-\S\ref{sec:lewm-bg}. Once trained, this model is frozen and used as a
-differentiable simulator for all downstream reinforcement learning methods.
+which predicts the next latent state given the current latent and
+action. Together, the encoder and predictor,
 
-Operating in latent space provides two key advantages. First, it removes the
-need to model high-dimensional pixel observations, focusing instead on
-task-relevant features. Second, as discussed in \S\ref{sec:lewm-bg}, the latent
-space is structured such that Euclidean distances are meaningful, enabling the
-use of simple distance-based reward functions for goal-reaching.
+\begin{equation}
+(E_\xi,f_\psi),
+\end{equation}
+form the learned world model described in
+\S\ref{sec:lewm-bg}. Once trained, the world model is frozen and reused
+by all downstream algorithms, providing both a compact state
+representation and a differentiable simulator for imagined rollouts.
 
-\medskip
-
-\noindent
-We use the following notation throughout the remainder of the thesis:
-\medskip
-
-\noindent
-\begin{tabular}{ll}
-$z, z' \in \mathcal{Z}$ & latent states \\
-$g \in \mathcal{Z}$ & goal embedding (latent goal) \\
-$a \in \mathcal{A}$ & action \\
-$\pi(a \mid z, g)$ & goal-conditioned policy \\
-$Q_\theta(z, g, a)$ & action-value function (critic) \\
-$V_\phi(z, g)$ & state-value function \\
-$f_\psi(z, a)$ & latent dynamics predictor \\
-$E_\xi(s) \to z$ & encoder mapping observations to latent space (frozen) \\
-\end{tabular}
+Operating in latent space avoids modelling pixels directly and gives
+the RL algorithms compact task-relevant features. Because the space is
+regularised to be approximately isotropic (\S\ref{sec:lewm-bg}),
+Euclidean distance can also be used for simple rewards and goal metrics.
 
 % ---------------------------------------------------------------------
-\section{The LeWM World Model}
+\section{Latent Action-Conditioned World Model}
 \label{sec:lewm-bg}
 
-This work builds upon an existing latent world model, \emph{LeWorldModel}
-(LeWM), which we adopt as a fixed representation and dynamics module
-throughout our experiments. We do not contribute to the design or training
-of this model; we use the open-source implementation trained on OGBench
-data \cite{maes2026leworldmodelstableendtoendjointembedding}. The JEPA paradigm and the SIGReg regulariser are described
-in the background; this section only summarises the architectural choices
-that downstream chapters depend on.
+The methods in this thesis use a latent action-conditioned world model
+with two components: an encoder $E_\xi$ that maps observations to latent
+states, and a latent dynamics predictor $f_\psi$ that advances those
+states under actions. This section describes the assumptions needed by
+the downstream algorithms. The concrete implementation used in the
+experiments, LeWM \cite{maes2026leworldmodelstableendtoendjointembedding},
+is described in \S\ref{sec:exp-wm-instantiation}.
 
-\paragraph{Architecture.}
-The model consists of two components: an encoder $E_\xi$ and a predictor
-$f_\psi$. The encoder is a Vision Transformer (ViT-Tiny) that maps each
-input frame $s_t$ to a latent representation
-\[
-z_t = E_\xi(s_t) \in \mathbb{R}^{d_z}, \quad d_z = 192.
-\]
-Actions are embedded into the same latent dimension and provided as
-conditioning inputs to the predictor.
+At a high level, the model follows the Joint-Embedding
+Predictive Architecture (JEPA) paradigm
+(\S\ref{sec:jepa}, Figure~\ref{fig:jepa-bg}). Rather
+than reconstructing future images, the model learns a latent
+representation in which future states can be predicted directly. This
+produces a compact state space that captures the aspects of the
+environment most relevant to control while avoiding the complexity of
+pixel-level prediction.
 
-The dynamics model $f_\psi$ is implemented as a multi-layer Transformer,
-which takes a short history of latent states and actions and predicts the
-next latent state. Conditioning on actions is achieved via adaptive
-normalisation (AdaLN), allowing the model to modulate its predictions based
-on control inputs.
+\paragraph{Structure.}
 
-\paragraph{Predictive objective.}
-The model is trained to minimise a mean-squared prediction error in latent
-space. Given a context window of past states and actions, the predictor
-outputs a one-step prediction:
+The encoder maps each observation $s_t$ to a latent state
+
+\begin{equation}
+z_t = E_\xi(s_t) \in \mathbb{R}^{d_z}.
+\end{equation}
+Actions are embedded into the same latent space and provided as inputs
+to the dynamics model. The predictor $f_\psi$ receives a short history
+of latent states together with an action chunk and predicts the
+corresponding future latent state. Throughout this thesis, a single
+world-model transition corresponds to one chunk of $h$ primitive
+environment actions, meaning that one prediction step advances the
+latent state by $h$ simulator frames.
+
+The resulting dynamics model can therefore be viewed as a learned
+transition function operating directly in latent space,
+
+\begin{equation}
+z_{t+1} = f_\psi(z_t,a_t),
+\end{equation}
+where, for brevity, the action chunk notation is omitted.
+
+\paragraph{Predictive training objective.}
+
+The world model is trained using a self-supervised prediction
+objective. Given a sequence of observations and actions, the predictor
+is required to match the latent representation of a future state:
+
 \begin{equation}
 \mathcal{L}_{\mathrm{pred}}
-= \mathbb{E}_{\tau \sim \mathcal{D}} \left[
-\big\| f_\psi(z_{t-c:t-1}, a_{t-c:t-1}) - z_t \big\|_2^2
+=
+\mathbb{E}_{\tau\sim\mathcal D}
+\left[
+\big\|
+f_\psi(z_{t-c},a_{t-c:t-1})
+-
+z_t
+\big\|_2^2
 \right],
 \label{eq:pred-loss-clean}
 \end{equation}
-where $z_t = E_\xi(s_t)$. This objective encourages the latent space to
-capture the minimal information required for predicting future dynamics.
+where $z_t=E_\xi(s_t)$.
 
-\paragraph{Preventing representation collapse.}
-A characteristic failure mode of JEPA-style models is representation
-collapse, where all inputs are mapped to a constant vector. LeWM addresses
-this through the Spectral Isotropy Regulariser (SIGReg), which matches the
-empirical characteristic function of the latent distribution to that of a
-standard normal along random projection directions. The combined training
-objective is
+Unlike pixel reconstruction objectives, this loss encourages the model
+to retain only the information required for predicting future
+dynamics. The learned latent space therefore becomes a compact,
+control-oriented representation of the environment.
+
+\paragraph{Isotropy regularisation.}
+
+A challenge in JEPA-style training is avoiding representation collapse,
+where all observations are mapped to nearly identical latent vectors.
+To prevent this, the model includes an isotropy regulariser that keeps
+the latent distribution spread out and approximately Gaussian.
+
+The complete training objective is
+
 \begin{equation}
-\mathcal{L}_{\mathrm{LeWM}}
-= \mathcal{L}_{\mathrm{pred}} + \lambda_{\mathrm{sig}} \,
-\mathcal{L}_{\mathrm{SIGReg}}.
+\mathcal{L}_{\mathrm{WM}}
+=
+\mathcal{L}_{\mathrm{pred}}
++
+\lambda_{\mathrm{iso}}
+\mathcal{L}_{\mathrm{iso}}.
 \label{eq:lewm-total-clean}
 \end{equation}
-For the full motivation of the SIGReg formulation and the contrast with
-EMA-target alternatives, see the background chapter \S\ref{sec:background-wm}.
+Here $\mathcal{L}_{\mathrm{iso}}$ denotes the isotropy penalty used by
+the chosen implementation; in the experiments this is SIGReg.
 
 \paragraph{Usage in this work.}
-After training, both the encoder $E_\xi$ and predictor $f_\psi$ are frozen
-and used as a differentiable simulator in latent space. All reinforcement
-learning methods described in the remainder of the thesis operate solely
-on latent states $z \in \mathcal{Z}$ and predicted transitions
-$\hat{z}_{t+1} = f_\psi(z_t, a_t)$.
+The encoder provides the latent state representation used throughout
+the thesis, while the predictor acts as a differentiable simulator for
+imagined rollouts. All policies, value functions, rewards, and planners
+operate exclusively on latent states
+$z\in\mathcal Z$ and predicted transitions generated by
+$f_\psi$ unless otherwise stated.
 
-\paragraph{Implications for control.}
-Two properties of LeWM are particularly important for our setting.
+\paragraph{Implications for reinforcement learning and planning.}
 
-\emph{First}, the predictor $f_\psi$ enables fast and differentiable
-rollouts in latent space, allowing policies to be trained without
-expensive interaction with the underlying simulator.
+Two properties matter for the methods developed in subsequent chapters.
+First, the dynamics predictor enables fast latent-space simulation,
+allowing candidate actions and subgoals to be evaluated without
+expensive physics rollouts.
+Second, the isotropy regularisation induces a structured latent
+geometry in which Euclidean distance is a meaningful measure of state
+similarity. Empirically,
+states corresponding to similar configurations of the environment are
+embedded close together, while dissimilar states are embedded further
+apart. As a result, the distance
 
-\emph{Second}, the combination of latent prediction and isotropy
-regularisation induces a structured geometry in $\mathcal{Z}$. In
-particular, Euclidean distances $\|z - g\|_2$ provide a meaningful and
-approximately isotropic measure of similarity between states. This
-property is central to our formulation of goal-conditioned rewards, where
-distance in latent space serves as a dense proxy for task progress, and
-to the value-based scoring used by the inference-time planners of
-Chapter~\ref{chap:online-with-wm}.
-
-In all subsequent methods, we define rewards of the form
-$r = -\|z_{\text{next}} - z_{\text{goal}}\|_2$
-or
-$r = \mathbb{1}\!\left[\|z_t - z_{\text{goal}}\|_2 < \delta\right]$,
-both justified by the geometric properties of the latent space.
+\begin{equation}
+\|z-g\|_2
+\end{equation}
+provides a useful proxy for progress towards a goal state $g$. This
+proxy is useful but not, on its own, a sufficient control objective: as
+\S\ref{sec:exp-cem-baseline} later shows, planning to minimise latent
+distance alone reaches the goal \emph{embedding} while failing the actual
+task.
+This geometry is used throughout the thesis: it underpins the
+latent-space rewards in Chapter~\ref{chap:wm-env} and forms part of the
+value-based scoring functions used by the planning methods in
+Chapter~\ref{chap:wm-planner}.
 
 % ---------------------------------------------------------------------
-\section{World Model Quality}
-\label{sec:wm-quality}
+\section{Reward Functions in Latent Space}
+\label{sec:wmep-setup}
 
-How accurate the world model actually is on the OGBench cube data
-determines what downstream RL methods can hope to do with it. This
-section characterises that accuracy along four axes: pre-training
-convergence, predictor drift as a function of rollout horizon, latent
-geometry under SIGReg, and resolution robustness. The single most
-important diagnostic is the predictor-drift curve in
-\S\ref{sec:wm-drift}, which sets the maximum horizon over which any
-method later in the thesis can trust the WM's predictions.
+When a method treats the world model as a simulated environment, rewards
+are computed directly in latent space using one of two reward functions.
+For sparse-reward experiments, success is defined by reaching a latent
+state within a threshold distance $\delta$ of the goal,
 
-\subsection{Pre-training Convergence}
-\label{sec:wm-pretrain}
-The LeJEPA world model is pre-trained on the OGBench cube data
-($224{\times}224$ images) with PyTorch Lightning. The objective combines
-the JEPA latent-prediction loss with the spectral isotropy regulariser
-(Eq.~\eqref{eq:lewm-total-clean}).
+\begin{equation}
+\tilde r_t^{\mathrm{sparse}}
+=
+\mathbb{1}\!\left[\|z_t-z_g\|_2 < \delta\right].
+\end{equation}
+For dense-reward experiments, the reward is the negative distance to
+the goal,
 
-\begin{table}[h]
-\centering
-\caption{LeJEPA pre-training. \texttt{fit/loss} is the total objective,
-\texttt{pred\_loss} the latent prediction loss, and \texttt{sigreg\_loss}
-the $\sigma$-regulariser on the encoder covariance. Values are the last
-logged step in
-\texttt{lightning\_logs/version\_*/metrics.csv};
-\texttt{version\_0} was truncated before a validation epoch was written.}
-\label{tab:lewm-pretraining}
-\begin{tabular}{lrrrr}
-\toprule
-Run & Epochs & Final fit/loss & Val pred\_loss & Val sigreg\_loss \\
-\midrule
-\texttt{version\_0} & 10 (in-progress) & 0.0927 & --      & --    \\
-\texttt{version\_1} & 19 (completed)   & --     & 0.00252 & 1.352 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Predictor Drift vs Horizon}
-\label{sec:wm-drift}
-We measure mean $\ell_2$ drift in latent space as a function of the
-predictor rollout horizon $\Delta$ (in raw frames). This is the most
-useful single diagnostic of whether downstream RL can be expected to
-succeed, because every method in this thesis uses
-$\|z_{t+1} - g\|_2$ or $\|z_t - z_g\|_2$ as a learning signal at some
-point.
-
-\begin{table}[h]
-\centering
-\caption{Mean latent-space drift
-$\|\hat z_{t+\Delta}-z_{t+\Delta}\|_2$ as a function of prediction
-horizon $\Delta$ (frames). Drift grows rapidly beyond
-$\Delta\approx 10$ frames; this is the source of the failure modes
-documented in Chapters~\ref{chap:wm-as-env}
-and~\ref{chap:online-with-wm}.}
-\label{tab:drift}
-\begin{tabular}{lcc}
-\toprule
-$\Delta$ (frames) & 1 & 50 \\
-\midrule
-mean $\ell_2$ drift & 1.77 & 16.54 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.65\linewidth]{figures/l2_vs_gap.png}
-\caption{Mean latent-space drift versus prediction horizon
-$\Delta$. The single-step drift of $\sim\!1.77$ calibrates the
-done-thresholds we use as termination conditions in later chapters; the
-super-linear growth beyond $\Delta\!\approx\!10$ frames is the direct
-source of the long-horizon collapse documented in
-Chapters~\ref{chap:wm-as-env} and~\ref{chap:online-with-wm}.}
-\label{fig:drift}
-\end{figure}
-
-\subsection{Latent Geometry under SIGReg}
-\label{sec:wm-geometry}
-The spectral isotropy regulariser
-(Eq.~\eqref{eq:lewm-total-clean}) is intended to make $\|z-g\|_2$ a
-meaningful distance. Figure~\ref{fig:latent-norms} shows histograms of
-latent norms and goal distances on in-distribution and
-out-of-distribution states; the distributions are well-concentrated,
-which justifies the use of a single done-threshold across tasks.
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.55\linewidth]{figures/goal_norms_ood.png}
-\caption{Distribution of latent norms on OOD goals. The concentration
-of latent norms around a common scale is what makes Euclidean distance
-a usable training signal across tasks.}
-\label{fig:latent-norms}
-\end{figure}
-
-\subsection{Resolution Robustness}
-\label{sec:wm-resolution}
-Several of our methods compare $64{\times}64$ checkpoints against the
-$224{\times}224$ LeJEPA model. We verify that the comparison is
-meaningful by measuring latent agreement between native
-$224{\times}224$ cube images and $64{\to}224$ up-sampled versions
-($n{=}128$ images from \texttt{ogbench/cube\_single\_expert}). The
-baseline cosine similarity on \emph{different} images is
-$-0.009 \pm 0.050$, so the high agreement below indicates the encoder
-is largely resolution-robust.
-
-\begin{table}[h]
-\centering
-\caption{Latent agreement between native $224{\times}224$ and
-$64{\to}224$ up-sampled cube images.}
-\label{tab:resolution}
-\begin{tabular}{lcccc}
-\toprule
-Comparison & $\overline{\cos}$ & cos std & $\overline{\ell_2}$ & $\ell_2$ std \\
-\midrule
-224 vs 64$\to$224 bilinear & 0.9900 & 0.0106 & 1.781 & 0.832 \\
-224 vs 64$\to$224 bicubic  & 0.9939 & 0.0060 & 1.404 & 0.618 \\
-\bottomrule
-\end{tabular}
-\end{table}
+\begin{equation}
+\tilde r_t^{\mathrm{dense}}
+=
+-\|z_t-z_g\|_2.
+\end{equation}
+The dense reward provides a shaped learning signal at every timestep,
+whereas the sparse reward only indicates whether the goal has been
+reached. To keep offline and online data consistent, trajectories in the
+offline replay buffer are relabelled using the same reward function
+whenever dense rewards are employed. This avoids training the critic on
+a mixture of reward conventions.

@@ -1,0 +1,35 @@
+
+\chapter{Declarations}
+\label{chap:declarations}
+
+\section{Use of Generative AI}
+\label{sec:decl-ai}
+
+I acknowledge the use of GPT-5.5 (https://chatgpt.com/) to support the editing of this report. In particular, it was used to help improve existing wording, restructure sections and refine the presentation of tables and figures. I also used Claude Opus 4.7 (https://claude.ai/) to assist with experiment code, debugging, and the generation of figures and tables.
+
+All technical decisions, experimental design choices, implementation decisions, and final interpretations of results remain my own. Outputs from generative AI tools were reviewed, edited, and verified before inclusion. I confirm that no AI-generated content has been presented as my own independent work.
+
+\section{Ethical Considerations}
+\label{sec:decl-ethics}
+
+This project does not involve human participants, patient data, personally identifiable information, or sensitive personal data. The experiments are conducted using publicly available or research-standard reinforcement learning benchmarks and simulated robotic environments. As such, the project does not raise the same data privacy or consent concerns associated with studies involving human subjects.
+
+The main ethical considerations relate to responsible reporting of results and the limitations of simulated robotics research. Policies trained in simulation may not transfer safely to real robotic systems without further validation, particularly where physical interaction, contact dynamics, or unsafe exploration could cause damage. For this reason, all claims in this thesis are limited to the simulated benchmark settings evaluated, and no claim is made that the learned policies are safe for direct deployment on real robotic hardware.
+
+\section{Sustainability}
+\label{sec:decl-sustainability}
+
+This project required the use of GPU compute for training world-model-based reinforcement learning agents and running evaluation experiments. I made efforts to reduce unnecessary computation where possible. In particular, pretrained or frozen representations were reused across experiments, cached latent datasets were used to avoid repeated image encoding, and evaluation was generally performed at fixed checkpoints rather than continuously. Several experiments also reused offline buffers and saved checkpoints rather than retraining complete pipelines from scratch.
+
+Despite these efforts, the project involved a significant number of GPU training runs due to the experimental nature of reinforcement learning research and the need to compare multiple methods, ablations, and random seeds. The sustainability impact of this compute usage is acknowledged as a limitation of the work.
+
+\section{Availability of Data and Materials}
+\label{sec:decl-availability}
+
+The project materials are available as follows:
+
+\begin{itemize}
+    \item Project source code: \url{https://github.com/jdefreitas02/latent-subgoal-chaining}.
+    \item Benchmark environments and datasets: experiments are based on the OGBench simulated robotic manipulation benchmarks.
+    \item The official LeWM checkpoints can be found on Hugging Face here \url{https://huggingface.co/papers/2603.19312}. Generated datasets, and experiment outputs can be reproduced by following the instructions provided in the project repository.
+\end{itemize}

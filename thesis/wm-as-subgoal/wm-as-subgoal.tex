@@ -1,379 +1,179 @@
-\chapter{Using the World Model to Ground Subgoals}
+\chapter{World Model for Subgoal Planning}
 \label{chap:wm-as-subgoal}
+\label{chap:latent-subgoal-planning}
 
 \section{Motivation}
-\label{sec:wm-as-subgoal-motivation}
+\label{sec:lsp-motivation}
 
-The synthesis of Chapter~\ref{chap:wm-as-env} closed with a strong negative
-conclusion: when the LeWM predictor is used as a training-time environment
-substitute, the agent's predicted-latent skill does not transfer to the
-real task. The diagnosis was that long-horizon WM rollouts drift off the
-offline support, the critic fits Bellman targets in regions the WM never
-saw at training time, and the resulting policy chases hallucinated states.
+The previous chapters showed that a frozen world model is most useful
+when it proposes short-horizon futures that are scored by a value
+function trained on real data. This chapter asks whether the same
+proposal-and-score pattern extends from action-level planning to
+hierarchical decision making.
+In standard hierarchical offline RL, the high-level policy is typically learned by behaviour cloning. It proposes subgoals that already appear in the dataset, and the low-level policy is trained to reach them. This works well but is inherently conservative. If a useful subgoal was never explicitly observed in the dataset, the high level cannot propose it, even if it would be reachable under the dynamics learned by the world model.
+We therefore explore whether the world model and offline value function can be used to search over subgoals rather than merely evaluate actions. The key idea is to treat subgoals as latent states in the same space as the world model, and to rank them using long-horizon value estimates obtained by rolling out the low-level policy inside the world model. In other words, we lift the same MPC-style mechanism from action space to subgoal space.
 
-That diagnosis does not, however, rule out a much weaker use of the same
-predictor: applying $f_\psi$ for one or two steps starting from a real
-on-policy latent, in order to \emph{rank} candidate subgoals or actions
-against a learned value function. Short rollouts from a real latent stay
-close to the offline support, the value function is queried at states the
-predictor was trained to model, and the WM is only ever asked to provide a
-relative ordering rather than a ground-truth next state. This chapter
-explores three offline methods that use the WM in this restricted way.
-The first two --- HIQL in the LeWM latent space and a flow-matching
-low-level extension --- avoid the WM at training time entirely and lift
-the offline goal-conditioned baseline modestly. The third, World-Grounded
-Subgoal Planning (WGSP), attempts to break the behaviour-cloning ceiling
-of HIQL by scoring imagined subgoal candidates against the value function;
-the attempt did not pan out, and the failure is informative for
-Chapter~\ref{chap:online-with-wm}.
+To study this, we introduce \textbf{Latent Subgoal Planning (LSP)}. The high-level policy proposes candidate subgoals directly in the learned latent space, the world model evaluates them by simulating low-level rollouts toward each candidate, and an offline-trained value function scores the resulting outcomes. This mirrors the structure of the previous chapters, but moves the search problem one level up the hierarchy.
+We adopt the hierarchical framework of HIQL-style offline goal-conditioned RL, but replace the original discrete or dataset-constrained subgoal distribution with a continuous flow-matching policy over latent subgoals and actions (see \S\ref{sec:lsp-flow}). Importantly, the core HIQL structure remains unchanged: a high-level policy proposes subgoals every $k=10$ steps, and a low-level policy executes primitive actions conditioned on those subgoals. The modification is not in the hierarchy itself, but in how the high-level proposals are generated and evaluated.
+Phase~1 follows standard offline goal-conditioned HIQL training with no world model involvement. Phase~2 then attempts to improve the high-level policy using world-model rollouts and value-function scoring in the same proposal-and-score spirit as Chapter~\ref{chap:wm-planner}. The evaluation in \S\ref{sec:exp-wm-as-subgoal} tests whether this action-level pattern transfers to hierarchical subgoal spaces.
 
-% ---------------------------------------------------------------------
-\section{HIQL in the LeWM Latent Space}
-\label{sec:hiql-lewm}
+% =====================================================================
+\section{Latent Subgoal Planning Architecture}
+\label{sec:lsp-architecture}
 
-The hierarchical SAC formulation in \S\ref{sec:joint} alleviates
-long-horizon planning by introducing temporal abstraction, but it still
-relies on an action-conditioned critic $Q(z,g,a)$. In practice, this
-remains a major source of instability: estimating $Q$ requires reasoning
-over both state and action spaces, and small errors in the world model
-compound when evaluating out-of-distribution actions.
+The system consists of three components operating in the learned latent space $\mathcal{Z} = \mathbb{R}^{d_z}$: a value function, a high-level policy, and a low-level policy.
 
-To address this, we move to an \emph{offline} formulation based on
-Implicit Q-Learning (IQL), and adopt its hierarchical extension (HIQL)
-in the LeWM latent space \cite{park2024hiqlofflinegoalconditionedrl}.
-The key idea is to \emph{eliminate explicit dependence on actions in
-the value function}, replacing $Q(z,g,a)$ with an action-free value
-function $V(z, \varphi(z,g))$. This removes the need to evaluate unseen
-actions and significantly improves stability.
+\paragraph{Value function.}
+We use an action-free goal-conditioned value function $V(z, g)$ trained with implicit Q-learning (IQL) via expectile regression (\S\ref{sec:iql}). It is trained entirely on offline data and is never updated with world-model-generated transitions. It estimates long-horizon return from state $z$ toward goal $g$.
 
-\paragraph{Model components.}
-The world model $(E_\xi, f_\psi)$ remains fixed. The trainable
-components are
+\paragraph{High-level policy.}
+The high-level policy $\pi^{\mathrm{HL}}$ proposes a subgoal latent $w$ conditioned on the current state and task goal:
 \begin{equation}
-\varphi_\eta(z,g) \in \mathbb{R}^{d_r}, \qquad d_r = 10,
-\qquad \|\varphi_\eta(z,g)\|_2 = \sqrt{d_r},
+w \;\sim\; \pi^{\mathrm{HL}}(\,\cdot\mid z,\,g).
 \end{equation}
+Unlike standard HIQL, where subgoals are implicitly constrained to match dataset behaviour, here $w$ is a continuous latent in the same space as $z$ and $g$. This makes it directly compatible with the world model, which can evaluate candidate subgoals by simulating trajectories toward them.
+
+\paragraph{Low-level policy.}
+The low-level policy $\pi^{\mathrm{LL}}$ maps the current latent and subgoal to primitive actions:
 \begin{equation}
-V_{\phi_1}, V_{\phi_2} : \mathcal{Z} \times \mathbb{R}^{d_r} \to \mathbb{R},
+a \;\sim\; \pi^{\mathrm{LL}}(\,\cdot\mid z,\,w).
+\end{equation}
+The high-level policy replans every $k=10$ steps, following the standard horizon choice used in HIQL-style hierarchical control. Between replanning steps, the low-level policy executes actions conditioned on a fixed subgoal.
+
+\subsection{Flow-Matching High- and Low-Level Policies}
+\label{sec:lsp-flow}
+
+Both policies are parameterised as flow-matching models, following the same construction used in Chapter~\ref{chap:wm-planner}. We do not restate the full formulation here and refer instead to \S\ref{sec:lsp-architecture} and the flow policy background (\S\ref{sec:fql-bg}).
+The key idea is that instead of modelling a unimodal Gaussian over subgoals or actions, the policy learns a transport map from Gaussian noise to the empirical behaviour distribution. This is particularly important in high-dimensional latent spaces such as $\mathbb{R}^{d_z}$, where behaviour is highly multi-modal and concentrated on narrow manifolds.
+
+Training follows the standard flow-matching behaviour cloning objective. Given a target sample $x_1$ (either a subgoal $w$ or an action $a$), we interpolate between Gaussian noise $x_0 \sim \mathcal{N}(0, I)$ and the target:
+\begin{equation}
+x_t = (1-t)\,x_0 + t\,x_1, \qquad t \sim \mathrm{Unif}[0,1],
+\end{equation}
+and train a velocity field to predict the displacement:
+\begin{equation}
+\mathcal{L}_{\mathrm{BC}}
+= \mathbb{E}\!\left[
+\|u_\theta(\mathrm{cond},\,x_t,\,t) - (x_1 - x_0)\|_2^2
+\right].
+\label{eq:lsp-bc}
+\end{equation}
+At inference time, samples are generated by integrating the learned velocity field using $S$ Euler steps. In Phase~2, these generated samples are further reweighted using advantage signals derived from the value function, following the same HIQL-style idea of advantage-weighted regression.
+
+\subsection{Offline Hierarchical Training}
+\label{sec:lsp-phase1}
+
+Phase~1 trains the full hierarchical system purely offline, without any world model interaction. The value function is trained using expectile regression (\S\ref{sec:iql}), and both policies are trained using advantage-weighted flow-matching.
+
+For each transition, an advantage estimate is computed from the value function and used to weight the flow-BC objective:
+\begin{equation}
+w_t = \min\!\bigl(\exp(\alpha\,\hat{A}_t),\,100\bigr),
 \qquad
-\pi^{\mathrm{HL}}(\varphi \mid z,g), \quad
-\pi^{\mathrm{LL}}(a \mid z,\varphi).
+\hat{A}_t = \tfrac{1}{2}\sum_{i=1}^{2}
+\bigl[
+V_{\phi_i}(z_{t+1}, g_{\mathrm{sub}}) - V_{\phi_i}(z_t, g_{\mathrm{sub}})
+\bigr].
 \end{equation}
+The clipping at $100$ prevents a small number of high-advantage transitions from dominating optimisation. The resulting Phase~1 policy provides the offline hierarchical baseline used by the Phase~2 world-model updates; its performance is reported in \S\ref{sec:exp-lsp-phase1} (Table~\ref{tab:lsp-phase1}).
 
-Here, $\varphi_\eta(z,g)$ is a learned low-dimensional representation
-of the goal, compressing the high-dimensional latent space into a more
-manageable form. This is particularly important because the LeWM
-latent space ($d_z=192$) is significantly overparameterised for value
-learning. Projecting onto a $10$-dimensional sphere enforces a
-structured and bounded representation, improving generalisation and
-stability.
+% =====================================================================
+\section{Using World Model to Improve High-Level Policies}
+\label{sec:lsp-phase2}
 
-\paragraph{Value learning via expectile regression.}
-Instead of learning a $Q$-function, HIQL learns a value function that
-implicitly captures the maximum over actions. Given a subgoal
-$z_{\mathrm{sub}} = z_{t+k}$ sampled from the dataset, we define a dense
-reward
-\[
-\hat r_t = -\|z_{t+1} - z_{\mathrm{sub}}\|_2,
-\]
-consistent with the latent geometry induced by LeWM
-(\S\ref{sec:wm-geometry}). We construct target values
-\begin{align}
-q_i &= \hat r_t + \gamma\,V_{\bar\phi_i}\!\big(z_{t+1},\,\bar\varphi(z_{t+1}, z_{\mathrm{sub}})\big),
-\end{align}
-and define an advantage-like quantity
-\begin{align}
-A_t = \frac{1}{2}\sum_i q_i - \frac{1}{2}\sum_i V_{\bar\phi_i}\!\big(z_t,\,\bar\varphi(z_t, z_{\mathrm{sub}})\big).
-\end{align}
-The value function is trained using \emph{expectile regression}
-\cite{kostrikov2021offlinereinforcementlearningimplicit}:
-\begin{align}
-\ell_\tau(u) &= \big|\tau - \mathbb{1}[u < 0]\big|\,u^2, \qquad \tau = 0.7,
-\label{eq:hiql-expectile}\\
-\mathcal{L}_V &= \mathbb{E}\!\left[\sum_{i=1}^{2}
-\ell_\tau\!\Big(q_i - V_{\phi_i}\!\big(z_t, \varphi_\eta(z_t, z_{\mathrm{sub}})\big)\Big)\right].
-\end{align}
-Intuitively, expectile regression biases the value function toward the
-\emph{upper tail} of the observed returns. This serves as a stable
-proxy for the $\max_a Q(z,g,a)$ operator in classical Q-learning,
-without ever evaluating actions explicitly. As a result, the method
-avoids overestimation errors on out-of-distribution actions --- the key
-failure mode in offline RL that drove every collapse in
-Chapter~\ref{chap:wm-as-env}.
-
-\paragraph{Policy learning via advantage-weighted regression.}
-Both the low-level and high-level policies are trained using
-advantage-weighted regression (AWR), which encourages imitation of
-actions and subgoals that lead to high-value outcomes.
-
-For the low-level policy:
-\begin{align}
-A^{\mathrm{LL}}_t &=
-\frac{1}{2}\sum_i \Big[
-V_{\phi_i}\!\big(z_{t+1}, \varphi(z_{t+1}, z_{\mathrm{sub}})\big)
-- V_{\phi_i}\!\big(z_t, \varphi(z_t, z_{\mathrm{sub}})\big)
-\Big], \\
-\mathcal{L}_{\pi^{\mathrm{LL}}} &=
--\mathbb{E}\!\left[
-\min\big(\exp(\alpha_{\mathrm{LL}} A^{\mathrm{LL}}_t), 100\big)
-\log \pi^{\mathrm{LL}}\!\big(a_t \mid z_t, \varphi(z_t, z_{\mathrm{sub}})\big)
-\right].
-\end{align}
-For the high-level policy:
-\begin{align}
-A^{\mathrm{HL}}_t &=
-\frac{1}{2}\sum_i \Big[
-V_{\phi_i}\!\big(z_{t+k}, \varphi(z_{t+k}, g_{\mathrm{ult}})\big)
-- V_{\phi_i}\!\big(z_t, \varphi(z_t, g_{\mathrm{ult}})\big)
-\Big], \\
-\mathcal{L}_{\pi^{\mathrm{HL}}} &=
--\mathbb{E}\!\left[
-\min\big(\exp(\alpha_{\mathrm{HL}} A^{\mathrm{HL}}_t), 100\big)
-\log \pi^{\mathrm{HL}}\!\big(\varphi(z_t, z_{\mathrm{sub}}) \mid z_t, g_{\mathrm{ult}}\big)
-\right].
-\end{align}
-Both policies learn by \emph{reweighting behaviour} according to value
-improvement: transitions that lead to greater progress toward the goal
-are exponentially upweighted.
-
-\paragraph{Offline training with optional imagination.}
-HIQL is fundamentally an offline method, trained on fixed datasets of
-transitions. To leverage the learned world model, we introduce a
-two-phase training procedure:
-\begin{align}
-\textbf{Phase 1 (offline warm-up):} &\quad \text{train only on real data},
-\label{eq:hiql-phase1}\\
-\textbf{Phase 2 (augmentation):} &\quad \text{mix real and synthetic data}.
-\label{eq:hiql-phase2}
-\end{align}
-Synthetic transitions are generated by rolling out the low-level policy
-through the latent dynamics model $f_\psi$. Subgoals are still sampled
-from real trajectories, ensuring that the imagined data remains
-grounded in the dataset distribution. The warm-up phase prevents
-catastrophic damage in the synthetic-rollout phase --- empirically the
-best operating point is $\rho_{\mathrm{wu}}=1$ (no synthetic data at
-all), confirming the diagnosis from Chapter~\ref{chap:wm-as-env} that
-on this task the WM contributes more noise than signal when fed into
-the training loop.
-
-\paragraph{Stability mechanisms.}
-To stabilise training, we maintain target networks for both the value
-function and goal representation:
-\[
-\bar\phi \leftarrow (1 - \tau)\bar\phi + \tau \phi, \qquad
-\bar\eta \leftarrow (1 - \tau)\bar\eta + \tau \eta,
-\]
-with $\tau = 0.005$.
-
-\paragraph{Discussion.}
-By removing the action-conditioned critic and adopting an offline
-learning paradigm, HIQL eliminates the primary source of instability
-observed in Chapter~\ref{chap:wm-as-env}. The combination of expectile
-regression and advantage-weighted regression enables stable learning
-from static data while still supporting hierarchical reasoning. The
-quantitative improvement over the SAC-family methods is substantial
-(\S\ref{sec:exp-hiql-results}), and HIQL+LeWM is the first method in
-this thesis to cross double-digit native task success. The remaining
-weakness is the low-level actor: a unimodal Gaussian cannot represent
-the multimodal expert action distributions seen on manipulation tasks,
-which motivates the flow-matching extension in the next section.
-
-% ---------------------------------------------------------------------
-\section{Flow-Matching Low-Level Policy}
-\label{sec:hiql-flow}
-
-The HIQL formulation in \S\ref{sec:hiql-lewm} removes the instability
-arising from action-conditioned value estimation, but the low-level
-policy remains a unimodal Gaussian. This assumption is restrictive in
-manipulation tasks, where multiple distinct actions may be equally
-valid in the same state (e.g., approaching an object from different
-directions). As a result, the Gaussian policy tends to average over
-modes, producing suboptimal or physically implausible actions.
-
-To address this limitation, we replace the Gaussian low-level actor
-with a \emph{flow-matching policy} that can represent complex,
-multimodal action distributions \cite{park2025flow}. The policy
-consists of two components: (i) a conditional velocity field trained
-via behaviour cloning, and (ii) a distilled one-step policy trained
-using advantage-weighted regression. All other components (value
-function, high-level policy, goal representation, training procedure)
-remain unchanged.
-
-\paragraph{Conditional flow matching.}
-We model the action distribution implicitly as a continuous
-transformation from Gaussian noise to expert actions. Specifically, we
-define a velocity field $u_\theta$ that describes how a sample evolves
-over time from an initial noise distribution to a target action.
-
-Following the flow-matching formulation, we sample
-\[
-x_0 \sim \mathcal{N}(0,I), \qquad x_1 = a^*, \qquad t \sim \mathrm{Unif}[0,1],
-\]
-and construct an interpolation
-\[
-x_t = (1 - t)\,x_0 + t\,x_1.
-\]
-The velocity field is trained to predict the direction from noise to
-the target action:
+After Phase-1, the high-level policy has learned a strong but dataset-limited mapping from $(z,g)$ to subgoals. It proposes latents that are consistent with the dataset distribution, but cannot reliably extrapolate beyond it. Phase-2 investigates whether the world model can be used as a proposal evaluator that reshapes this distribution using imagined rollouts, without ever changing the low-level policy or the value function.
+Across all experiments, the value function $V$ and the low-level policy $\pi^{\mathrm{LL}}$ are frozen at their Phase-1 parameters. Only the high-level policy $\pi^{\mathrm{HL}}$ is updated. The world model is used to evaluate a candidate subgoal $w$ by first executing the low-level controller inside the model for $k$ steps starting from the current latent $z$, as illustrated in Figure~\ref{fig:lsp-subgoal-grounding}. Concretely, the low-level policy is unrolled conditionally on $w$, and the resulting latent after $k$ steps is
 \begin{equation}
-\mathcal{L}_{\mathrm{BC}}(\theta)
-= \mathbb{E}\!\left[
-\big\| u_\theta(z, \varphi, x_t, t) - (x_1 - x_0) \big\|_2^2
-\right].
-\label{eq:flow-bc-clean}
+z_{\mathrm{ach}} = z_k,\quad
+z_{h+1} = f_\psi\!\bigl(z_h, a_h\bigr),\quad
+a_h \sim \pi^{\mathrm{LL}}(\cdot \mid z_h, w),\quad
+z_0 = z,\quad h=0,\dots,k-1.
+\label{eq:lsp-roll}
 \end{equation}
-Intuitively, this learns a continuous vector field that transports a
-simple Gaussian distribution into the complex, multimodal distribution
-of expert actions, conditioned on the current state and goal.
+The subgoal is then evaluated by how much downstream value it produces under the frozen critic, i.e. $V(z_{\mathrm{ach}}, g)$.
 
-\paragraph{Action generation via integration.}
-To generate an action, we simulate this flow starting from Gaussian
-noise. Using a simple Euler integration scheme with $S$ steps,
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/subgoal_grounding.png}
+    \caption{World-model-based evaluation of candidate high-level subgoals in Phase-2 of Latent Subgoal Planning. Starting from the current latent state $z_0$, the high-level policy proposes multiple candidate subgoals. For each candidate, the frozen low-level policy is rolled out for $H$ steps inside the world model, producing an imagined latent trajectory and a terminal latent $z_H^{(i)}$. Each terminal latent is then scored using the frozen value function $V$, yielding a weight or ranking for the corresponding candidate subgoal. The highest-scoring rollout indicates which subgoal is predicted to produce the greatest downstream value relative to the ultimate goal.}
+    \label{fig:lsp-subgoal-grounding}
+\end{figure}
+
+The core question in all subsequent methods is whether we can use this imagined closed-loop rollout to reshape the distribution of high-level subgoals without breaking the alignment between the high- and low-level policies learned in Phase-1.
+
+\subsection{AWR with Dataset Subgoal Targets}
+\label{sec:lsp-awr-data}
+
+The first and most direct idea is to keep the Phase-1 subgoal support fixed and simply reweight it using world-model rollouts. For each training state $z$, we sample a small set of candidate subgoals $\{w_n\}_{n=1}^N$ from the original dataset subgoal distribution used in Phase-1. Each candidate is evaluated by rolling the frozen low-level policy for $k$ steps inside the world model as in Eq.~\eqref{eq:lsp-roll}, producing $z_{\mathrm{ach},n}$.
+
+We define an advantage relative to the current state:
 \begin{equation}
-x_{i+1} = x_i + \frac{1}{S}\,u_\theta(z, \varphi, x_i, i/S),
-\qquad x_0 = \epsilon \sim \mathcal{N}(0,I),
+J_n = V(z_{\mathrm{ach},n},\,g) - V(z,\,g),
 \end{equation}
-and the final action is
+which measures whether attempting to reach $w_k$ improves predicted long-term return compared to staying at $z$. These advantages are normalised within the batch and converted into AWR weights $w_n = \min(\exp(\alpha J_n), 100)$. The high-level policy is then updated by a weighted flow-BC objective toward the dataset subgoals.
+
+\paragraph{Distributional sharpness.}
+Although this procedure is locally well-defined, it introduces a tension between the Phase-1 subgoal distribution and the broader dataset support. Phase-1 has already concentrated probability mass on a relatively narrow set of subgoals that are consistently useful under the frozen low-level policy. In contrast, the dataset distribution includes many subgoals that are valid transitions but not necessarily optimal intermediate targets.
+Even with AWR weighting, every batch still contains non-zero probability mass on suboptimal subgoals. Over many updates, this can broaden the high-level flow: probability mass is pulled away from the sharp Phase-1 modes toward the wider dataset support. Increasing $\alpha$ reduces this effect but weakens the learning signal, while decreasing $\alpha$ accelerates the drift.
+
+\subsection{AWR with On-Policy Subgoal Targets}
+\label{sec:lsp-awr-self}
+
+A natural response is to eliminate the mismatch between the dataset subgoal distribution and the current policy by sampling subgoals directly from $\pi^{\mathrm{HL}}(\cdot \mid z,g)$. This ensures that all candidates lie within the current support of the high-level policy, avoiding the broadening pressure observed above.
+Each candidate subgoal $w_n \sim \pi^{\mathrm{HL}}(\cdot \mid z,g)$ is evaluated using the same world-model rollout procedure in Eq.~\eqref{eq:lsp-roll}, and scored by $V(z_{\mathrm{ach},n}, g)$. These scores are again converted into AWR weights and used to update the flow policy.
+
+\paragraph{Value miscalibration risk.}
+This variant exposes a different failure mode: the frozen value function $V(z,g)$ is not trained to evaluate arbitrary latent subgoals $w$, but only dataset-induced states. In particular, it assigns high value to latents that are close to the goal $g$, even if they are not actually reachable from $z$ within $k$ low-level steps.
+As training progresses, the high-level policy exploits this bias by shifting probability mass toward subgoals $w \approx g$. However, when these subgoals are executed through the frozen low-level policy inside the world model, the resulting $z_{\mathrm{ach}}$ remains far from $g$, leading to low realised value $V(z_{\mathrm{ach}}, g)$. This creates a systematic disconnect between the training signal $V(w,g)$ and the true outcome of executing $w$ via the low-level controller, resulting in instability rather than improvement.
+
+\subsection{AWR with Achieved Latent States}
+\label{sec:lsp-hrf}
+
+To remove the mismatch between proposed subgoals and executed outcomes, we replace the training target with the \emph{achieved state} of the rollout. Instead of regressing the high-level policy toward the proposed subgoal $w$, we regress it toward the actually reached latent $z_{\mathrm{ach}}$ obtained after executing $\pi^{\mathrm{LL}}$ in the world model for $k$ steps.
+
+The resulting objective is:
 \begin{equation}
-\hat{a}_{\mathrm{flow}} = \mathrm{clip}(x_S, -s_{\max}, s_{\max}).
-\label{eq:flow-euler-clean}
+\mathcal{L}_{\mathrm{HRF}} = \mathbb{E}\!\left[
+w_n\cdot\mathcal{L}_{\mathrm{BC}}^{\mathrm{per\text{-}sample}}
+\!\bigl(\pi^{\mathrm{HL}},\,z_{\mathrm{ach},n}\bigr)\right],
+\quad
+w_n = \min\!\bigl(\exp(\alpha\cdot\hat J_n),\,100\bigr),
+\quad
+J_n = V(z_{\mathrm{ach},n},\,g) - V(z,\,g).
 \end{equation}
-This procedure allows the policy to generate diverse actions depending
-on the initial noise sample, naturally capturing multimodal behaviour.
+This ensures that learning is grounded in what the low-level policy can actually achieve under the world model, rather than what the high-level policy proposes.
 
-\paragraph{Advantage-weighted distillation.}
-While the flow model is expressive, iterative integration is
-computationally expensive at inference time. To address this, we train
-a second network $\mu_\psi$ to approximate the output of the flow in a
-single forward pass. This network takes a noise sample $\epsilon$ and
-predicts an action directly. It is trained using advantage-weighted
-regression to imitate the flow output:
-\begin{equation}
-\mathcal{L}_{\mathrm{dist}}(\psi)
-= \mathbb{E}\!\left[
-\min\big(\exp(\alpha_{\mathrm{LL}} A^{\mathrm{LL}}_t), 100\big)
-\|\mu_\psi(z, \varphi, \epsilon) - \hat{a}_{\mathrm{flow}}\|_2^2
-\right].
-\label{eq:flow-dist-clean}
-\end{equation}
-The advantage weights ensure that the distilled policy focuses on
-high-value behaviours, effectively selecting the most useful modes of
-the action distribution.
+\paragraph{Distributional mismatch between levels.}
+Despite being more consistent, this objective changes the effective training distribution of the high-level policy. In Phase-1, $\pi^{\mathrm{HL}}$ is trained to produce subgoals drawn from a dataset-aligned distribution $\mathcal{D}_w$, which is itself matched to what $\pi^{\mathrm{LL}}$ expects as conditioning input.
+Under HRF, the high-level policy is instead trained toward $z_{\mathrm{ach}}$, which lies in a different region of latent space: it reflects what the frozen low-level policy can reach in $k$ steps starting from $z$, not what appears as intermediate subgoals in the dataset. Although both lie in $\mathbb{R}^{d_z}$, their distributions are not aligned.
+As a result, the high-level policy gradually shifts away from $\mathcal{D}_w$. The low-level policy, which has not been updated, begins to receive subgoal inputs outside its training distribution, making execution quality increasingly fragile despite the improved internal consistency of the training signal.
 
-\paragraph{Training objective.}
-The two components are trained jointly:
-\begin{equation}
-\mathcal{L}^{\mathrm{LL}}_{\mathrm{flow}}
-= \mathcal{L}_{\mathrm{BC}}(\theta)
-+ \mathcal{L}_{\mathrm{dist}}(\psi).
-\label{eq:flow-total-clean}
-\end{equation}
-The behaviour-cloning loss uses all available expert transitions and
-learns the full action distribution, while the distillation loss
-shapes the final policy toward high-advantage regions.
+\paragraph{Summary of Phase-2.}
+Quantitative results for the Phase-2 updates are reported in
+\S\ref{sec:exp-phase2-awr} (Table~\ref{tab:lsp-phase2-awr}) and
+\S\ref{sec:exp-phase2-hrf} (Table~\ref{tab:lsp-hrf}), with further
+ablations in Appendix~\ref{app:lsp-ablations}. The shared distributional
+risk is analysed next.
 
-\paragraph{Inference.}
-At evaluation time, the agent uses only the distilled policy
-$\mu_\psi$, requiring a single forward pass. This makes inference as
-efficient as the Gaussian actor used in \S\ref{sec:hiql-lewm}, while
-retaining the ability to model multimodal action distributions. The
-same flow-matching actor reappears as the proposal distribution for
-the BoN/Grad-MPC/FMQ planners of Chapter~\ref{chap:online-with-wm} ---
-the multimodality it captures is what makes those planners worth
-running in the first place.
+\section{High--Low Level Policy Coupling Failure Mode}
+\label{sec:lsp-barrier}
 
-% ---------------------------------------------------------------------
-\section{World-Grounded Subgoal Planning (WGSP)}
-\label{sec:wgsp}
+The central risk in Phase~2 is not only model error or value noise, but a structural constraint of the hierarchical decomposition itself: the high-level policy $\pi^{\mathrm{HL}}$ and low-level policy $\pi^{\mathrm{LL}}$ are co-adapted in Phase~1, and their compatibility depends on a shared implicit distribution over subgoals. Any update that changes this distribution without simultaneously re-establishing that compatibility can break the equilibrium.
 
-HIQL keeps the policy strictly within the support of the behaviour
-distribution: the value function is trained on dataset transitions
-only, and the high-level actor regresses onto subgoals drawn from
-trajectories that are already in the dataset. This is what makes HIQL
-stable, but it also caps how much improvement is possible at the
-high-level: the high-level cannot propose a subgoal the dataset does
-not already contain.
+The three approaches can be grouped according to how they violate this constraint. Updating with dataset subgoals (Approach 1) pushes the high-level policy toward the broader dataset marginal, away from the concentrated subgoal distribution that the low-level has learned to execute reliably. Updating with on-policy subgoals preferences (Approach 2) does not change the support as drastically, but instead shifts probability mass toward near-goal or high-value regions that are not necessarily reachable within $k$ steps under the frozen low-level controller. Hindsight reality forcing (Approach 3) goes further and replaces the target distribution entirely with achieved latents $z_{\mathrm{ach}}$, which are by construction tied to the current low-level dynamics inside the world model. In each case, the effective conditioning distribution seen by $\pi^{\mathrm{LL}}$ can drift away from the one it was trained on.
 
-WGSP is our attempt to extend the high-level beyond this ceiling. The
-high-level proposes \emph{candidate} subgoals, the WM rolls each
-candidate forward $k$ steps under the low-level policy, and the value
-function scores the rollout endpoint. The candidate with the highest
-WM-based score becomes the supervision target for the high-level
-regression --- the high-level is no longer constrained to imitate
-data-sampled subgoals, but can prefer dynamically plausible candidates
-that the value function rates higher. The motivation is that HIQL's
-behaviour-cloning ceiling is most binding on the high level (the
-low-level is essentially a one-step BC problem), and that short WM
-rollouts from a real on-policy latent can score subgoals the dataset
-does not directly contain.
+A useful diagnostic is to remove the world model from the advantage computation entirely. In this controlled ablation, WM-evaluated advantages are replaced with
+$V(w_k, g) - V(z, g)$ computed directly from the frozen critic, while the dataset-subgoal AWR update is otherwise unchanged. This isolates whether the central issue is compounding model error or the mismatch between the subgoal distribution induced by Phase-2 updates and the distribution on which the hierarchical policies were jointly trained. The world model can make this mismatch explicit, but it is not the only possible source of the mismatch.
 
-\paragraph{Notation.}
-A high-level candidate is a goal-representation vector
-$\mathrm{rep}^{(i)}\sim\pi^{\mathrm{HL}}(\cdot\mid z_t, g)$, with
-$N$ such candidates drawn per training step. Each candidate is decoded
-into an action chunk $c^{(i,m)} \in \mathbb{R}^{25}$ by the low-level
-chunk decoder, and $M$ such chunks are sampled per candidate. The chunk
-is rolled forward $k$ WM steps to obtain a rollout endpoint
-$z_k^{(i,m)}$ in the offline latent space. The within-representation
-advantage assigns credit across the $M$ rollouts of the same candidate
-$i$, and the cross-candidate weight $w^{(i)}$ aggregates across the
-$N$ candidates.
+\paragraph{Jointly updating the hierarchy.}
+A natural repair is to update both levels so that the low-level policy can track the evolving subgoal distribution induced by the high-level updates. We evaluate this directly by allowing $\pi^{\mathrm{LL}}$ to train under the same WM-derived supervision as $\pi^{\mathrm{HL}}$. This ablation tests whether distributional drift can be absorbed by the hierarchy itself, or whether moving both policies simply shifts the inconsistency to the value function and remaining offline anchors, which still reflect the original Phase-1 equilibrium.
 
-\paragraph{HL update.}
-Each candidate is scored by its rollout endpoint under the value
-function $V$ and an optional geometric residual:
-\begin{equation}
-J^{(i,m)} \;=\; V_\phi\!\big(z_k^{(i,m)},\,\varphi(z_k^{(i,m)}, g)\big)
-   \;-\; \beta_{\mathrm{geom}}\,\big\|z_k^{(i,m)} - g\big\|_2,
-\end{equation}
-with the geometric term weighted by $\beta_{\mathrm{geom}}\ge 0$.
-Cross-candidate weights are softmax-normalised across $N$
-candidates; within-candidate weights $u^{(i,m)}$ are softmax-normalised
-across the $M$ rollouts of the same candidate. The high-level
-regression target is the chosen candidate's rep vector, and the
-high-level loss is the AWR objective from \S\ref{sec:hiql-lewm} with
-the WGSP-derived weights substituted for the dataset-derived ones.
+The underlying risk mirrors the moving-target problem analysed in Chapter~\ref{chap:mpc-distillation}. Here, the analogue is the frozen value function and the jointly trained policies: once one part of the system shifts its effective data distribution, the others can only remain consistent by shifting as well. We therefore conjecture that successful joint optimisation would require either (i) a value function that tracks the evolving hierarchy, or (ii) a mechanism that constrains both levels to a shared, fixed subgoal distribution throughout training. We leave both directions as future work.
 
-\paragraph{Distillation to the LL.}
-The same WM rollouts produce action chunks $c^{(i,m)}$. The LL
-distillation loss reuses these chunks as supervision targets, weighted
-by the same $w^{(i)} \cdot u^{(i,m)}$ product. This means the LL is
-nudged toward action chunks that, in the WM, reach high-value
-endpoints under the value function --- a regression-to-high-value
-target rather than the dataset-derived target of plain HIQL.
-
-\paragraph{Training pipeline.}
-Phase 1 (warm-up): train $V$, $\varphi$, and the low-level on real
-data with plain HIQL. Phase 2 (WGSP-active): every training step,
-sample $N$ rep candidates from the current high-level, roll out $M$
-chunks each through the WM, compute the WGSP weights, and update the
-high-level and (optionally) the low-level distil head against them.
-Value updates remain on real data only --- the WM is never queried as
-part of $V$'s Bellman target, only as part of the high-level scoring.
-
-\paragraph{Why it failed.}
-The WGSP training trajectory on the cube benchmark is recorded in
-Table~\ref{tab:wgsp-dynamics} of the appendix. The relevant pattern is
-that the closer-fraction metric --- the share of WM rollouts whose
-endpoint is closer to the goal than the start --- peaks at $0.588$
-around step $150$k and then regresses back to $0.564$ by step $338$k.
-At the same time the LL distillation loss
-$-\mathbb{E}[w_{\mathrm{HL}}\,\log\pi_{\mathrm{LL}}]$ crosses zero at
-$\sim$195k and continues into negative territory. The diagnosis is
-that the distillation loss has no lower bound on the Gaussian standard
-deviation: minimising a negative loss collapses the LL toward a
-near-deterministic point, which collapses WM rollout diversity, which
-degrades the HL's learning signal. The cube-task evaluation reflects
-this: WGSP's best checkpoint (128k snap) reaches $39.2\%$, well below
-the HIQL+LeJEPA baseline at $69.6\%$. The failure is a control-theoretic
-one in the LL training loss rather than a fundamental problem with the
-subgoal-grounding idea --- but in this thesis we did not have time to
-test the obvious fixes (clipping the LL std, reducing the distillation
-weight), and the method is retained here as a documented attempt
-rather than a positive result.
-
-The negative result is still informative for
-Chapter~\ref{chap:online-with-wm}. WGSP's collapse comes from training
-the LL on WM-derived rollouts; the interleaved MPC distillation of
-Chapter~\ref{chap:online-with-wm} avoids that route by supervising the
-actor on MPC-relabelled \emph{actions}, not on WM-imagined trajectories.
+\section{Summary}
+This chapter defined a hierarchical extension of the proposal-and-score
+pattern used in action-level planning. As argued in
+\S\ref{sec:lsp-barrier}, the key methodological issue is the coupling
+between the high-level subgoal distribution and the low-level policy
+trained to execute it. Improving the high level therefore requires
+maintaining that compatibility, not only finding higher-valued candidate
+subgoals.

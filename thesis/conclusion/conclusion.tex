@@ -1,1 +1,133 @@
+
 \chapter{Conclusion}
+\label{chap:conclusion}
+
+\section{Summary of Findings}
+\label{sec:concl-summary}
+
+This thesis investigated how a frozen latent world model can be used to
+improve offline reinforcement learning for high-dimensional robotic
+manipulation. We evaluated a latent action-conditioned world model in several roles: as
+a training environment, as a short-horizon planner, as a source of
+world-model-generated training data, and as a tool for grounding
+hierarchical subgoals. The central finding is that these roles are not
+equivalent. The world model is useful when used locally and
+conservatively, but unreliable when treated as a replacement for the
+environment or as an unconstrained source of training data.
+
+Using the world model as a surrogate environment for reinforcement
+learning consistently failed to improve over the offline baseline.
+Across sparse rewards, dense rewards, anchoring, joint
+predictor--policy training, uncertainty penalties, and
+nearest-neighbour regularisation, policy optimisation inside the
+learned dynamics either underperformed or collapsed. The failure mode is
+consistent with the predictor-drift analysis: small latent prediction
+errors accumulate over rollout horizons, and once the critic is allowed
+to bootstrap on imagined successors, value estimates become corrupted.
+This shows that accurate short-horizon prediction is not sufficient for
+stable long-horizon reinforcement learning inside a learned simulator.
+
+In contrast, the world model is useful for short-horizon
+value-guided planning. Best-of-$N$ MPC improves the single-task offline
+policy from $81.6\%$ to $88.0\%$, and gradient-based value-guided
+planning reaches $90.0\%$ with no parameter updates. FMQ achieves the
+same level on the frozen offline critic, but only within a narrow
+trust-region range. After training the actor and critic on
+planner-generated actions, FMQ inference becomes substantially more
+robust and reaches $96.0\%$ success. This result highlights the key
+mechanism: the planner benefits from the world model's local
+counterfactual predictions, but only when the critic remains calibrated
+to the actions being evaluated.
+
+The online-in-WM experiments provide the clearest evidence for how
+imagined transitions should be used during training. Updating both actor
+and critic on world-model-generated transitions collapses to
+$30.7 \pm 20.8\%$. Freezing the critic and updating only the actor
+instead reaches a standalone peak of $94.8 \pm 0.7\%$ and a final
+success rate of $90.7 \pm 0.8\%$ on the single-task benchmark. The
+world model can therefore provide useful policy-improvement
+supervision, but should not be used to generate bootstrapping targets
+for value learning.
+
+The same recipe does not transfer cleanly to the full
+goal-conditioned benchmark. Goal-conditioned online-in-WM briefly
+matches or exceeds the offline baseline, but final performance remains
+below it; the strongest leakage-free achieved-state-goal variant reaches
+$84.4 \pm 0.9\%$ compared with a $90.0\%$ offline baseline. Generating a
+fixed offline corpus from the world model also underperforms real play
+data: with identical HER processing, FQL reaches $90.3 \pm 1.6\%$ on
+real data but only $64.7 \pm 3.7\%$ on the best world-model-generated
+corpus. These results suggest that the successful single-task methods
+depend on closed-loop interaction between the current actor, planner,
+and frozen critic. Once that loop is broken, much of the benefit is
+lost.
+
+Latent Subgoal Planning (LSP) provides the strongest stable
+goal-conditioned result. Phase 1, trained entirely offline with
+flow-matching high- and low-level policies, reaches $88.0\%$ on the
+five-task benchmark, slightly exceeding the HIQL end-to-end baseline.
+However, Phase 2 attempts to improve the high-level policy using
+world-model-grounded AWR or achieved-state subgoal regression do not
+surpass this baseline. Conservative updates preserve some Phase-1
+performance but do not improve it, while more aggressive updates
+collapse the hierarchy. The likely cause is distributional coupling:
+shifting the high-level subgoal distribution pushes the frozen low-level
+policy outside the conditioning distribution it was trained to execute.
+
+Several early SAC-based approaches, including curriculum SAC, HER+SAC,
+and hierarchical SAC with expert-guided stabilisation, were also
+explored. These methods could often optimise latent-reaching objectives
+inside the world model, but did not transfer to native task success in
+MuJoCo. They are therefore treated as exploratory negative results and
+documented separately in the appendix.
+
+Overall, the thesis supports a constrained view of learned world models
+for offline robotic control. The world model is not reliable enough to
+serve as a standalone simulator, a replacement offline dataset, or an
+unconstrained subgoal generator. Its strength lies in short-horizon,
+local counterfactual reasoning. When paired with a critic trained on
+real transitions, this local reasoning can improve action selection,
+generate useful actor-training data, and produce substantial gains in
+single-task manipulation.
+
+\section{Future Work}
+\label{sec:concl-future}
+
+\paragraph{Improving world-model reliability and action conditioning.}
+The methods that succeed in this thesis all avoid long-horizon open-loop
+rollouts. They use the world model over one or two prediction steps and
+rely on a critic trained on real data to score the result. Future work
+should repeat the same diagnostic pipeline with world-model
+architectures that may offer longer reliable horizons or stronger action
+conditioning, such as diffusion-transformer world models,
+Dreamer-style recurrent state-space models, or value-aware latent
+models. The action-conditioning ratio used in the generalisation
+experiments is also a useful pre-screening diagnostic: online-in-WM
+should only be expected to help when the learned dynamics are
+sufficiently sensitive to actions.
+
+\paragraph{Scaling generated-data methods to goal-conditioned control.}
+The single-task online-in-WM method improves substantially, but the
+goal-conditioned extension does not reliably beat the offline baseline.
+Future work should focus on coverage: more diverse goal sampling,
+explicit exploration bonuses in the MPC scorer, higher weighting of
+real offline replay during online updates, or goal-conditioned critics
+specialised to different regions of the goal space. These directions
+target the main weakness observed here: the generated online buffer
+becomes concentrated around the states visited by the current planner,
+rather than covering the full state-goal distribution.
+
+\paragraph{Stabilising hierarchical world-model learning.}
+The LSP Phase-2 failures leave a clear open problem: how can a
+hierarchical policy use world-model-derived supervision without breaking
+coordination between the high and low levels? In the flat single-task
+case, the successful rule is to freeze the critic and update only the
+actor. The analogous rule for hierarchical agents is less obvious,
+because changing the high-level policy also changes the conditioning
+distribution faced by the low-level policy. Future work could explore
+conservative subgoal trust regions, explicit low-level reachability
+models, or joint update rules that maintain compatibility between
+proposed subgoals and low-level competence. The broader challenge is to extend the local usefulness of learned
+world models to broader goal-conditioned and hierarchical settings
+without losing the grounding provided by real experience.
+
