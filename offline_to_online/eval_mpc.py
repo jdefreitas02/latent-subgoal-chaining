@@ -223,6 +223,155 @@ def _make_mpc_fn(agent, wm_model, wm_params, z_goal, N, H, gamma,
 
 
 # ---------------------------------------------------------------------------
+# Goal-conditioned MPC action selector
+# ---------------------------------------------------------------------------
+
+def _make_mpc_fn_gc(agent, wm_model, wm_params, latent_dim, N, H, gamma,
+                    dense_scale, K_grad, lr, q_only=False, q_every_step=False,
+                    fmq=False, fmq_eta=0.3):
+    """Goal-conditioned variant of _make_mpc_fn.
+
+    Takes obs of shape (2*latent_dim,) at call time and splits internally:
+      z = obs[:latent_dim]      (192,)  -> used for WM rollout
+      g = obs[latent_dim:]      (192,)  -> used for dense reward
+      full obs (2*latent_dim,)          -> used for critic(obs, a) scoring
+
+    The augmented obs is reused at every WM lookahead step: as we step the
+    WM forward to z_{h+1}, we re-pair with the SAME g (the goal does not
+    change within an MPC rollout, mirroring how the agent is trained).
+
+    Function signature remains fn(observations, rng) -> (25,) action.
+    """
+    D = int(latent_dim)
+
+    def _wm_step(z_t, a_t):
+        return wm_model.apply(wm_params, z_t[:, None, :], a_t[:, None, :])[:, -1, :]
+
+    def _score_proposals(a_first, z_batch, g_batch, obs_batch, rng):
+        """obs_batch: (N, 2D) = concat([z_batch, g_batch], -1). Held constant
+        in g for the duration of the lookahead; only the z half advances."""
+        total_score = jnp.zeros(N)
+        z_t = z_batch
+        a_t = a_first
+        if q_every_step:
+            for h in range(H):
+                z_next = _wm_step(z_t, a_t)
+                obs_next = jnp.concatenate([z_next, g_batch], axis=-1)
+                rng, key_h = jax.random.split(rng)
+                noises_h = jax.random.normal(key_h, (N, 25))
+                a_next = agent.compute_flow_actions(obs_next, noises_h)
+                q_h = agent.network.select('critic')(obs_next, a_next).mean(axis=0)
+                total_score = total_score + (gamma ** h) * q_h
+                a_t = a_next
+                z_t = z_next
+        else:
+            for h in range(H):
+                z_next = _wm_step(z_t, a_t)
+                if not q_only:
+                    r = -jnp.linalg.norm(z_next - g_batch, axis=-1) / dense_scale
+                    total_score = total_score + (gamma ** h) * r
+                obs_next = jnp.concatenate([z_next, g_batch], axis=-1)
+                rng, key_h = jax.random.split(rng)
+                noises_h = jax.random.normal(key_h, (N, 25))
+                a_t = agent.compute_flow_actions(obs_next, noises_h)
+                z_t = z_next
+            obs_t = jnp.concatenate([z_t, g_batch], axis=-1)
+            q_term = agent.network.select('critic')(obs_t, a_t).mean(axis=0)
+            total_score = total_score + q_term
+        return total_score, z_t, a_t
+
+    if K_grad > 0 or fmq:
+        @jax.jit
+        def mpc_fn(observations, rng):
+            obs_0 = observations          # (2D,)
+            z_0 = obs_0[:D]               # (D,)
+            g_0 = obs_0[D:]               # (D,)
+            z_batch = jnp.tile(z_0[None], (N, 1))         # (N, D)
+            g_batch = jnp.tile(g_0[None], (N, 1))         # (N, D) — fixed within rollout
+            obs_batch = jnp.concatenate([z_batch, g_batch], axis=-1)  # (N, 2D)
+
+            rng, key0 = jax.random.split(rng)
+            noises0 = jax.random.normal(key0, (N, 25))
+            a_first = agent.compute_flow_actions(obs_batch, noises0)
+
+            cont_keys = []
+            for _ in range(H):
+                rng, kk = jax.random.split(rng)
+                cont_keys.append(kk)
+
+            def score_for_grad(a_0):
+                total = jnp.zeros(N)
+                z_t = z_batch
+                a_t = a_0
+                if q_every_step:
+                    for h in range(H):
+                        z_next = _wm_step(z_t, a_t)
+                        obs_next = jnp.concatenate([z_next, g_batch], axis=-1)
+                        noises_h = jax.random.normal(cont_keys[h], (N, 25))
+                        a_next = jax.lax.stop_gradient(
+                            agent.compute_flow_actions(obs_next, noises_h))
+                        q_h = agent.network.select('critic')(obs_next, a_next).mean(axis=0)
+                        total = total + (gamma ** h) * q_h
+                        a_t = a_next
+                        z_t = z_next
+                else:
+                    for h in range(H):
+                        z_next = _wm_step(z_t, a_t)
+                        if not q_only:
+                            r = -jnp.linalg.norm(z_next - g_batch, axis=-1) / dense_scale
+                            total = total + (gamma ** h) * r
+                        obs_next = jnp.concatenate([z_next, g_batch], axis=-1)
+                        noises_h = jax.random.normal(cont_keys[h], (N, 25))
+                        a_t = jax.lax.stop_gradient(
+                            agent.compute_flow_actions(obs_next, noises_h))
+                        z_t = z_next
+                    obs_t = jnp.concatenate([z_t, g_batch], axis=-1)
+                    q_t = agent.network.select('critic')(obs_t, a_t).mean(axis=0)
+                    total = total + (gamma ** H) * q_t
+                return total.sum()
+
+            grad_fn = jax.grad(score_for_grad)
+            if fmq:
+                grads = grad_fn(a_first)
+                grads = grads / (jnp.linalg.norm(grads, axis=-1, keepdims=True) + 1e-8)
+                a_first = jnp.clip(a_first + fmq_eta * grads, -1.0, 1.0)
+            else:
+                for _ in range(K_grad):
+                    grads = grad_fn(a_first)
+                    a_first = jnp.clip(a_first + lr * grads, -1.0, 1.0)
+
+            rng, score_rng = jax.random.split(rng)
+            total_score, _, _ = _score_proposals(
+                a_first, z_batch, g_batch, obs_batch, score_rng)
+
+            best_i = jnp.argmax(total_score)
+            return a_first[best_i]
+
+    else:
+        @jax.jit
+        def mpc_fn(observations, rng):
+            obs_0 = observations
+            z_0 = obs_0[:D]
+            g_0 = obs_0[D:]
+            z_batch = jnp.tile(z_0[None], (N, 1))
+            g_batch = jnp.tile(g_0[None], (N, 1))
+            obs_batch = jnp.concatenate([z_batch, g_batch], axis=-1)
+
+            rng, key0 = jax.random.split(rng)
+            noises0 = jax.random.normal(key0, (N, 25))
+            a_first = agent.compute_flow_actions(obs_batch, noises0)
+
+            rng, score_rng = jax.random.split(rng)
+            total_score, _, _ = _score_proposals(
+                a_first, z_batch, g_batch, obs_batch, score_rng)
+
+            best_i = jnp.argmax(total_score)
+            return a_first[best_i]
+
+    return mpc_fn
+
+
+# ---------------------------------------------------------------------------
 # Thin wrapper so evaluate_real_ogbench can call .sample_actions
 # ---------------------------------------------------------------------------
 
