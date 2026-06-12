@@ -1,24 +1,24 @@
 # Leveraging Latent World Models for Offline Reinforcement Learning
 
 Code for my Imperial College London individual project. The thesis (in
-[`thesis/`](thesis/)) asks one question: **how can a learned latent world model be
-used to improve goal-conditioned control in high-dimensional robotic
-manipulation?** Everything is evaluated on the [OGBench](https://github.com/seohongpark/ogbench)
-visual manipulation suite (`cube-single`, plus `scene` and `puzzle-3x3` for
-generalisation), with a JEPA-style latent world model (LeWM) providing the
+[`thesis/`](thesis/)) asks: **how can a learned latent world model be used to
+improve goal-conditioned control in high-dimensional robotic manipulation?**
+Experiments use the [OGBench](https://github.com/seohongpark/ogbench) visual
+manipulation suite (`cube-single`, plus `scene` and `puzzle-3x3` for
+generalisation), with a JEPA-style latent world model (LeWM) providing both the
 192-D representation and the latent dynamics.
 
-The short version of the findings (Chapter 5 of the thesis):
+In short, the main findings from Chapter 5 are:
 
-- **The world model is not a usable replacement environment.** Every variant of
+- **The world model does not work as a replacement environment.** Every variant of
   "run online RL inside the world model" (sparse/dense rewards, latent
   anchoring, joint predictor–policy training, uncertainty penalties) ends below
   the offline policy it started from.
-- **It is a good short-horizon planner.** Best-of-N, gradient-refined, and
+- **It does work as a short-horizon planner.** Best-of-N, gradient-refined, and
   FMQ (flow-map Q-guidance) MPC on a *frozen* policy lift a 81.6% offline
   checkpoint to 88–90%, with performance peaking at 1–2 world-model steps and
   degrading beyond that, exactly as the predictor-drift diagnostic predicts.
-- **It is most useful as a data generator for the actor only.** Interleaved
+- **It is most useful when generating data for the actor only.** Interleaved
   training on MPC-relabelled actions reaches **96.0%** with FMQ inference
   (Q-chunking reference: 92.8%), and online fine-tuning on imagined transitions
   works if and only if the critic is frozen (90.7% final / 94.8% peak vs. a
@@ -26,7 +26,7 @@ The short version of the findings (Chapter 5 of the thesis):
 - **Action conditioning predicts transfer.** The same recipe gives large gains
   on `cube-single` (8.0× action-conditioning ratio), marginal gains on `scene`
   (1.4×), and nothing on `puzzle-3x3` (1.1×).
-- **Hierarchy: offline is strong, world-model grounding is not.** The
+- **For hierarchy, offline training is strong; world-model grounding is not.** The
   flow-policy hierarchical baseline (LSP Phase 1) reaches 88.0% five-task
   success, slightly above end-to-end HIQL (87.0%), but every Phase-2 attempt to
   improve the high level with world-model rollouts destabilises it.
@@ -57,16 +57,16 @@ flow-map Q-guidance planner of Chapter 3.
 
 ## Adapted third-party code
 
-This repository builds directly on several public codebases. Credit where it
-is due:
+This repository builds directly on several public codebases. The main borrowed
+pieces are:
 
 - **Q-chunking** — [`offline_to_online/`](offline_to_online/) is a fork of the
   official implementation of *Reinforcement Learning with Action Chunking*
   (Qiyang Li, Zhiyuan Zhou, Sergey Levine, arXiv:2507.07969),
   <https://github.com/ColinQiyangLi/qc>. The ACFQL agent
   (`agents/acfql.py`), the `utils/` and `envs/` scaffolding, and the original
-  `main.py` offline-to-online loop are theirs (their README and LICENSE are
-  kept in that folder); the WM environment, MPC planners, JAX WM port,
+  `main.py` offline-to-online loop come from that codebase (their README and
+  LICENSE are kept in that folder); the WM environment, MPC planners, JAX WM port,
   goal-conditioned trainers, and everything `train_*`/`eval_*` beyond
   `main.py` were added for this project. The published Q-chunking
   `cube-single-task1` result (92.8%) is the reference baseline in the thesis.
@@ -108,7 +108,7 @@ pip install -r offline_to_online/requirements.txt   # JAX side
 pip install torch torchvision lightning stable-worldmodel stable-pretraining ogbench h5py hdf5plugin
 ```
 
-Two external pieces:
+Two external pieces are needed:
 
 1. **Patched ogbench clone** (needed only for the latent hierarchical trainers,
    `train_hiql_acfql_latent.py` / `train_wgsp_lsg*.py`): follow
@@ -135,8 +135,8 @@ points; every experiment below can equally be run directly with `python`.
 
 ## Data and world-model pipeline
 
-All downstream experiments consume three artefacts per environment: a 224×224
-HDF5 dataset, a (fine-tuned) world-model checkpoint, and a latent cache.
+All downstream experiments use three artefacts per environment: a 224×224 HDF5
+dataset, a (fine-tuned) world-model checkpoint, and a latent cache.
 
 ```bash
 # 1. download the OGBench play dataset (64×64) — any of:
@@ -193,8 +193,9 @@ drift ratio from `wm_ood_diagnostics.py`.
 python analysis/eval_cem_ogbench.py        # LeWM CEM protocol, 5 tasks × 50 episodes
 ```
 
-Reports both the latent-reach rate (72.0%) and the native success rate (0.0%) —
-the gap that motivates critic-grounded planning in the rest of the thesis.
+Reports both the latent-reach rate (72.0%) and the native success rate (0.0%),
+which is the gap that motivates critic-grounded planning in the rest of the
+thesis.
 
 ### §5.4 World model as environment (Table 5.5)
 
@@ -303,7 +304,7 @@ are not dynamically consistent.)
 Run the data pipeline above with `--env_name visual-scene-v0` /
 `visual-puzzle-3x3-v0` (the `button_states` field is carried through
 automatically), train a fresh WM per environment, then re-run §5.6.4 / §5.6.5
-with `--env_family scene` or `--env_family puzzle-3x3`. The cheap screening
+with `--env_family scene` or `--env_family puzzle-3x3`. The lightweight screening
 diagnostic (action-conditioning ratio, Table 5.16) comes from
 `analysis/wm_ood_diagnostics.py` on the new checkpoint and cache — no RL run
 needed.
@@ -337,7 +338,7 @@ Thesis row ↔ `--hl_mode` mapping:
 | LL freezing / cadence / metric ablations (App. E.1) | `--ll_frozen`, `--hl_every`, `--ll_reach_metric {distance,value}` |
 
 `eval_wgsp_lsg_planning.py` is the eval-time best-of-N gate over a frozen
-Phase-1 checkpoint (the cheap test that HL×LL MPC does not beat the standalone
+Phase-1 checkpoint (a quick check that HL×LL MPC does not beat the standalone
 hierarchy); `eval_wgsp_planning.py` is the same gate for the
 `train_hiql_acfql_latent.py` (HIQL+ACFQL on latents) checkpoints.
 
