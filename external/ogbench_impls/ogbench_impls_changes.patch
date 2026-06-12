@@ -1,0 +1,395 @@
+diff --git a/impls/agents/__init__.py b/impls/agents/__init__.py
+index 4596fe2..2541db8 100644
+--- a/impls/agents/__init__.py
++++ b/impls/agents/__init__.py
+@@ -3,6 +3,7 @@ from agents.gcbc import GCBCAgent
+ from agents.gciql import GCIQLAgent
+ from agents.gcivl import GCIVLAgent
+ from agents.hiql import HIQLAgent
++from agents.hiql_acfql import HIQLACFQLAgent
+ from agents.qrl import QRLAgent
+ from agents.sac import SACAgent
+ 
+@@ -12,6 +13,7 @@ agents = dict(
+     gciql=GCIQLAgent,
+     gcivl=GCIVLAgent,
+     hiql=HIQLAgent,
++    hiql_acfql=HIQLACFQLAgent,
+     qrl=QRLAgent,
+     sac=SACAgent,
+ )
+diff --git a/impls/main.py b/impls/main.py
+index 3660e03..6a3b950 100644
+--- a/impls/main.py
++++ b/impls/main.py
+@@ -13,7 +13,7 @@ from agents import agents
+ from ml_collections import config_flags
+ from utils.datasets import Dataset, GCDataset, HGCDataset
+ from utils.env_utils import make_env_and_datasets
+-from utils.evaluation import evaluate
++from utils.evaluation import evaluate, evaluate_hier_chunked
+ from utils.flax_utils import restore_agent, save_agent
+ from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
+ 
+@@ -120,9 +120,10 @@ def main(_):
+             overall_metrics = defaultdict(list)
+             task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
+             num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
++            eval_fn = evaluate_hier_chunked if config.get('hierarchical_chunked') else evaluate
+             for task_id in tqdm.trange(1, num_tasks + 1):
+                 task_name = task_infos[task_id - 1]['task_name']
+-                eval_info, trajs, cur_renders = evaluate(
++                eval_info, trajs, cur_renders = eval_fn(
+                     agent=eval_agent,
+                     env=env,
+                     task_id=task_id,
+diff --git a/impls/utils/datasets.py b/impls/utils/datasets.py
+index 59b32a6..306924b 100644
+--- a/impls/utils/datasets.py
++++ b/impls/utils/datasets.py
+@@ -357,6 +357,19 @@ class HGCDataset(GCDataset):
+         low_goal_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
+         batch['low_actor_goals'] = self.get_observations(low_goal_idxs)
+ 
++        # Action chunking (additive, config-gated). When 'action_chunk_len' is set,
++        # provide an H_c-step action chunk and the state H_c steps ahead (clamped to
++        # the episode end) for the H_c-step low-level advantage.
++        chunk_len = self.config['action_chunk_len'] if 'action_chunk_len' in self.config else None
++        if chunk_len is not None:
++            chunk_idxs = np.minimum(
++                idxs[:, None] + np.arange(chunk_len)[None, :], final_state_idxs[:, None]
++            )  # (B, H_c)
++            action_chunks = self.dataset['actions'][chunk_idxs]  # (B, H_c, action_dim)
++            batch['action_chunks'] = action_chunks.reshape(action_chunks.shape[0], -1)  # (B, H_c*action_dim)
++            chunk_next_idxs = np.minimum(idxs + chunk_len, final_state_idxs)
++            batch['low_chunk_next_observations'] = self.get_observations(chunk_next_idxs)
++
+         # Sample high-level actor goals and set prediction targets.
+         # High-level future goals.
+         if self.config['actor_geom_sample']:
+diff --git a/impls/utils/encoders.py b/impls/utils/encoders.py
+index 3c2378b..943daa4 100644
+--- a/impls/utils/encoders.py
++++ b/impls/utils/encoders.py
+@@ -4,7 +4,7 @@ from typing import Sequence
+ import flax.linen as nn
+ import jax.numpy as jnp
+ 
+-from utils.networks import MLP
++from utils.networks import MLP, Identity
+ 
+ 
+ class ResnetStack(nn.Module):
+@@ -141,4 +141,6 @@ encoder_modules = {
+     'impala_debug': functools.partial(ImpalaEncoder, num_blocks=1, stack_sizes=(4, 4)),
+     'impala_small': functools.partial(ImpalaEncoder, num_blocks=1),
+     'impala_large': functools.partial(ImpalaEncoder, stack_sizes=(64, 128, 128), mlp_hidden_dims=(1024,)),
++    # Pre-encoded latent observations — pass through unchanged
++    'identity': Identity,
+ }
+diff --git a/impls/utils/env_utils.py b/impls/utils/env_utils.py
+index 6b17e11..e70f197 100644
+--- a/impls/utils/env_utils.py
++++ b/impls/utils/env_utils.py
+@@ -11,6 +11,103 @@ import ogbench
+ from utils.datasets import Dataset
+ 
+ 
++# =============================================================================
++# LeWM latent environment wrapper
++# =============================================================================
++
++class LeWMLatentWrapper(gymnasium.Wrapper):
++    """Wraps swm/OGBCube-v0 to return 192-D LeWM encoder latents as observations.
++
++    Actions are 25-D (5 physical steps × 5-D, StandardScaler-normalised),
++    matching the WM-step granularity of lewm_latent_dataset.npz.
++    One call to step() internally executes 5 consecutive physical actions.
++
++    Args:
++        env:            Unwrapped swm/OGBCube-v0 gymnasium env.
++        encode_fn:      Callable (H, W, 3) uint8 → (192,) float32 numpy array.
++        action_scaler:  sklearn StandardScaler fit on raw 5-D dataset actions.
++    """
++
++    def __init__(self, env, encode_fn, action_scaler):
++        super().__init__(env)
++        self.encode_fn      = encode_fn
++        self.action_scaler  = action_scaler
++        self.observation_space = Box(-np.inf, np.inf, shape=(192,), dtype=np.float32)
++        # 25-D normalised; the eval loop may clip to [-1,1] — inverse_transform still works
++        self.action_space = Box(-5.0, 5.0, shape=(25,), dtype=np.float32)
++
++    def _encode(self, obs_hwc):
++        return self.encode_fn(obs_hwc)
++
++    def reset(self, **kwargs):
++        obs, info = self.env.reset(**kwargs)
++        if "target" in info:
++            info["goal"] = self._encode(info["target"])
++        return self._encode(obs), info
++
++    def step(self, action_25d):
++        """Expand one 25-D normalised action into 5 physical env steps."""
++        raw      = np.array(action_25d).reshape(5, 5)
++        physical = np.clip(self.action_scaler.inverse_transform(raw), -1.0, 1.0)
++        obs = terminated = truncated = None
++        reward = 0.0
++        info   = {}
++        for t in range(5):
++            obs, reward, terminated, truncated, info = self.env.step(physical[t])
++            if terminated or truncated:
++                break
++        return self._encode(obs), reward, terminated, truncated, info
++
++
++def make_latent_env_and_datasets(latent_dataset_path, encode_fn, action_scaler_path,
++                                  frame_stack=None):
++    """Load a LeWM latent dataset and wrap swm/OGBCube-v0 for evaluation.
++
++    Args:
++        latent_dataset_path:  Path to lewm_latent_dataset.npz.
++        encode_fn:            Callable (H,W,3) uint8 → (192,) float32 numpy.
++                              Build this from the frozen LeWM encoder in your training script.
++        action_scaler_path:   Path to lewm_action_scaler.npz.
++        frame_stack:          Ignored (latent obs are already temporal aggregates).
++
++    Returns:
++        (env, train_dataset, val_dataset)  — env is a LeWMLatentWrapper.
++    """
++    from sklearn.preprocessing import StandardScaler
++
++    # Reconstruct action scaler from saved params
++    sc = np.load(action_scaler_path)
++    action_scaler = StandardScaler()
++    action_scaler.mean_           = sc["mean"]
++    action_scaler.scale_          = sc["scale"]
++    action_scaler.n_features_in_  = int(len(sc["mean"]))
++
++    # Build eval env
++    raw_env = gymnasium.make("swm/OGBCube-v0", ob_type="pixels",
++                              env_type="single", visualize_info=False)
++    env = LeWMLatentWrapper(raw_env, encode_fn, action_scaler)
++    env.reset()
++
++    # Load dataset
++    data = np.load(latent_dataset_path)
++    train_dataset = Dataset.create(
++        observations = data["train_observations"],
++        actions      = data["train_actions"],
++        terminals    = data["train_terminals"],
++        rewards      = data["train_rewards"],
++        valids       = data["train_valids"],
++    )
++    val_dataset = Dataset.create(
++        observations = data["val_observations"],
++        actions      = data["val_actions"],
++        terminals    = data["val_terminals"],
++        rewards      = data["val_rewards"],
++        valids       = data["val_valids"],
++    )
++
++    return env, train_dataset, val_dataset
++
++
+ class EpisodeMonitor(gymnasium.Wrapper):
+     """Environment wrapper to monitor episode statistics."""
+ 
+diff --git a/impls/utils/evaluation.py b/impls/utils/evaluation.py
+index a3a9944..677bef9 100644
+--- a/impls/utils/evaluation.py
++++ b/impls/utils/evaluation.py
+@@ -34,6 +34,103 @@ def add_to(dict_of_lists, single_dict):
+         dict_of_lists[k].append(v)
+ 
+ 
++def evaluate_hier_chunked(
++    agent,
++    env,
++    task_id=None,
++    config=None,
++    num_eval_episodes=50,
++    num_video_episodes=0,
++    video_frame_skip=3,
++    eval_temperature=0,
++    eval_gaussian=None,
++):
++    """Evaluate a hierarchical action-chunking agent.
++
++    The high-level actor proposes a subgoal representation every ``subgoal_steps``
++    env steps; the low-level flow actor emits an ``action_chunk_len``-step chunk
++    that is executed open-loop via an action queue, refilled when empty. This is
++    the HIQL hierarchy at the subgoal cadence + ACFQL's chunked execution.
++    """
++    high_rng = jax.random.PRNGKey(np.random.randint(0, 2**32))
++    low_rng = jax.random.PRNGKey(np.random.randint(0, 2**32))
++
++    subgoal_steps = config['subgoal_steps']
++    action_dim = config['action_dim']
++    chunk_len = config['action_chunk_len']
++
++    trajs = []
++    stats = defaultdict(list)
++    renders = []
++    for i in trange(num_eval_episodes + num_video_episodes):
++        traj = defaultdict(list)
++        should_render = i >= num_eval_episodes
++
++        observation, info = env.reset(options=dict(task_id=task_id, render_goal=should_render))
++        goal = info.get('goal')
++        goal_frame = info.get('goal_rendered')
++        done = False
++        step = 0
++        render = []
++
++        goal_rep = None
++        action_queue = []
++        while not done:
++            # Refresh subgoal representation at the HL cadence.
++            if step % subgoal_steps == 0:
++                high_rng, hkey = jax.random.split(high_rng)
++                goal_rep = agent.sample_high_rep(
++                    observations=observation, goals=goal, seed=hkey, temperature=eval_temperature
++                )
++                action_queue = []  # force a fresh chunk under the new subgoal
++
++            # Refill the action queue with a fresh chunk when empty.
++            if len(action_queue) == 0:
++                low_rng, lkey = jax.random.split(low_rng)
++                chunk = agent.sample_low_chunk(
++                    observations=observation, goal_reps=goal_rep, seed=lkey, temperature=eval_temperature
++                )
++                chunk = np.array(chunk).reshape(-1, action_dim)  # (chunk_len, action_dim)
++                action_queue = list(chunk)
++
++            action = action_queue.pop(0)
++            if eval_gaussian is not None:
++                action = np.random.normal(action, eval_gaussian)
++            action = np.clip(action, -1, 1)
++
++            next_observation, reward, terminated, truncated, info = env.step(action)
++            done = terminated or truncated
++            step += 1
++
++            if should_render and (step % video_frame_skip == 0 or done):
++                frame = env.render().copy()
++                if goal_frame is not None:
++                    render.append(np.concatenate([goal_frame, frame], axis=0))
++                else:
++                    render.append(frame)
++
++            transition = dict(
++                observation=observation,
++                next_observation=next_observation,
++                action=action,
++                reward=reward,
++                done=done,
++                info=info,
++            )
++            add_to(traj, transition)
++            observation = next_observation
++        if i < num_eval_episodes:
++            add_to(stats, flatten(info))
++            trajs.append(traj)
++        else:
++            renders.append(np.array(render))
++
++    for k, v in stats.items():
++        stats[k] = np.mean(v)
++
++    return stats, trajs, renders
++
++
+ def evaluate(
+     agent,
+     env,
+diff --git a/impls/utils/log_utils.py b/impls/utils/log_utils.py
+index 9c421dd..cc72095 100644
+--- a/impls/utils/log_utils.py
++++ b/impls/utils/log_utils.py
+@@ -82,7 +82,7 @@ def setup_wandb(
+             start_method='thread',
+             _disable_stats=False,
+         ),
+-        mode=mode,
++        mode=os.environ.get('WANDB_MODE', mode),
+         save_code=True,
+     )
+ 
+diff --git a/impls/utils/networks.py b/impls/utils/networks.py
+index 4ee2b26..2d9baa1 100644
+--- a/impls/utils/networks.py
++++ b/impls/utils/networks.py
+@@ -71,6 +71,72 @@ class LengthNormalize(nn.Module):
+         return x / jnp.linalg.norm(x, axis=-1, keepdims=True) * jnp.sqrt(x.shape[-1])
+ 
+ 
++class FourierFeatures(nn.Module):
++    """Sinusoidal timestep embedding (ported from offline_to_online/utils/networks.py).
++
++    Used to embed the flow-matching time variable for the ActorVectorField.
++    """
++
++    output_size: int = 64
++    learnable: bool = False
++
++    @nn.compact
++    def __call__(self, x: jnp.ndarray):
++        if self.learnable:
++            w = self.param('kernel', nn.initializers.normal(0.2),
++                           (self.output_size // 2, x.shape[-1]), jnp.float32)
++            f = 2 * jnp.pi * x @ w.T
++        else:
++            half_dim = self.output_size // 2
++            f = jnp.log(10000) / (half_dim - 1)
++            f = jnp.exp(jnp.arange(half_dim) * -f)
++            f = x * f
++        return jnp.concatenate([jnp.cos(f), jnp.sin(f)], axis=-1)
++
++
++class ActorVectorField(nn.Module):
++    """Flow-matching vector-field actor (ported from ACFQL / offline_to_online).
++
++    Returns the velocity field v(obs, a, t) for flow matching. Goal-conditioning
++    is achieved by the caller passing a wider ``observations`` (e.g. concat of the
++    state and the subgoal representation); this module just concatenates
++    ``[observations, actions, times]`` and runs an MLP.
++
++    Attributes:
++        hidden_dims: Hidden layer dimensions.
++        action_dim: Output (chunked-action) dimension.
++        layer_norm: Whether to apply layer normalization in the MLP.
++        encoder: Optional encoder module applied to observations.
++        use_fourier_features: Whether to embed times with FourierFeatures.
++        fourier_feature_dim: FourierFeatures output dimension.
++    """
++
++    hidden_dims: Sequence[int]
++    action_dim: int
++    layer_norm: bool = False
++    encoder: nn.Module = None
++    use_fourier_features: bool = False
++    fourier_feature_dim: int = 64
++
++    def setup(self) -> None:
++        self.mlp = MLP((*self.hidden_dims, self.action_dim), activate_final=False, layer_norm=self.layer_norm)
++        if self.use_fourier_features:
++            self.ff = FourierFeatures(self.fourier_feature_dim)
++
++    @nn.compact
++    def __call__(self, observations, actions, times=None, is_encoded=False):
++        """Return the velocity at the given (observations, actions, times)."""
++        if not is_encoded and self.encoder is not None:
++            observations = self.encoder(observations)
++        if times is None:
++            inputs = jnp.concatenate([observations, actions], axis=-1)
++        else:
++            if self.use_fourier_features:
++                times = self.ff(times)
++            inputs = jnp.concatenate([observations, actions, times], axis=-1)
++        return self.mlp(inputs)
++
++
+ class Param(nn.Module):
+     """Scalar parameter module."""
+ 
