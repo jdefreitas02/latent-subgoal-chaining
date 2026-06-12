@@ -473,3 +473,77 @@ def make_wm_env_and_dataset(
         dense_reward_scale=dense_reward_scale,
     )
     return train_env, eval_env, train_dataset_dict, None, jepa, real_env, z_goal_task
+
+
+def make_wm_env_and_dataset_multitask(
+    wm_ckpt_path,
+    latent_cache_path,
+    hdf5_dataset_path,
+    task_ids=(1, 2, 3, 4, 5),
+    done_threshold=2.0,
+    max_episode_steps=40,
+    wm_device="cuda",
+    img_size=224,
+    env_family="cube-single",
+):
+    """Multi-task variant: build dataset once + encode goals for all `task_ids`.
+
+    Returns:
+        train_dataset_dict: same as build_for_E(task_id=task_ids[0]), used for
+            seeding the replay buffer. Rewards are NOT goal-correct for multi-task
+            use -- GCHERSampler recomputes them per-batch from sampled goals.
+        jepa: PyTorch JEPA encoder (shared across tasks).
+        real_envs: dict {task_id: gymnasium.Env}, one singletask env per task,
+            for use with evaluate_real_ogbench (per-task eval loop).
+        z_goals_all: (K, 192) numpy array of task-goal latents, indexed by
+            position in `task_ids`.
+    """
+    from envs.jepa_loader import load_jepa, encode_pixels_to_latent
+    from envs.wm_dataset_builder import build_for_E
+    from envs.env_utils import EpisodeMonitor
+    from pathlib import Path
+    import gymnasium as _gym
+    import ogbench  # registers envs
+
+    if isinstance(wm_ckpt_path, (list, tuple)):
+        jepa = load_jepa(wm_ckpt_path[0], device=wm_device, img_size=img_size)
+    else:
+        jepa = load_jepa(wm_ckpt_path, device=wm_device, img_size=img_size)
+
+    # Build one singletask env per task, get its goal image, encode to latent.
+    real_envs = {}
+    z_goals = []
+    for tid in task_ids:
+        env = _gym.make(
+            f"visual-{env_family}-singletask-task{tid}-v0",
+            width=224, height=224,
+        )
+        env = EpisodeMonitor(env, filter_regexes=['.*privileged.*', '.*proprio.*'])
+        _, info = env.reset(seed=0, options=dict(render_goal=True))
+        goal_img = info.get("goal", info.get("target", None))
+        if goal_img is None:
+            raise RuntimeError(
+                f"reset info for task {tid} missing 'goal'/'target'; got keys: {list(info.keys())}"
+            )
+        z_g = encode_pixels_to_latent(jepa, goal_img, wm_device).astype(np.float32)
+        z_goals.append(z_g)
+        real_envs[tid] = env
+    z_goals_all = np.stack(z_goals, axis=0)  # (K, 192)
+    print(f"[wm_env_multitask] encoded {len(task_ids)} task goals: shape {z_goals_all.shape}",
+          flush=True)
+
+    # Build offline chunk-granularity dataset (rewards are for task_ids[0] but
+    # the GC sampler ignores them; observations/actions/terminals are task-agnostic).
+    cache = torch.load(latent_cache_path, map_location="cpu", weights_only=False)
+    all_latents = cache["all_latents"] if isinstance(cache, dict) and "all_latents" in cache else cache
+
+    _hdf5_for_rewards = (hdf5_dataset_path
+                         if hdf5_dataset_path.endswith(".h5")
+                         else hdf5_dataset_path + ".h5")
+    train_dataset_dict = build_for_E(
+        all_latents=all_latents,
+        task_id=task_ids[0],
+        env_family=env_family,
+        hdf5_path=_hdf5_for_rewards,
+    )
+    return train_dataset_dict, jepa, real_envs, z_goals_all

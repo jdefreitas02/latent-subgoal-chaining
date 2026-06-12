@@ -50,15 +50,23 @@ def evaluate_real_ogbench(
     max_steps=200,
     action_dispatch="single",  # 'single' for B1/B2, 'chunk25' for E
     pass_task_id_on_reset=True,
+    obs_augment=None,
 ):
     """Return dict of per-task and aggregate success rates.
 
     Args:
+        real_env: Either a single gymnasium env OR a dict {task_id: env}. When
+            a dict is passed, the per-task env is selected by task_id and
+            `pass_task_id_on_reset` should be False (each env is already bound
+            to its task via registration).
         pass_task_id_on_reset: If True, calls reset(options=dict(task_id=...)) — works
             for swm/OGBCube-v0 which reads task_id from options. If False, just calls
             reset() — works for OGBench singletask envs where task_id is baked in via
-            registration. In that case task_ids should contain only the configured
-            task id (used for logging).
+            registration.
+        obs_augment: Optional callable obs_augment(z, task_id) -> obs_aug applied
+            before passing the latent to agent.sample_actions. Used by goal-conditioned
+            agents to concatenate the task goal latent: obs_aug = concat([z, g_task]).
+            Default None preserves single-task behavior.
     """
     img_transform = make_img_transform()
     rng = jax.random.PRNGKey(np.random.randint(0, 2**31 - 1))
@@ -66,14 +74,16 @@ def evaluate_real_ogbench(
 
     per_task_success = {}
     all_successes = []
+    envs_dict = isinstance(real_env, dict)
 
     for task_id in task_ids:
+        env_t = real_env[task_id] if envs_dict else real_env
         successes = []
         for ep in trange(num_episodes_per_task, desc=f"task {task_id}"):
             if pass_task_id_on_reset:
-                obs_pix, info = real_env.reset(options=dict(task_id=task_id))
+                obs_pix, info = env_t.reset(options=dict(task_id=task_id))
             else:
-                obs_pix, info = real_env.reset()
+                obs_pix, info = env_t.reset()
             done = False
             step = 0
             action_queue = []
@@ -82,6 +92,8 @@ def evaluate_real_ogbench(
             while not done and step < max_steps:
                 if len(action_queue) == 0:
                     z = _encode(jepa_model, obs_pix, device, img_transform)
+                    if obs_augment is not None:
+                        z = obs_augment(z, task_id)
                     rng, key = jax.random.split(rng)
                     action_out = np.array(actor_fn(observations=z, rng=key)).reshape(-1)
                     # Whether single or chunk25, action_out is 25-D = 5 actions of 5 dims.
@@ -91,7 +103,7 @@ def evaluate_real_ogbench(
                         action_queue.append(np.clip(a.astype(np.float32), -1.0, 1.0))
 
                 a = action_queue.pop(0)
-                obs_pix, _r, terminated, truncated, info = real_env.step(a)
+                obs_pix, _r, terminated, truncated, info = env_t.step(a)
                 done = terminated or truncated
                 step += 1
                 success_seen = max(success_seen, float(info.get("success", 0.0)))
